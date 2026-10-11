@@ -356,10 +356,14 @@ void enter_lock_and_sleep(
 ) {
     // Refuse to interrupt an active upload. The caller repaints its page when
     // this function returns, and the user can lock again after the transfer.
-    bool radio_paused = !read_pico_airdrop_busy() &&
-                        read_pico_transfer_pause_for_sleep() &&
+    bool transfer_paused = !read_pico_airdrop_busy() &&
+                           read_pico_transfer_pause_for_sleep();
+    bool radio_paused = transfer_paused &&
                         read_pico_airdrop_pause_for_sleep();
     if (!radio_paused) {
+        if (transfer_paused) {
+            read_pico_transfer_resume_after_sleep();
+        }
         pico_boot_clear_resume();
         ESP_LOGW(TAG, "lock postponed while transfer is busy");
         return;

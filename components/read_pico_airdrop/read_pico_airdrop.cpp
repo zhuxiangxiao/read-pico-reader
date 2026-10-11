@@ -50,6 +50,8 @@ static uint32_t s_expected_size = 0;
 static uint32_t s_written_size = 0;
 static airdrop_route_kind_t s_current_route = AIRDROP_ROUTE_OTHER;
 static uint32_t s_last_ad_err = 0;
+static bool s_rx_had_file = false;
+static bool s_rx_had_error = false;
 
 static void copy_dir_or_default(char *dst, size_t cap, const char *src, const char *fallback) {
     const char *use = (src && *src) ? src : fallback;
@@ -120,6 +122,7 @@ static void cleanup_partial_file(const char *err_msg) {
     s_expected_size = 0;
     s_written_size = 0;
     if (err_msg && *err_msg) {
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "%s", err_msg);
         s_status.state = READ_PICO_AIRDROP_ERROR;
     }
@@ -142,6 +145,7 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
     (void)ctx;
     cleanup_partial_file(nullptr);
     if (!f) {
+        s_rx_had_error = true;
         return AD_FILE_FAIL;
     }
 
@@ -152,11 +156,13 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
         return AD_FILE_SKIP;
     }
     if (route == AIRDROP_ROUTE_INVALID || !base) {
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "文件名不合法");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return AD_FILE_FAIL;
     }
     if (!has_storage_headroom(f->size)) {
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "TF 卡剩余空间不足");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return AD_FILE_FAIL;
@@ -164,6 +170,7 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
 
     const char *dir = target_dir_for_route(route);
     if (!ensure_dir_tree(dir)) {
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "无法创建保存目录");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return AD_FILE_FAIL;
@@ -175,6 +182,7 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
             s_current_path, sizeof(s_current_path),
             final_name, sizeof(final_name))) {
         s_current_path[0] = '\0';
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "同名文件过多，请先整理目录");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return AD_FILE_FAIL;
@@ -184,6 +192,7 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
     if (!s_current_fp) {
         ESP_LOGW(TAG, "fopen failed for %s (errno=%d)", s_current_path, errno);
         s_current_path[0] = '\0';
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "无法创建文件");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return AD_FILE_FAIL;
@@ -195,6 +204,8 @@ static int on_file_begin(void *ctx, const struct AdFile *f) {
     s_current_route = route;
     s_expected_size = f->size;
     s_written_size = 0;
+    s_rx_had_file = true;
+    s_rx_had_error = false;
     snprintf(s_status.current_file, sizeof(s_status.current_file), "%s", final_name);
     s_status.current_bytes = 0;
     s_status.current_total = f->size;
@@ -242,6 +253,7 @@ static void on_file_end(void *ctx, bool complete) {
         }
         s_expected_size = 0;
         s_written_size = 0;
+        s_rx_had_error = true;
         snprintf(s_status.last_error, sizeof(s_status.last_error), "投送未完成，请重试");
         s_status.state = READ_PICO_AIRDROP_ERROR;
         return;
@@ -277,7 +289,11 @@ esp_err_t read_pico_airdrop_start(const read_pico_airdrop_cfg_t *cfg) {
     memset(&s_status, 0, sizeof(s_status));
     fill_device_name();
     s_status.state = READ_PICO_AIRDROP_STARTING;
-    s_last_ad_err = 0;
+    struct AdStatus ad_init = {};
+    ad_stats_read(&ad_init);
+    s_last_ad_err = ad_init.file_err;
+    s_rx_had_file = false;
+    s_rx_had_error = false;
 
     if (cfg) {
         copy_dir_or_default(s_books_dir, sizeof(s_books_dir), cfg->books_dir, "/sdcard/books");
@@ -296,7 +312,13 @@ esp_err_t read_pico_airdrop_start(const read_pico_airdrop_cfg_t *cfg) {
     }
 
     if (!s_ble_leased) {
-        ble_pt_network_acquire();
+        esp_err_t ble_rc = ble_pt_network_acquire();
+        if (ble_rc != ESP_OK) {
+            ESP_LOGW(TAG, "ble_pt_network_acquire failed: 0x%x", (unsigned)ble_rc);
+            snprintf(s_status.last_error, sizeof(s_status.last_error), "蓝牙释放失败，请重试");
+            s_status.state = READ_PICO_AIRDROP_ERROR;
+            return ble_rc;
+        }
         s_ble_leased = true;
     }
 
@@ -338,6 +360,8 @@ esp_err_t read_pico_airdrop_start(const read_pico_airdrop_cfg_t *cfg) {
 void read_pico_airdrop_stop(void) {
     s_sleep_paused = false;
     cleanup_partial_file(nullptr);
+    s_rx_had_file = false;
+    s_rx_had_error = false;
     if (s_running) {
         ad_end();
         (void)awdl_end();
@@ -365,26 +389,38 @@ void read_pico_airdrop_poll(void) {
     ad_stats_read(&ad);
     s_status.rx_active = ad.rx_active != 0;
 
-    if (s_status.rx_active) {
-        s_status.state = READ_PICO_AIRDROP_RECEIVING;
-        if (!s_current_fp && ad.rx_bytes > 0) {
-            s_status.current_bytes = ad.rx_bytes;
-            s_status.current_total = ad.rx_max;
-        }
-        return;
-    }
-
-    if (s_current_fp) {
-        cleanup_partial_file("投送中断，未完整文件已清理");
-        return;
-    }
-
     if (ad.file_err != 0 && ad.file_err != s_last_ad_err) {
         s_last_ad_err = ad.file_err;
+        s_rx_had_error = true;
         if (!s_status.last_error[0]) {
             snprintf(s_status.last_error, sizeof(s_status.last_error), "投送未完成，请重试");
         }
         s_status.state = READ_PICO_AIRDROP_ERROR;
+    }
+
+    if (s_status.rx_active) {
+        if (s_rx_had_error) {
+            s_status.state = READ_PICO_AIRDROP_ERROR;
+        } else if (s_current_fp == nullptr && s_rx_had_file) {
+            // 文件已落盘关闭，等待 TLS 线程写回 200 OK 期间保持 DONE 与文件真实字节数。
+            // Preserve DONE and exact file size while the TLS task finishes sending 200 OK.
+            s_status.state = READ_PICO_AIRDROP_DONE;
+        } else {
+            s_status.state = READ_PICO_AIRDROP_RECEIVING;
+            if (!s_current_fp && !s_rx_had_file && ad.rx_bytes > 0) {
+                s_status.current_bytes = ad.rx_bytes;
+                s_status.current_total = ad.rx_max;
+            }
+        }
+        return;
+    }
+
+    s_rx_had_file = false;
+    s_rx_had_error = false;
+
+    if (s_current_fp) {
+        cleanup_partial_file("投送中断，未完整文件已清理");
+        s_rx_had_error = false;
         return;
     }
 
@@ -424,7 +460,10 @@ bool read_pico_airdrop_pause_for_sleep(void) {
         return false;
     }
     ad_end();
-    (void)awdl_end();
+    if (awdl_end() != ESP_OK) {
+        (void)ad_begin(s_status.device_name, 0);
+        return false;
+    }
     s_running = false;
     s_sleep_paused = true;
     return true;
@@ -435,11 +474,22 @@ void read_pico_airdrop_resume_after_sleep(void) {
         return;
     }
     s_sleep_paused = false;
+    read_pico_airdrop_status_t saved = s_status;
     read_pico_airdrop_cfg_t cfg = {
         .books_dir = s_books_dir,
         .fonts_dir = s_fonts_dir,
         .pictures_dir = s_pictures_dir,
         .other_dir = s_other_dir,
     };
-    (void)read_pico_airdrop_start(&cfg);
+    if (read_pico_airdrop_start(&cfg) == ESP_OK) {
+        s_status.completed_files = saved.completed_files;
+        s_status.books_received = saved.books_received;
+        s_status.fonts_received = saved.fonts_received;
+        snprintf(s_status.current_file, sizeof(s_status.current_file), "%s", saved.current_file);
+        s_status.current_bytes = saved.current_bytes;
+        s_status.current_total = saved.current_total;
+        if (saved.completed_files > 0) {
+            s_status.state = READ_PICO_AIRDROP_DONE;
+        }
+    }
 }

@@ -730,6 +730,23 @@ static void airdrop_mbedtls_free(void *ptr) {
   heap_caps_free(ptr);
 }
 
+static bool s_tls_ctx_inited = false;
+
+static void airdrop_tls_free_all(void) {
+  if (!s_tls_ctx_inited) return;
+  mbedtls_ssl_free(&g_ssl);
+  mbedtls_ssl_config_free(&g_tlsconf);
+  mbedtls_pk_free(&g_pkey);
+  mbedtls_x509_crt_free(&g_srvcert);
+  mbedtls_ssl_cache_free(&g_cache);
+#if MBEDTLS_VERSION_MAJOR < 4
+  mbedtls_ctr_drbg_free(&g_ctr_drbg);
+  mbedtls_entropy_free(&g_entropy);
+#endif
+  s_tls_ctx_inited = false;
+  g_tls_ready = false;
+}
+
 static void airdrop_tls_init() {
   if (g_tls_ready) return;
 #if defined(MBEDTLS_PLATFORM_MEMORY) && !defined(MBEDTLS_PLATFORM_CALLOC_MACRO) && !defined(MBEDTLS_PLATFORM_FREE_MACRO)
@@ -755,18 +772,8 @@ static void airdrop_tls_init() {
    *
    * With the frees below, a pass that fails costs nothing, so a transient failure heals on
    * the next tick instead of becoming permanent. */
-  static bool tried = false;
-  if (tried) {
-    mbedtls_ssl_free(&g_ssl);
-    mbedtls_ssl_config_free(&g_tlsconf);
-    mbedtls_pk_free(&g_pkey);
-    mbedtls_x509_crt_free(&g_srvcert);
-#if MBEDTLS_VERSION_MAJOR < 4
-    mbedtls_ctr_drbg_free(&g_ctr_drbg);
-    mbedtls_entropy_free(&g_entropy);
-#endif
-  }
-  tried = true;
+  airdrop_tls_free_all();
+  s_tls_ctx_inited = true;
 #if MBEDTLS_VERSION_MAJOR < 4
   mbedtls_entropy_init(&g_entropy);
   mbedtls_ctr_drbg_init(&g_ctr_drbg);
@@ -774,6 +781,8 @@ static void airdrop_tls_init() {
   mbedtls_x509_crt_init(&g_srvcert);
   mbedtls_pk_init(&g_pkey);
   mbedtls_ssl_config_init(&g_tlsconf);
+  mbedtls_ssl_cache_init(&g_cache);
+  mbedtls_ssl_init(&g_ssl);
   int r;
   psa_crypto_init();   // some EC/PK paths route through PSA (MBEDTLS_PSA_CRYPTO_C on)
   // EC P-256 cert: ECDSA sign is ~10-30ms vs RSA-2048's ~300ms. That speed is the
@@ -835,7 +844,6 @@ static void airdrop_tls_init() {
   mbedtls_ssl_conf_read_timeout(&g_tlsconf, 10000);
   // Session cache: sharingd's follow-up/retry connections resume abbreviated
   // (1-RTT, no cert, no EC sign) -- huge on this ~1-window/second link.
-  mbedtls_ssl_cache_init(&g_cache);
   mbedtls_ssl_cache_set_max_entries(&g_cache, 4);
 #ifdef AD_DIAG_DETAIL
   mbedtls_ssl_conf_session_cache(&g_tlsconf, &g_cache,
@@ -848,7 +856,6 @@ static void airdrop_tls_init() {
         AD_LOG("[tls] own_cert -0x%04x\n", -r); return; }
   // Allocate the ONE ssl context now (34KB I/O buffers). session_reset() between
   // connections reuses these buffers -> no per-connection alloc churn/fragmentation.
-  mbedtls_ssl_init(&g_ssl);
   if ((r = mbedtls_ssl_setup(&g_ssl, &g_tlsconf))) {
         AD_LOG("[tls] ssl_setup -0x%04x\n", -r); return; }
   g_tls_ready = true;
@@ -857,6 +864,21 @@ static void airdrop_tls_init() {
 }
 
 static volatile bool g_tcp_listen_stop = false;
+
+static int airdrop_net_recv_timeout(void *ctx, unsigned char *buf, size_t len, uint32_t timeout) {
+  if (g_tcp_listen_stop) return -1;
+  uint32_t elapsed = 0;
+  while (!g_tcp_listen_stop) {
+    uint32_t step = (timeout == 0) ? 200 : ((timeout - elapsed > 200) ? 200 : (timeout - elapsed));
+    int ret = mbedtls_net_recv_timeout(ctx, buf, len, step);
+    if (ret != MBEDTLS_ERR_SSL_TIMEOUT) return ret;
+    if (timeout != 0) {
+      elapsed += step;
+      if (elapsed >= timeout) return MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+  }
+  return -1;
+}
 
 static int ssl_write_all(mbedtls_ssl_context *ssl, const unsigned char *p, int len) {
   int off = 0;
@@ -1111,6 +1133,17 @@ static void stream_infra_free(void) {
   g_scur_held = false;
 }
 
+static bool stream_send_ready(const struct AdStreamBlk *blk) {
+  uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
+  while (!g_stream_sink_failed && !g_tcp_listen_stop &&
+         (uint32_t)(esp_timer_get_time() / 1000) - t0 < AD_STREAM_WAIT_MS) {
+    if (xQueueSend(g_sready_q, blk, pdMS_TO_TICKS(50)) == pdTRUE) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /* Produce decoded archive bytes into the ring (TLS task). Blocks when the sink is
    behind -- that pause IS the backpressure. false = fail the transfer. */
 static bool stream_produce(const uint8_t *data, uint32_t n) {
@@ -1146,8 +1179,10 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
     data += take;
     n -= take;
     if (g_scur.n == AD_STREAM_BLOCK_SZ) {
-      xQueueSend(g_sready_q, &g_scur, pdMS_TO_TICKS(AD_STREAM_WAIT_MS));
       g_scur_held = false;
+      if (!stream_send_ready(&g_scur)) {
+        return false;
+      }
     }
   }
   return true;
@@ -1158,11 +1193,11 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
    back whatever file the failure cut). */
 static void stream_producer_end(void) {
   if (g_scur_held) {
-    xQueueSend(g_sready_q, &g_scur, pdMS_TO_TICKS(AD_STREAM_WAIT_MS));
+    (void)stream_send_ready(&g_scur);
     g_scur_held = false;
   }
   struct AdStreamBlk end = {nullptr, 0};
-  xQueueSend(g_sready_q, &end, pdMS_TO_TICKS(AD_STREAM_WAIT_MS));
+  (void)stream_send_ready(&end);
   g_stream_open = false;
 }
 
@@ -1299,7 +1334,8 @@ static bool rx_stream_open(struct RxPump *p) {
     /* The previous archive has not been collected yet. Give the sink a moment; a second
        body must not be parsed into the first one's state machine. */
     uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
-    while (!g_stream_done && (uint32_t)(esp_timer_get_time() / 1000) - t0 < 2000) {
+    while (!g_stream_done && !g_tcp_listen_stop &&
+           (uint32_t)(esp_timer_get_time() / 1000) - t0 < 2000) {
       vTaskDelay(pdMS_TO_TICKS(20));
     }
     if (!g_stream_done) {
@@ -1721,7 +1757,8 @@ static void rx_upload(struct HttpRdr *r, bool chunked, int clen) {
       unsigned char scrap[512]; uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
       uint32_t binned = 0; uint32_t now;
       http_set_timeout(r, 300);
-      while (!r->eof && ((now = (uint32_t)(esp_timer_get_time() / 1000)) - t0) < 3000) {
+      while (!r->eof && !g_tcp_listen_stop &&
+             ((now = (uint32_t)(esp_timer_get_time() / 1000)) - t0) < 3000) {
         int g = hr_read(r, scrap, sizeof(scrap));
         if (g > 0) binned += (uint32_t)g;
       }
@@ -2059,9 +2096,8 @@ static void tcp_listen_task(void *) {
       for (int i = 0; i < MAXC; i++) {
         if (conn[i] >= 0) { close(conn[i]); conn[i] = -1; }
       }
-      mbedtls_ssl_session_reset(&g_ssl);
-      mbedtls_ssl_free(&g_ssl);
-      g_tls_ready = false;
+      g_net.fd = -1;
+      airdrop_tls_free_all();
       g_tcp_listen_task_handle = nullptr;
       vTaskDelete(nullptr);
       return;
@@ -2070,15 +2106,19 @@ static void tcp_listen_task(void *) {
     { uint32_t hw = (uint32_t)uxTaskGetStackHighWaterMark(nullptr);
       if (hw < g_ls_stack_min) g_ls_stack_min = hw; }
 #endif
-    if (!g_tls_ready) { vTaskDelay(pdMS_TO_TICKS(1000)); airdrop_tls_init(); continue; }
+    if (!g_tls_ready) {
+      for (int i = 0; i < 20 && !g_tcp_listen_stop; i++) vTaskDelay(pdMS_TO_TICKS(50));
+      if (!g_tcp_listen_stop) airdrop_tls_init();
+      continue;
+    }
     if (ls < 0) {
       ls = socket(AF_INET6, SOCK_STREAM, 0);
-      if (ls < 0) { vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+      if (ls < 0) { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
       int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
       struct sockaddr_in6 a; memset(&a, 0, sizeof(a));
       a.sin6_family = AF_INET6; a.sin6_port = htons(AIRDROP_PORT);   // in6addr_any
       if (bind(ls, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(ls, 8) != 0) {
-        close(ls); ls = -1; g_listen_fd = -1; vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        close(ls); ls = -1; g_listen_fd = -1; vTaskDelay(pdMS_TO_TICKS(200)); continue;
       }
       set_nonblock(ls, true);
       g_listen_fd = ls;            // published for sv_peer_waiting(), which ends the /Ask drain
@@ -2089,6 +2129,7 @@ static void tcp_listen_task(void *) {
     for (int i = 0; i < MAXC; i++) if (conn[i] >= 0) { FD_SET(conn[i], &rf); if (conn[i] > mx) mx = conn[i]; }
     struct timeval tv = { 0, 100000 };            // 100ms tick
     select(mx + 1, &rf, NULL, NULL, &tv);
+    if (g_tcp_listen_stop) continue;
     uint32_t now = millis();
 
     // 1. Drain the accept backlog (non-blocking); TCP_NODELAY + O_NONBLOCK each.
@@ -2140,7 +2181,7 @@ static void tcp_listen_task(void *) {
     else if (active >= 0 && cand >= 0 && cand != active &&
              born[cand] > born[active] && (uint32_t)(now - t_data) > 1200) {
       AD_LOG("[serve] preempt fd=%d -> fd=%d\n", conn[active], conn[cand]);
-      close(conn[active]); conn[active] = -1; active = -1; adopt = true;
+      close(conn[active]); conn[active] = -1; active = -1; g_net.fd = -1; adopt = true;
     }
     /* The select loop's own heartbeat: how many fds are held, how many are readable, and
        which one the election above picked. It is gated only by a 1000 ms timer, so it fires
@@ -2186,7 +2227,7 @@ static void tcp_listen_task(void *) {
         for (int i = 0; i < MAXC; i++) if (conn[i] >= 0 && i != active) { close(conn[i]); conn[i] = -1; killed++; }
         if (killed) EV("cull n=%d -- closed sharingd's other parallel connections", killed);
         set_nonblock(afd, false);                  // HTTP phase: blocking + read timeout
-        mbedtls_ssl_set_bio(&g_ssl, &g_net, mbedtls_net_send, mbedtls_net_recv, mbedtls_net_recv_timeout);
+        mbedtls_ssl_set_bio(&g_ssl, &g_net, mbedtls_net_send, mbedtls_net_recv, airdrop_net_recv_timeout);
         g_http_enter_ms = millis();
         EV("http_enter fd=%d", afd);
         serve_http(&g_ssl);
@@ -2194,12 +2235,14 @@ static void tcp_listen_task(void *) {
         EV("http_exit fd=%d blocked_ms=%lu since_disc=%lu", afd,
            (unsigned long)(g_http_exit_ms - g_http_enter_ms),
            (unsigned long)(g_disc_ms ? (g_http_exit_ms - g_disc_ms) : 0));
-        mbedtls_ssl_close_notify(&g_ssl);
-        close(afd); conn[active] = -1; active = -1;
+        if (!g_tcp_listen_stop) {
+          mbedtls_ssl_close_notify(&g_ssl);
+        }
+        close(afd); conn[active] = -1; active = -1; g_net.fd = -1;
         mbedtls_ssl_session_reset(&g_ssl);
       } else if (r != MBEDTLS_ERR_SSL_WANT_READ && r != MBEDTLS_ERR_SSL_WANT_WRITE) {
         EV("hs_fail fd=%d err=-0x%04x", conn[active], -r);
-        close(conn[active]); conn[active] = -1; active = -1;
+        close(conn[active]); conn[active] = -1; active = -1; g_net.fd = -1;
         mbedtls_ssl_session_reset(&g_ssl);
       }
     } else active = -1;
@@ -2207,7 +2250,7 @@ static void tcp_listen_task(void *) {
     // 5. Handshake deadline: drop a connection that never finishes.
     if (active >= 0 && (uint32_t)(now - t_hs0) > 15000) {
       AD_LOG("[tls] handshake deadline (fd=%d)\n", conn[active]);
-      close(conn[active]); conn[active] = -1; active = -1;
+      close(conn[active]); conn[active] = -1; active = -1; g_net.fd = -1;
       mbedtls_ssl_session_reset(&g_ssl);
     }
   }
@@ -2324,6 +2367,8 @@ int ad_begin(const char *name, uint32_t max_receive) {
   awdl_identity(&g_id);
   awdl_rx_tap_set(ad_rx_tap, nullptr);
 
+  g_net.fd = -1;
+  g_listen_fd = -1;
   g_tcp_listen_stop = false;
 
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
@@ -2348,26 +2393,34 @@ int ad_begin(const char *name, uint32_t max_receive) {
 
 void ad_end(void) {
   if (!g_ad_role_receiver && g_tcp_listen_task_handle == nullptr) return;
+  awdl_rx_tap_set(nullptr, nullptr);
   g_tcp_listen_stop = true;
+  g_stream_sink_failed = true;
   if (g_net.fd >= 0) shutdown(g_net.fd, SHUT_RDWR);
   if (g_listen_fd >= 0) shutdown(g_listen_fd, SHUT_RDWR);
-  for (int i = 0; i < 50 && g_tcp_listen_task_handle != nullptr; i++) {
+  for (int i = 0; i < 200 && g_tcp_listen_task_handle != nullptr; i++) {
     vTaskDelay(pdMS_TO_TICKS(20));
   }
-  if (g_tcp_listen_task_handle != nullptr) {
-    vTaskDelete(g_tcp_listen_task_handle);
-    g_tcp_listen_task_handle = nullptr;
-  }
+  vTaskDelay(pdMS_TO_TICKS(20));
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
-  if (s_tcp_stack) {
-    heap_caps_free(s_tcp_stack);
-    s_tcp_stack = nullptr;
-  }
-  if (s_tcp_tcb) {
-    heap_caps_free(s_tcp_tcb);
-    s_tcp_tcb = nullptr;
+  if (g_tcp_listen_task_handle == nullptr) {
+    if (s_tcp_stack) {
+      heap_caps_free(s_tcp_stack);
+      s_tcp_stack = nullptr;
+    }
+    if (s_tcp_tcb) {
+      heap_caps_free(s_tcp_tcb);
+      s_tcp_tcb = nullptr;
+    }
   }
 #endif
+  if (g_arch_block) {
+    heap_caps_free(g_arch_block);
+    g_arch_block = nullptr;
+  }
+  g_arch_buf = nullptr;
+  g_arch_len = 0;
+  g_arch_ready = false;
   stream_infra_free();
   g_stream_open = false;
   g_stream_started = false;

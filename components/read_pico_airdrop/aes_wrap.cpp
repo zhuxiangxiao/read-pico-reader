@@ -38,13 +38,20 @@ static uint8_t *s_bulk_in = nullptr;
 static uint8_t *s_bulk_out = nullptr;
 static uint8_t *s_tail_in = nullptr;
 static uint8_t *s_tail_out = nullptr;
+static portMUX_TYPE s_aes_init_lock = portMUX_INITIALIZER_UNLOCKED;
 static StaticSemaphore_t s_aes_mux_buf;
 static SemaphoreHandle_t s_aes_mux = nullptr;
 
 static bool ensure_scratch(void) {
+    portENTER_CRITICAL(&s_aes_init_lock);
     if (!s_aes_mux) {
         s_aes_mux = xSemaphoreCreateMutexStatic(&s_aes_mux_buf);
     }
+    portEXIT_CRITICAL(&s_aes_init_lock);
+    if (!s_aes_mux) {
+        return false;
+    }
+    xSemaphoreTake(s_aes_mux, portMAX_DELAY);
     if (!s_bulk_in) {
         s_bulk_in = static_cast<uint8_t *>(
             heap_caps_aligned_alloc(kCacheLine, kBulkChunk, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -61,7 +68,9 @@ static bool ensure_scratch(void) {
         s_tail_out = static_cast<uint8_t *>(
             heap_caps_aligned_alloc(16, kTailChunk, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT));
     }
-    return s_aes_mux && s_tail_in && s_tail_out;
+    bool ok = s_tail_in && s_tail_out;
+    xSemaphoreGive(s_aes_mux);
+    return ok;
 }
 
 static bool buf_needs_bounce(const void *ptr) {

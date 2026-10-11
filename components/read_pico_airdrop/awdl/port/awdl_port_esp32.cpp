@@ -2647,6 +2647,7 @@ esp_err_t awdl_end(void) {
     return ESP_ERR_INVALID_STATE;
   }
   g_cadence_task = nullptr;
+  vTaskDelay(pdMS_TO_TICKS(20));
 
   /* 2. The radio. Promiscuous off FIRST: sniffer_cb writes into the frame ring from the
    *    Wi-Fi task, and proc_task is already gone, so every frame after this point is work
