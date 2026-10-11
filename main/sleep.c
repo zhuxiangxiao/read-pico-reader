@@ -38,6 +38,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pmu_selftest.h"
+#include "read_pico_airdrop.h"
 #include "read_pico_board.h"
 #include "read_pico_pmu.h"
 #include "read_pico_transfer.h"
@@ -355,7 +356,9 @@ void enter_lock_and_sleep(
 ) {
     // Refuse to interrupt an active upload. The caller repaints its page when
     // this function returns, and the user can lock again after the transfer.
-    bool radio_paused = read_pico_transfer_pause_for_sleep();
+    bool radio_paused = !read_pico_airdrop_busy() &&
+                        read_pico_transfer_pause_for_sleep() &&
+                        read_pico_airdrop_pause_for_sleep();
     if (!radio_paused) {
         pico_boot_clear_resume();
         ESP_LOGW(TAG, "lock postponed while transfer is busy");
@@ -397,6 +400,7 @@ void enter_lock_and_sleep(
     pico_boot_clear_resume();
     if (system_lock) app_font_end_lock(&lock_font);
     read_pico_transfer_resume_after_sleep();
+    read_pico_airdrop_resume_after_sleep();
 
     // 参考帧和屏幕都归零，回到主循环后由当前页自己画一遍，不必知道是哪一页。
     // Zero the reference frame and the panel; the current page redraws after the loop resumes, without knowing which page it is.

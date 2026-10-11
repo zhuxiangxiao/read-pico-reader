@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 source=ROOT/'main/apps/app_files.c'
 s=source.read_text()
 a=s.index('    if (!long_press && sd_needs_format() && ui_rect_hit(storage_card_rect()')
-b=s.index('    for (int i = 0; !long_press && i < 3;',a)
+b=s.index('    for (int i = 0; !long_press && i < 4;',a)
 unit=r'''
 #include <assert.h>
 #include <stdbool.h>

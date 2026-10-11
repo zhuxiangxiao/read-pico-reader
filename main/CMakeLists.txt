@@ -1,6 +1,7 @@
 set(main_requires
     read_pico
     read_pico_transfer
+    read_pico_airdrop
     read_pico_search
     espressif__qrcode
     espressif__esp_jpeg

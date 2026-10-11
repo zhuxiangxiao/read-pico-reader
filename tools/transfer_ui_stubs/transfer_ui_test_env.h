@@ -127,7 +127,9 @@ static int test_qr_encodes;
 static bool test_qr_failure;
 static char test_qr_payload[128];
 static inline void ui_wifi_qr_clear(void) {test_qr_payload[0]=0;}
+static int test_font_scans;
 static inline void ttf_font_cache_clear(void) {}
+static inline void ttf_font_scan(void) { ++test_font_scans; }
 static inline bool ui_wifi_qr_prepare(const char* s,const char* p) {(void)p;++test_qr_encodes;snprintf(test_qr_payload,sizeof(test_qr_payload),"%s",s);return !test_qr_failure;}
 static inline bool ui_wifi_qr_prepare_url(const char* s) {++test_qr_encodes;snprintf(test_qr_payload,sizeof(test_qr_payload),"%s",s);return !test_qr_failure;}
 static inline void ui_wifi_qr_draw(uint8_t* fb,EpdRect r) {(void)fb;(void)r;}
@@ -145,3 +147,55 @@ static char test_signature[96];
 static bool test_signature_fail;
 static inline const char *app_settings_status_signature(void){return test_signature;}
 static inline void app_settings_set_status_signature(const char *text){if(!test_signature_fail)snprintf(test_signature,sizeof(test_signature),"%s",text);}
+
+typedef enum {
+    READ_PICO_AIRDROP_STOPPED = 0,
+    READ_PICO_AIRDROP_STARTING,
+    READ_PICO_AIRDROP_READY,
+    READ_PICO_AIRDROP_RECEIVING,
+    READ_PICO_AIRDROP_DONE,
+    READ_PICO_AIRDROP_ERROR,
+} read_pico_airdrop_state_t;
+typedef struct {
+    const char *books_dir;
+    const char *fonts_dir;
+    const char *pictures_dir;
+    const char *other_dir;
+} read_pico_airdrop_cfg_t;
+typedef struct {
+    read_pico_airdrop_state_t state;
+    bool rx_active;
+    char device_name[33];
+    char current_file[241];
+    char last_error[96];
+    unsigned completed_files;
+    unsigned books_received;
+    unsigned fonts_received;
+    size_t current_bytes;
+    size_t current_total;
+} read_pico_airdrop_status_t;
+static read_pico_airdrop_status_t test_airdrop_status;
+static bool test_airdrop_active;
+static int test_airdrop_starts, test_airdrop_stops, test_airdrop_polls;
+static esp_err_t test_airdrop_start_err = ESP_OK;
+static inline esp_err_t read_pico_airdrop_start(const read_pico_airdrop_cfg_t *cfg) {
+    (void)cfg;
+    ++test_airdrop_starts;
+    if (test_airdrop_start_err != ESP_OK) return test_airdrop_start_err;
+    test_airdrop_active = true;
+    test_airdrop_status.state = READ_PICO_AIRDROP_READY;
+    strcpy(test_airdrop_status.device_name, "kiikoread-1A2B");
+    return ESP_OK;
+}
+static inline void read_pico_airdrop_stop(void) {
+    ++test_airdrop_stops;
+    test_airdrop_active = false;
+    test_airdrop_status.rx_active = false;
+    test_airdrop_status.state = READ_PICO_AIRDROP_STOPPED;
+}
+static inline void read_pico_airdrop_poll(void) { ++test_airdrop_polls; }
+static inline void read_pico_airdrop_get_status(read_pico_airdrop_status_t *out) {
+    if (!test_airdrop_status.device_name[0]) strcpy(test_airdrop_status.device_name, "kiikoread-1A2B");
+    *out = test_airdrop_status;
+}
+static inline bool read_pico_airdrop_active(void) { return test_airdrop_active; }

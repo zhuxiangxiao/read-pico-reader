@@ -15,6 +15,7 @@ void app_home_cover_mode_changed(void) {}
 esp_err_t pico_boot_save_resume(const pico_resume_t *resume) { (void)resume; return ESP_OK; }
 void pico_boot_clear_resume(void) {}
 bool app_book_resume_context(char *p,size_t c,bool *f) { (void)p;(void)c;(void)f;return false; }
+#include "read_pico_airdrop.h"
 #include "read_pico_transfer.h"
 #include "ble_page_turner.h"
 #include <assert.h>
@@ -37,7 +38,7 @@ static int menus, highlights, restores, fulls, mode, tick_consumed[32];
 static int long_keys;
 static uint8_t idle_minutes;
 static int idle_locks, before_locks;
-static bool online_busy;
+static bool online_busy, airdrop_active;
 static bool ble_enabled, saved_wifi, upload_busy, click_enabled, click_active;
 static read_pico_transfer_status_t transfer_status;
 static int quick_draws, quick_gl, quick_du, wifi_starts, wifi_stops, ble_resets, click_presses, click_restores;
@@ -176,7 +177,7 @@ static void reset(void) {
     ble_enabled=saved_wifi=upload_busy=click_enabled=click_active=false;
     transfer_status=(read_pico_transfer_status_t){0};
     quick_draws=quick_gl=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
-    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=0;online_busy=false;
+    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=0;online_busy=airdrop_active=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
     media_test=sd_font=saved_sd_font=false;media_lost=media_ready=builtin_opens=font_opens=probes=0;loss_step=-1;
@@ -344,6 +345,8 @@ int main(void) {
     add(0,0,0,0);add(0,0,0,0);run();assert(!idle_locks);
     reset();idle_minutes=1;time_step=600000000;online_busy=true;
     add(0,0,0,0);add(0,0,0,0);run();assert(!idle_locks);
+    reset();idle_minutes=1;time_step=600000000;airdrop_active=true;
+    add(0,0,0,0);add(0,0,0,0);run();assert(!idle_locks);
     reset();idle_minutes=1;time_step=600000000;first.holds_pmu=true;
     add(0,0,0,0);add(0,0,0,0);run();assert(!idle_locks);
     reset();idle_minutes=1;time_step=30000000;
@@ -427,6 +430,7 @@ int main(void) {
 void ble_pt_sync(bool enabled) { (void)enabled; }
 void ble_pt_poll(void) {}
 bool pico_online_busy(void) { return online_busy; }
+bool read_pico_airdrop_active(void) { return airdrop_active; }
 
 uint8_t app_settings_auto_lock_minutes(void){return idle_minutes;}
 uint32_t ble_pt_input_serial(void){return 0;}

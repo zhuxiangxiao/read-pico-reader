@@ -16,6 +16,7 @@
  * 卡失效时停止并汇合接收任务，清除旧容量与二维码；当前请求不得切换存储源。
  * 配网列表与确认页底栏可切换主页面；密码页底部保留输入操作键，已连接的 STA 在离页后保活。
  * 正在上传时禁止主动切页；USB 退出必须先断开电脑再启动本机重新挂载。
+ * 用户新增文件管理隔空投送直达模式：独立 AWDL+BLE 接收，仅支持 TF 卡并按扩展名自动归类，同名自动加 _1 后缀，支持随时中断并清理半截文件。
  * Frozen: AP/STA transfer stops on exit while a provisioned connected STA stays online; deep sleep or power loss interrupts transfer.
  * Render only paints snapshots; book_store defines the flash file limit. Never format the TF card.
  * Concurrent uploads underrun scan queues; increase prefill until service exit without changing waveforms or pixel clocks.
@@ -29,6 +30,7 @@
  * Lost media stops and joins reception and clears capacity/QR; never switch storage beneath an active request.
  * Provisioning lists and confirmation keep the main tabs active; the password editor keeps its input actions, and connected STA persists after exit.
  * Navigation waits for an active upload; USB exit disconnects the host before local remount.
+ * User-added direct AirDrop mode from File Manager: standalone AWDL+BLE receiver requiring TF card, routing by extension with _1 collision suffix, and allowing immediate cancel with partial-file cleanup.
  */
 #include <stdio.h>
 #include <string.h>
@@ -42,6 +44,7 @@
 #include "e0470_epaper_waveform.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "read_pico_airdrop.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
 #include "settings.h"
@@ -75,6 +78,8 @@ static bool s_usb_start_pending;
 static int64_t s_usb_retry_ms;
 static bool s_usb_host_connected;
 static uint64_t s_usb_capacity_bytes;
+static bool s_airdrop_requested, s_airdrop_entry, s_airdrop_start_pending;
+static read_pico_airdrop_status_t s_airdrop_status;
 
 static uint32_t s_signature_revision, s_signature_seen;
 static bool transfer_signature_get(char *out, size_t cap) {
@@ -156,26 +161,37 @@ static bool transfer_set_wallpaper(const char *path) {
 
 void app_transfer_request_method_picker(void) {
     s_usb_requested = s_hotspot_requested = s_wifi_upload_requested = s_wifi_setup_requested = false;
+    s_airdrop_requested = false;
     s_wifi_settings_only = false;
 }
 
 void app_transfer_request_usb_start(void) {
+    s_airdrop_requested = false;
     s_usb_requested = true;
 }
 
 void app_transfer_request_wifi_setup(void) {
+    s_airdrop_requested = false;
     s_wifi_setup_requested = true;
     s_wifi_settings_only = true;
 }
 
 void app_transfer_request_wifi_upload(void) {
+    s_airdrop_requested = false;
     s_wifi_upload_requested = true;
     s_wifi_settings_only = false;
 }
 
 void app_transfer_request_hotspot_start(void) {
+    s_airdrop_requested = false;
     s_hotspot_requested = true;
     s_wifi_settings_only = false;
+}
+
+void app_transfer_request_airdrop_start(void) {
+    s_usb_requested = s_hotspot_requested = s_wifi_upload_requested = s_wifi_setup_requested = false;
+    s_wifi_settings_only = false;
+    s_airdrop_requested = true;
 }
 
 static void clear_qr(void) {
@@ -735,6 +751,84 @@ static EpdRect control_rect(int id) {
     return (EpdRect){0};
 }
 
+static EpdRect airdrop_status_rect(void) {
+    return (EpdRect){36, 176, 612, 268};
+}
+
+static void draw_airdrop_status(uint8_t *fb) {
+    EpdRect area = airdrop_status_rect();
+    ui_clear_rect_fast(fb, area);
+    ui_fill_round_rect(fb, area, 24, UI_GRAY_WHITE);
+    ui_draw_round_rect(fb, area, 24, 0x90);
+    const char *state = "服务已停止";
+    if (s_airdrop_start_pending || s_airdrop_status.state == READ_PICO_AIRDROP_STARTING) state = "正在准备…";
+    else if (s_media_lost) state = "TF 卡已移除，服务已停止";
+    else if (s_airdrop_status.state == READ_PICO_AIRDROP_RECEIVING) state = "正在接收";
+    else if (s_airdrop_status.state == READ_PICO_AIRDROP_DONE) state = "接收完成 · 继续等待投送";
+    else if (s_airdrop_status.state == READ_PICO_AIRDROP_READY) state = "等待投送";
+    else if (s_airdrop_status.state == READ_PICO_AIRDROP_ERROR)
+        state = s_airdrop_status.last_error[0] ? s_airdrop_status.last_error : "隔空投送未启动";
+    ui_text(fb, area.x + 28, area.y + 24, 28, state, EPD_DRAW_ALIGN_LEFT, false);
+
+    char dev_line[80];
+    snprintf(dev_line, sizeof(dev_line), "设备名称  %s",
+             s_airdrop_status.device_name[0] ? s_airdrop_status.device_name : "kiikoread");
+    ui_text(fb, area.x + 28, area.y + 72, 20, dev_line, EPD_DRAW_ALIGN_LEFT, false);
+
+    if (s_airdrop_status.current_file[0]) {
+        char file_line[248];
+        snprintf(file_line, sizeof(file_line), "%s", s_airdrop_status.current_file);
+        while (*file_line && ttf_text_width_px(ui_text_effective_px(19), file_line) > area.width - 220) {
+            size_t n = strlen(file_line) - 1;
+            while (n && ((unsigned char)file_line[n] & 0xc0) == 0x80) --n;
+            file_line[n] = 0;
+        }
+        ui_text(fb, area.x + 28, area.y + 114, 19, file_line, EPD_DRAW_ALIGN_LEFT, false);
+        char size_line[48];
+        size_t bytes = s_airdrop_status.current_total ? s_airdrop_status.current_total : s_airdrop_status.current_bytes;
+        if (bytes >= 1024 * 1024) snprintf(size_line, sizeof(size_line), "%.1f MB", bytes / 1048576.0);
+        else if (bytes >= 1024) snprintf(size_line, sizeof(size_line), "%.1f KB", bytes / 1024.0);
+        else snprintf(size_line, sizeof(size_line), "%u B", (unsigned)bytes);
+        ui_text(fb, area.x + area.width - 28, area.y + 114, 19, size_line, EPD_DRAW_ALIGN_RIGHT, false);
+    } else {
+        ui_text(fb, area.x + 28, area.y + 114, 19, "尚无接收文件", EPD_DRAW_ALIGN_LEFT, false);
+    }
+
+    ui_hairline(fb, area.y + 162, area.x + 28, area.width - 56, 0xb8);
+    char summary[112];
+    if (s_media_lost) snprintf(summary, sizeof(summary), "请重新插入 TF 卡后再试");
+    else if (s_free > 0)
+        snprintf(summary, sizeof(summary), "已收 %u 个文件 · TF 卡剩余 %.1f GB",
+                 (unsigned)s_airdrop_status.completed_files, s_free / 1073741824.0);
+    else snprintf(summary, sizeof(summary), "已收 %u 个文件", (unsigned)s_airdrop_status.completed_files);
+    ui_text(fb, area.x + 28, area.y + 180, 19, summary, EPD_DRAW_ALIGN_LEFT, false);
+
+    ui_text(fb, area.x + 28, area.y + 220, 18,
+            s_airdrop_status.state == READ_PICO_AIRDROP_RECEIVING
+                ? "正在写入 TF 卡，接收完成后刷新画面"
+                : "同名文件自动加 _1 后缀，不覆盖已有文件",
+            EPD_DRAW_ALIGN_LEFT, false);
+}
+
+static bool refresh_airdrop_sd_free(void) {
+    read_pico_sd_info_t sd = {0};
+    if (read_pico_sd_get_info(&sd) == ESP_OK && sd.mounted) {
+        s_free = sd.free_bytes;
+        return true;
+    }
+    s_free = 0;
+    return false;
+}
+
+static void stop_airdrop_session(void) {
+    s_airdrop_start_pending = false;
+    bool was_active = read_pico_airdrop_active();
+    if (was_active) read_pico_airdrop_stop();
+    read_pico_airdrop_get_status(&s_airdrop_status);
+    if (s_airdrop_status.books_received > 0) s_any_changed = true;
+    if (was_active && s_airdrop_status.fonts_received > 0) ttf_font_scan();
+}
+
 static void render(app_ctx_t* ctx, uint8_t* fb) {
     (void)ctx;
     if (s_usb_entry) {
@@ -771,6 +865,37 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
         ui_fill_round_rect(fb, control_rect(2), 22, s_pressed == 2 ? 0x60 : 0x38);
         ui_text_vc(fb, 342, 1014, 24, active ? "结束 USB 读卡" : "返回文件管理",
                    EPD_DRAW_ALIGN_CENTER, true);
+        return;
+    }
+    if (s_airdrop_entry) {
+        ui_clear_page(fb);
+        transfer_header(fb, "隔空投送", NULL);
+        draw_airdrop_status(fb);
+
+        ui_text(fb, 42, 464, 20, "苹果设备操作步骤", EPD_DRAW_ALIGN_LEFT, false);
+        EpdRect steps = {36, 494, 612, 212};
+        ui_fill_round_rect(fb, steps, 24, UI_GRAY_WHITE);
+        ui_draw_round_rect(fb, steps, 24, 0x90);
+        ui_text(fb, 64, 524, 21, "1  开启 iPhone / iPad / Mac 的 Wi-Fi 与蓝牙", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 64, 578, 21, "2  将苹果设备隔空投送设为「所有人 10 分钟」", EPD_DRAW_ALIGN_LEFT, false);
+        char step3[96];
+        snprintf(step3, sizeof(step3), "3  分享文件，选择「%s」",
+                 s_airdrop_status.device_name[0] ? s_airdrop_status.device_name : "kiikoread");
+        ui_text(fb, 64, 632, 21, step3, EPD_DRAW_ALIGN_LEFT, false);
+
+        ui_text(fb, 42, 728, 20, "文件存放位置", EPD_DRAW_ALIGN_LEFT, false);
+        EpdRect route = {36, 758, 612, 186};
+        ui_fill_round_rect(fb, route, 24, UI_GRAY_WHITE);
+        ui_draw_round_rect(fb, route, 24, 0x90);
+        ui_text(fb, 64, 786, 20, "书籍 (.epub / .txt)  →  books 书籍目录", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 64, 830, 20, "字体 (.ttf / .otf)   →  fonts 字体目录", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 64, 874, 20, "图片 (.jpg / .png)   →  pictures · 其他存入根目录", EPD_DRAW_ALIGN_LEFT, false);
+
+        EpdRect back = control_rect(2);
+        if (s_pressed == 2) ui_draw_pressed_round_rect(fb, back, UI_BTN_RADIUS);
+        bool active = read_pico_airdrop_active() || s_airdrop_start_pending;
+        ui_draw_button(fb, back, active ? "结束隔空投送" : "返回文件管理", false);
+        ui_nav_draw(fb, 2);
         return;
     }
     if (s_view == TRANSFER_METHODS) { draw_methods(fb); return; }
@@ -842,10 +967,14 @@ static void on_enter(app_ctx_t* ctx) {
     s_usb_retry_ms = 0;
     s_usb_host_connected = false;
     s_usb_capacity_bytes = 0;
+    s_airdrop_start_pending = false;
+    memset(&s_airdrop_status, 0, sizeof(s_airdrop_status));
+    read_pico_airdrop_get_status(&s_airdrop_status);
     s_method_message[0] = 0;
     s_view = TRANSFER_METHODS;
-    s_direct_entry = s_usb_requested || s_wifi_upload_requested || s_hotspot_requested;
+    s_direct_entry = s_usb_requested || s_wifi_upload_requested || s_hotspot_requested || s_airdrop_requested;
     s_usb_entry = s_usb_requested;
+    s_airdrop_entry = s_airdrop_requested;
     s_forget_confirm = false;
     s_scan_pending = false;
     s_network_connect_pending = false;
@@ -864,6 +993,20 @@ static void on_enter(app_ctx_t* ctx) {
         s_view = TRANSFER_HOME;
         s_usb_start_pending = true;
         snprintf(s_usb_message, sizeof(s_usb_message), "正在卸载本机 TF 卡并启动 USB…");
+    } else if (s_airdrop_requested) {
+        s_airdrop_requested = false;
+        s_view = TRANSFER_HOME;
+        if (!refresh_airdrop_sd_free()) {
+            s_airdrop_status.state = READ_PICO_AIRDROP_ERROR;
+            snprintf(s_airdrop_status.last_error, sizeof(s_airdrop_status.last_error), "请插入 TF 卡");
+        } else if (!read_pico_transfer_try_stop_if_idle()) {
+            s_airdrop_status.state = READ_PICO_AIRDROP_ERROR;
+            snprintf(s_airdrop_status.last_error, sizeof(s_airdrop_status.last_error), "传输正在结束，请稍后再试");
+        } else {
+            stop_session();
+            s_airdrop_start_pending = true;
+            s_airdrop_status.state = READ_PICO_AIRDROP_STARTING;
+        }
     } else if (s_hotspot_requested) {
         s_hotspot_requested = false;
         if (!start_hotspot_service()) {
@@ -925,6 +1068,14 @@ static bool stop_upload_if_idle(void) {
 // Join HTTP before clearing the old root; in-flight requests never move to another storage.
 static void transfer_on_media_lost(app_ctx_t* ctx) {
     (void)ctx;
+    if (s_airdrop_entry) {
+        stop_airdrop_session();
+        s_pressed = -1;
+        s_free = 0;
+        s_media_lost = true;
+        s_settle = false;
+        return;
+    }
     if (s_root.is_flash) return;
     stop_session();
     s_start_pending = s_scan_pending = false;
@@ -945,6 +1096,7 @@ static void transfer_on_exit(app_ctx_t* ctx) {
         if (err == ESP_OK) s_any_changed = true;
         else ESP_LOGW(TAG, "USB remained active on page exit: %s", esp_err_to_name(err));
     }
+    stop_airdrop_session();
     clear_password();
     s_scan_pending = s_network_connect_pending = false;
     read_pico_transfer_status_t latest = {0};
@@ -957,6 +1109,7 @@ static void transfer_on_exit(app_ctx_t* ctx) {
     } else stop_session();
     s_wifi_settings_only = false;
     s_usb_entry = false;
+    s_airdrop_entry = false;
     s_direct_entry = false;
     display_set_bulk_io(false);
     if (s_any_changed) book_store_notify_changed();
@@ -996,6 +1149,53 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
         if (err != ESP_OK)
             snprintf(s_usb_message, sizeof(s_usb_message), "USB 模式启动失败：%s", esp_err_to_name(err));
         return APP_REDRAW_PAGE;
+    }
+    if (s_airdrop_entry) {
+        if (s_airdrop_start_pending) {
+            s_airdrop_start_pending = false;
+            ttf_font_cache_clear();
+            read_pico_airdrop_cfg_t cfg = {
+                .books_dir = app_settings_books_dir(),
+                .fonts_dir = app_settings_fonts_dir(),
+                .pictures_dir = "/sdcard/pictures",
+                .other_dir = "/sdcard",
+            };
+            esp_err_t err = read_pico_airdrop_start(&cfg);
+            read_pico_airdrop_get_status(&s_airdrop_status);
+            refresh_airdrop_sd_free();
+            if (err != ESP_OK && s_airdrop_status.state != READ_PICO_AIRDROP_ERROR) {
+                s_airdrop_status.state = READ_PICO_AIRDROP_ERROR;
+                snprintf(s_airdrop_status.last_error, sizeof(s_airdrop_status.last_error), "隔空投送启动失败");
+            }
+            return APP_REDRAW_PAGE;
+        }
+        if (!read_pico_airdrop_active()) return APP_REDRAW_NONE;
+        read_pico_airdrop_poll();
+        read_pico_airdrop_status_t next = {0};
+        read_pico_airdrop_get_status(&next);
+        if (next.books_received > 0) s_any_changed = true;
+        if (next.fonts_received > s_airdrop_status.fonts_received) ttf_font_scan();
+        // 接收期间已在显示“正在接收”时保持屏幕静止，避免刷屏与写卡/无线电争用。
+        // Keep the panel still once in the receiving state to avoid display/SD/radio contention.
+        if (next.state == READ_PICO_AIRDROP_RECEIVING &&
+            s_airdrop_status.state == READ_PICO_AIRDROP_RECEIVING) {
+            s_airdrop_status.current_bytes = next.current_bytes;
+            s_airdrop_status.current_total = next.current_total;
+            return APP_REDRAW_NONE;
+        }
+        bool changed = next.state != s_airdrop_status.state ||
+                       next.completed_files != s_airdrop_status.completed_files ||
+                       strcmp(next.current_file, s_airdrop_status.current_file) != 0 ||
+                       strcmp(next.last_error, s_airdrop_status.last_error) != 0;
+        if (!changed) return APP_REDRAW_NONE;
+        s_settle = next.completed_files != s_airdrop_status.completed_files ||
+                   (s_airdrop_status.state == READ_PICO_AIRDROP_RECEIVING &&
+                    next.state != READ_PICO_AIRDROP_RECEIVING);
+        s_airdrop_status = next;
+        refresh_airdrop_sd_free();
+        draw_airdrop_status(ctx->fb);
+        s_area = airdrop_status_rect();
+        return APP_REDRAW_AREA;
     }
     if (usb_storage_active()) return APP_REDRAW_NONE;
     if (s_view == TRANSFER_METHODS) return APP_REDRAW_NONE;
@@ -1068,7 +1268,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
 }
 
 static int hit_control(uint16_t x, uint16_t y) {
-    if (usb_storage_active()) return ui_rect_hit(control_rect(2), x, y) ? 2 : -1;
+    if (usb_storage_active() || s_airdrop_entry) return ui_rect_hit(control_rect(2), x, y) ? 2 : -1;
     if (s_mode == READ_PICO_TRANSFER_MODE_AP && s_view == TRANSFER_HOME)
         for (int i = 0; i < 2; ++i) if (ui_rect_hit(control_rect(i), x, y)) return i;
     return ui_rect_hit(control_rect(2), x, y) ? 2 : -1;
@@ -1125,11 +1325,12 @@ static app_redraw_t method_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
 }
 
 static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
-    if (s_status.state == READ_PICO_TRANSFER_UPLOADING) return APP_REDRAW_NONE;
+    if (!s_airdrop_entry && s_status.state == READ_PICO_TRANSFER_UPLOADING) return APP_REDRAW_NONE;
     if (ev->type == UI_GESTURE_TAP && s_view != TRANSFER_PASSWORD && !usb_storage_active()) {
         int tab = ui_nav_hit(ev->x0, ev->y0);
         if (tab >= 0 && tab == ui_nav_hit(ev->x, ev->y)) {
-            if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
+            if (s_airdrop_entry) stop_airdrop_session();
+            else if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
             s_pressed = -1;
             ui_nav_request(ctx, tab);
             return APP_REDRAW_NONE;
@@ -1137,6 +1338,11 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
     }
     if (ev->type == UI_GESTURE_TAP && ev->y0 < 160 && ev->x0 < 120) {
         if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, false);
+        if (s_airdrop_entry) {
+            stop_airdrop_session();
+            ctx->request_return = true;
+            return APP_REDRAW_NONE;
+        }
         if (s_view == TRANSFER_PASSWORD) { clear_password(); s_view = TRANSFER_NETWORKS; return APP_REDRAW_PAGE; }
         if (s_view == TRANSFER_NETWORKS) {
             if (s_wifi_settings_only) { ctx->request_return = true; return APP_REDRAW_NONE; }
@@ -1161,6 +1367,11 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
         hit_control(ev->x, ev->y) == origin) {
         if (s_usb_entry) {
             return stop_usb_for_navigation(ctx, false);
+        }
+        if (s_airdrop_entry) {
+            stop_airdrop_session();
+            ctx->request_return = true;
+            return APP_REDRAW_NONE;
         }
         if (origin == 0 || origin == 1) {
             bool url = origin == 1;
@@ -1191,6 +1402,12 @@ static app_redraw_t on_gesture(app_ctx_t* ctx, const ui_gesture_event_t* ev) {
 
 static app_redraw_t on_key(app_ctx_t *ctx, int key) {
     if (s_usb_entry || usb_storage_active()) return stop_usb_for_navigation(ctx, key == UI_KEY_2);
+    if (s_airdrop_entry) {
+        stop_airdrop_session();
+        if (key == UI_KEY_2) ui_nav_request(ctx, 0);
+        else ctx->request_return = true;
+        return APP_REDRAW_NONE;
+    }
     if (s_view == TRANSFER_HOME && !stop_upload_if_idle()) return APP_REDRAW_NONE;
     if (key == UI_KEY_2) { ui_nav_request(ctx, 0); return APP_REDRAW_NONE; }
     if (s_view == TRANSFER_PASSWORD) { clear_password(); s_view = TRANSFER_NETWORKS; return APP_REDRAW_PAGE; }

@@ -48,6 +48,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "read_pico_airdrop.h"
 #include "read_pico_board.h"
 #include "read_pico_pmu.h"
 #include "read_pico_transfer.h"
@@ -795,6 +796,7 @@ void app_loop_run(const app_loop_config_t* config) {
         read_pico_transfer_status_t transfer;
         read_pico_transfer_get_status(&transfer);
         const bool wifi_busy = transfer.state != READ_PICO_TRANSFER_STOPPED ||
+            read_pico_airdrop_active() ||
             pico_online_busy();
         ble_pt_sync(app_settings_ble_turner() && !wifi_busy);
         ble_pt_poll();

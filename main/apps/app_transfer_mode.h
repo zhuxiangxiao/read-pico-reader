@@ -6,6 +6,8 @@ void app_transfer_request_usb_start(void);
 // File manager opens the selected transfer mode directly, without the method picker.
 void app_transfer_request_wifi_upload(void);
 void app_transfer_request_hotspot_start(void);
+/// 文件管理直接进入隔空投送接收页。/ File manager opens the AirDrop receiver view directly.
+void app_transfer_request_airdrop_start(void);
 
 // Settings uses this before opening Transfer to enter WiFi provisioning directly.
 void app_transfer_request_wifi_setup(void);

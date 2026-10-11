@@ -306,5 +306,56 @@ int main(void) {
     test_usb_stop_error = ESP_OK;
     tap(&ctx, control_rect(2));
     assert(ctx.request_return && !test_usb_active);
+
+    // 隔空投送无卡拦截、正常启动、接收中保持静止与随时取消、拔卡停止验证。
+    // AirDrop missing-card gate, normal start, static panel while receiving, immediate cancel and media-loss stop.
+    ctx.request_return = false;
+    test_sd_mounted = false;
+    app_transfer_request_airdrop_start();
+    on_enter(&ctx);
+    assert(s_direct_entry && s_airdrop_entry && !s_airdrop_start_pending);
+    assert(s_airdrop_status.state == READ_PICO_AIRDROP_ERROR && !strcmp(s_airdrop_status.last_error, "请插入 TF 卡"));
+    tap(&ctx, control_rect(2));
+    assert(ctx.request_return && test_airdrop_starts == 0);
+
+    ctx.request_return = false;
+    test_sd_mounted = true;
+    app_transfer_request_airdrop_start();
+    on_enter(&ctx);
+    assert(s_direct_entry && s_airdrop_entry && s_airdrop_start_pending && !test_airdrop_active);
+    assert(on_tick(&ctx) == APP_REDRAW_PAGE);
+    assert(!s_airdrop_start_pending && test_airdrop_active && test_airdrop_starts == 1);
+    assert(s_airdrop_status.state == READ_PICO_AIRDROP_READY);
+
+    // 进入接收态刷新一次状态卡，后续接收进度保持屏幕静止，并允许随时点结束取消。
+    // Entering RECEIVING refreshes the status card once; further progress stays static and allows immediate cancel.
+    test_airdrop_status.state = READ_PICO_AIRDROP_RECEIVING;
+    test_airdrop_status.rx_active = true;
+    strcpy(test_airdrop_status.current_file, "book.epub");
+    test_airdrop_status.current_bytes = 4096;
+    test_airdrop_status.current_total = 65536;
+    assert(on_tick(&ctx) == APP_REDRAW_AREA && !s_settle);
+    test_airdrop_status.current_bytes = 32768;
+    assert(on_tick(&ctx) == APP_REDRAW_NONE);
+    tap(&ctx, control_rect(2));
+    assert(ctx.request_return && !test_airdrop_active && test_airdrop_stops == 1);
+
+    // 完成书籍和字体投送后触发书架通知与字体重扫；拔卡立即停止服务。
+    // Completed book/font transfers notify the shelf and rescan fonts; media loss stops the service immediately.
+    ctx.request_return = false;
+    int changes_before = test_store_changes;
+    int fonts_before = test_font_scans;
+    app_transfer_request_airdrop_start();
+    on_enter(&ctx);
+    assert(on_tick(&ctx) == APP_REDRAW_PAGE);
+    test_airdrop_status.state = READ_PICO_AIRDROP_DONE;
+    test_airdrop_status.completed_files = 2;
+    test_airdrop_status.books_received = 1;
+    test_airdrop_status.fonts_received = 1;
+    assert(on_tick(&ctx) == APP_REDRAW_AREA && s_settle && test_font_scans == fonts_before + 1);
+    app_transfer.on_media_lost(&ctx);
+    assert(s_media_lost && !test_airdrop_active && !s_free);
+    transfer_on_exit(&ctx);
+    assert(test_store_changes == changes_before + 1 && !s_airdrop_entry);
     puts("transfer_ui_host_test: PASS");
 }
