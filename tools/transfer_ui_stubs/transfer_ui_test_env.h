@@ -64,6 +64,7 @@ static inline bool ui_rect_hit(EpdRect r,int x,int y) { return x>=r.x&&y>=r.y&&x
 static inline EpdRect ui_rect_union(EpdRect a,EpdRect b) { int x=a.x<b.x?a.x:b.x,y=a.y<b.y?a.y:b.y; int x2=a.x+a.width>b.x+b.width?a.x+a.width:b.x+b.width; int y2=a.y+a.height>b.y+b.height?a.y+a.height:b.y+b.height; return(EpdRect){x,y,x2-x,y2-y}; }
 static inline void ui_clear_page(uint8_t* f) {(void)f;}
 static inline void ui_clear_rect_fast(uint8_t* f,EpdRect r) {(void)f;(void)r;}
+static inline void ui_fill_rect_fast(EpdRect r,uint8_t c,uint8_t* f) {(void)r;(void)c;(void)f;}
 static inline void ui_draw_header(uint8_t* f,...) {(void)f;}
 static inline void ui_draw_button(uint8_t* f,...) {(void)f;}
 static inline void ui_draw_icon(uint8_t* f,...) {(void)f;}
