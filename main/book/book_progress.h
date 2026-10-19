@@ -20,6 +20,10 @@
 /// 调用方须串行化所有进度写入与遗忘；HTTP 退出并 join 后才交回阅读页。
 /// Callers serialize progress writes and forget operations; HTTP stops and joins before returning to reading.
 
+/// RAM change serial for UI caches; no persistent format change.
+uint32_t book_progress_revision(void);
+void book_progress_notify_changed(void);
+
 typedef struct book_progress_watch book_progress_watch_t;
 /// 为待保存进度创建路径监视；内存不足返回 NULL。注册/注销仅在 HTTP 停止并 join 后调用。
 /// Watch pending progress for one path; return NULL on allocation failure. Register/unregister only while HTTP is stopped and joined.

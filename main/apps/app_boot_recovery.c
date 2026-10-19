@@ -35,7 +35,7 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     ui_nav_status(fb);
     ui_nav_back(fb, 58, 117);
     ui_text_vc(fb, 342, 117, 36, "启动恢复", EPD_DRAW_ALIGN_CENTER, false);
-    epd_fill_rect((EpdRect){36, 195, 612, 2}, 0x58, fb);
+    ui_fill_rect_fast((EpdRect){36, 195, 612, 2}, 0x58, fb);
     EpdRect card = {36, 244, 612, 320};
     ui_fill_round_rect(fb, card, 24, 0xf0);
     ui_draw_round_rect(fb, card, 24, 0x38);

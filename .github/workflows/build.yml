@@ -17,6 +17,17 @@ jobs:
           bash tools/run_water_turn_host_test.sh
           bash tools/run_display_host_test.sh
           bash tools/run_display_navigation_tests.sh
+          python3 tools/pmic_gate_host_test.py
+          python3 tools/boot_panel_actions_host_test.py
+          python3 tools/lock_pin_host_test.py
+          python3 tools/lock_screen_host_test.py
+          python3 tools/reader_spacing_host_test.py
+          python3 tools/test_book_toc.py
+          node tools/flasher_integrity_host_test.cjs
+          python3 tools/vertical_punctuation_host_test.py
+          python3 tools/vertical_number_host_test.py
+          cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/book_layout.c main/book/html_text.c -o build/book-tests/layout
+          build/book-tests/layout
 
   build:
     runs-on: ubuntu-latest

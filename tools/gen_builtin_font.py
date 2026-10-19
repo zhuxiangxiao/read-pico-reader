@@ -164,12 +164,20 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--src", type=Path, default=default_src())
     parser.add_argument("--out", type=Path, default=OUT)
+    parser.add_argument("--extend-text", help="Keep the existing output cmap and add only these UI outline glyphs")
     args = parser.parse_args()
     if not args.src.is_file():
         print(f"missing source font: {args.src}", file=sys.stderr)
         return 1
 
-    text = unique_text(ascii_printable(), load_preset(CHARSET), scan_sources())
+    if args.extend_text is not None:
+        # 局部修补只补指定轮廓，避免扫描历史文本扩张整个字库。
+        # A targeted repair adds only requested outlines, without growing the subset from historical UI strings.
+        from fontTools.ttLib import TTFont
+        with TTFont(args.out) as existing:
+            text = unique_text("".join(chr(cp) for cp in existing.getBestCmap()), args.extend_text)
+    else:
+        text = unique_text(ascii_printable(), load_preset(CHARSET), scan_sources())
     cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
     print(f"charset {len(text)} chars ({cjk} CJK)")
 

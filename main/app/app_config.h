@@ -46,8 +46,8 @@
 // Count only whole system-page transitions; local controls, dialogs and cover updates do not advance
 // the cleanup cadence. Reading keeps its own configurable full-screen cleanup interval.
 #define APP_UI_GC16_EVERY 40
-// 普通系统页使用 16 灰阶 GL16；每隔几次做一遍全像素灰阶整理，避免只刷变化区域留下旧页轮廓。
-// Ordinary system pages use 16-gray GL16; periodically drive unchanged pixels as well to suppress prior-page outlines.
+// 非普通子页面的旧灰阶出口每三次做全像素整理；普通模式已改用单次柔和差分，仅保留下面的完整清残影周期。
+// Legacy nonordinary subpage output settles every third page; ordinary uses single soft differences with only the full-cleanup interval below.
 #define APP_UI_FAST_GL16_SETTLE_EVERY 3
 // 全像素灰阶仍不能无限消除累积残影，达到阈值时同步做完整 GC16。
 // Full-pixel gray updates cannot remove unlimited ghosting, so periodically run a synchronous GC16.

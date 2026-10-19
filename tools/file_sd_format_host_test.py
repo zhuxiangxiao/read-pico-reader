@@ -20,6 +20,10 @@ typedef struct {bool present,mounted,needs_format;} read_pico_sd_info_t;
 typedef struct {int x0,y0;} ui_gesture_event_t;
 typedef int esp_err_t;
 #define ESP_OK 0
+#define ESP_ERR_NOT_FINISHED 3
+static bool avatar_ok=true;
+static bool book_cover_jobs_quiesce(unsigned ms){assert(ms==2000);return true;}
+static bool ui_avatar_quiesce(unsigned ms){assert(ms==2000);return avatar_ok;}
 #define APP_REDRAW_NONE 0
 #define APP_REDRAW_PAGE 1
 static read_pico_sd_info_t s_sd;
@@ -45,6 +49,7 @@ int main(void){
  s_sd=(read_pico_sd_info_t){true,false,true};format_error=-1;s_scan_pending=false;
  tap(100,200,false);assert(!s_sd_notice[0]);tap(100,200,false);
  assert(formats==2&&!s_sd_format_confirm&&!s_scan_pending&&strstr(s_sd_notice,"ERROR"));
+ avatar_ok=false;format_error=0;tap(100,200,false);tap(100,200,false);assert(formats==2&&!s_sd_format_confirm&&!s_scan_pending);
  puts("PASS: absent/contact/timeout cards cannot format; confirmation/cancel/hold guards, error and success rescan");
 }
 '''

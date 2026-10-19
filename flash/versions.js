@@ -59,11 +59,13 @@
       const next = installer.cloneNode(true);
       next.manifest = manifestURL;
       next.setAttribute("manifest", manifestURL);
+      next.prepareManifest = () => window.KiikoreadFlasher.prepare(manifest, manifestURL, choice.files);
       const shortVersion = manifest.version.split("-").pop();
       next.querySelector("button").textContent = `连接墨水屏，刷入 ${shortVersion}`;
       installer.replaceWith(next);
       installer = next;
-      download.href = new URL(choice.bin, document.baseURI).href;
+      download.href = new URL(choice === latest ? `./Pico-update-${manifest.version}.bin` : choice.bin,
+                              document.baseURI).href;
       download.textContent = `下载 ${shortVersion} TF 卡升级 Bin ↓`;
       download.hidden = false;
       manifestReady = true;

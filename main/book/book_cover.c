@@ -283,7 +283,7 @@ static void png_read_mem(png_structp png, png_bytep dst, png_size_t count) {
     input->pos += count;
 }
 static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigned out_width,
-                     unsigned out_height, uint8_t *out) {
+                     unsigned out_height, uint8_t *out, uint8_t *alpha) {
     png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL);
     if (!png) return false;
     png_infop info = png_create_info_struct(png);
@@ -298,13 +298,15 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
     // freeing an uninitialised pointer there would crash.
     scale_step_t *volatile xmap = NULL, *volatile ymap = NULL;
     uint8_t *volatile rows[2] = {NULL, NULL};
+    uint8_t *volatile masks[2] = {NULL, NULL};
     png_input_t input = {data, size, 0, file};
     bool ok = false;
     if (setjmp(png_jmpbuf(png))) goto done;
     png_set_read_fn(png, &input, png_read_mem);
     png_read_info(png, info);
     png_uint_32 width = png_get_image_width(png, info), height = png_get_image_height(png, info);
-    if (!width || !height || width > 8192 || height > 8192) goto done;
+    if (!width || !height || width > 8192 || height > 8192 ||
+        png_get_interlace_type(png, info) != PNG_INTERLACE_NONE) goto done;
     int color = png_get_color_type(png, info), depth = png_get_bit_depth(png, info);
     if (depth == 16) png_set_strip_16(png);
     if (color == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
@@ -328,8 +330,9 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
         ymap = scale_map(out_height, crop.height);
         rows[0] = cover_alloc(crop.width);
         rows[1] = cover_alloc(crop.width);
+        if (alpha) { masks[0] = cover_alloc(crop.width); masks[1] = cover_alloc(crop.width); }
     }
-    if (xmap && ymap && rows[0] && rows[1]) {
+    if (xmap && ymap && rows[0] && rows[1] && (!alpha || (masks[0] && masks[1]))) {
         for (png_uint_32 y = 0; y < height; ++y) {
             png_read_row(png, row, NULL);
             decode_yield((unsigned)y);
@@ -339,7 +342,9 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
             for (unsigned x = 0; x < crop.width; ++x) {
                 const uint8_t *p = row + (size_t)(crop.x + x) * 4;
                 const uint8_t gray = luminance(p[0], p[1], p[2]);
-                cur[x] = (uint8_t)(((unsigned)gray * p[3] + 255u * (255u - p[3])) / 255u);
+                // 透明层保留预乘灰度与独立alpha，避免缩放后出现白边。/ Preserve premultiplied gray and alpha for layers, avoiding white scaling fringes.
+                cur[x] = (uint8_t)(((unsigned)gray * p[3] + (alpha ? 0 : 255u * (255u - p[3])) + 127u) / 255u);
+                if (alpha) masks[wy & 1][x] = p[3];
             }
             // 两行都齐了的目标行可以一次输出完：同一源行可能对应多个目标行（放大时）。
             // Every destination row whose two source rows are now present can be emitted: one source
@@ -353,6 +358,8 @@ static bool png_gray_input(const uint8_t *data, size_t size, FILE *file, unsigne
                     const int sx = xmap[x].at, fx = xmap[x].frac;
                     const int sx1 = scale_next(sx, crop.width);
                     out[next_y * out_width + x] = bilinear4(r0[sx], r0[sx1], r1[sx], r1[sx1], fx, fy);
+                    if (alpha) alpha[next_y * out_width + x] = bilinear4(masks[sy & 1][sx], masks[sy & 1][sx1],
+                        masks[sy1 & 1][sx], masks[sy1 & 1][sx1], fx, fy);
                 }
                 ++next_y;
             }
@@ -364,6 +371,7 @@ done:
     free(ymap);
     free(rows[0]);
     free(rows[1]);
+    free((void *)masks[0]); free((void *)masks[1]);
     free((void *)row);
     png_destroy_read_struct(&png, &info, NULL);
     return ok;
@@ -379,7 +387,7 @@ bool book_image_grayscale(const uint8_t *data, size_t size, bool png,
     if (!data || !size || !out || !out_width || !out_height ||
         out_width > 1216 || out_height > 1216 || (size_t)out_width * out_height > 684u * 1216u)
         return false;
-    return png ? png_gray_input(data, size, NULL, out_width, out_height, out)
+    return png ? png_gray_input(data, size, NULL, out_width, out_height, out, NULL)
                : jpeg_gray(data, size, out_width, out_height, out);
 }
 
@@ -456,9 +464,9 @@ static void cover_cache_write(const char *path, const cover_cache_header_t *head
     remove(temp);
 }
 
-bool book_cover_load_gray(const char *path, const char *title, const char *author,
+static bool book_cover_load_gray_impl(const char *path, const char *title, const char *author,
                           uint8_t out[BOOK_COVER_W * BOOK_COVER_H],
-                          bool allow_decode, bool *pending) {
+                          bool allow_decode, bool *pending, bool allow_auto, bool *auto_cache) {
     if (pending) *pending = false;
     if (!path || !*path || !out) return false;
     char canonical_title[256];
@@ -478,11 +486,14 @@ bool book_cover_load_gray(const char *path, const char *title, const char *autho
         uint8_t *data = NULL;
         size_t size = 0;
         bool png = false;
-        esp_err_t err = book_epub_cover(path, &data, &size, &png);
+        size_t free_bytes=heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+        size_t budget=free_bytes>2u*1024u*1024u?free_bytes-2u*1024u*1024u:0;
+        esp_err_t err = budget ? book_epub_cover_bounded(path,&data,&size,&png,budget) : ESP_ERR_NO_MEM;
         if (err == ESP_OK) good = book_cover_thumbnail(data, size, png, out);
         free(data);
         if (err == ESP_ERR_NO_MEM) cache_result = false;
     }
+    if (!good && !allow_auto) { if(pending)*pending=true;if(auto_cache)*auto_cache=cache_result;return false; }
     if (!good) good = book_auto_cover_render(path, title, author, BOOK_COVER_W, BOOK_COVER_H, out);
     if (good && cache_result) cover_cache_write(cache_path, &key, out);
     return good;
@@ -490,9 +501,9 @@ bool book_cover_load_gray(const char *path, const char *title, const char *autho
 
 // 与网格缓存分离，不能把已经裁剪的封面当作完整原图。
 // Separate from grid thumbnails: a cropped cache cannot represent the complete source.
-bool book_cover_load_list_gray(const char *path, const char *title, const char *author,
+static bool book_cover_load_list_gray_impl(const char *path, const char *title, const char *author,
                                uint8_t out[BOOK_COVER_W * BOOK_COVER_H], bool allow_decode,
-                               bool *pending, unsigned *width, unsigned *height) {
+                               bool *pending, unsigned *width, unsigned *height, bool allow_auto, bool *auto_cache) {
     if (pending) *pending = false;
     if (!path || !out || !width || !height) return false;
     *width = BOOK_COVER_W; *height = BOOK_COVER_H;
@@ -538,6 +549,7 @@ bool book_cover_load_list_gray(const char *path, const char *title, const char *
         free(data);
         if ((error != ESP_OK && error != ESP_ERR_NOT_FOUND) || (error == ESP_OK && !good)) cacheable = false;
     }
+    if (!good && !allow_auto) { if(pending)*pending=true;if(auto_cache)*auto_cache=cacheable;return false; }
     if (!good) {
         *width = BOOK_COVER_W; *height = BOOK_COVER_H;
         good = book_auto_cover_render(path, title, author, *width, *height, out);
@@ -560,6 +572,74 @@ bool book_cover_load_list_gray(const char *path, const char *title, const char *
         }
     }
     return good;
+}
+
+/* ---- 已处理的黑白点阵落卡 / Persistent finished monochrome raster ---- */
+// 更改封面点阵算法时递增此版本；首页与书架各保留一个快刷结果，不按相位累积文件。
+// Bump for changes to dithering; retain one Home and one shelf raster per book, not one per phase.
+#define FAST_COVER_REVISION 1u
+typedef struct {
+    cover_cache_header_t source;
+    uint32_t revision, width, height, stride, contrast, phase, white_edge;
+    uint64_t checksum;
+} fast_cover_header_t;
+static uint64_t fast_cover_checksum(const uint8_t *data, size_t size) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    while (size--) hash = (hash ^ *data++) * UINT64_C(1099511628211);
+    return hash;
+}
+static bool fast_cover_key(const char *source, const char *title, const char *author,
+                            book_fast_cover_key_t key, char path[120], fast_cover_header_t *header) {
+    const bool home = key.width == 172 && key.height == 250;
+    if (!source || !*source || !key.width || key.width > 176 || !key.height ||
+        (key.height > 240 && !home) ||
+        key.stride < (key.width+7)/8 || key.stride > 22 || key.phase > 15 || key.contrast > 200) return false;
+    char canonical[256];
+    if (book_title_from_path(source, canonical, sizeof(canonical))) title = canonical;
+    if (!title || !*title) return false;
+    memset(header, 0, sizeof(*header));
+    if (!cover_cache_key(source, title, author, path, 120, &header->source)) return false;
+    snprintf(path, 120, "/sdcard/.readpico/covers/%016llx-%sfast.bin",
+             (unsigned long long)header->source.path_hash, home ? "home-" : "");
+    header->revision = FAST_COVER_REVISION; header->width = key.width; header->height = key.height;
+    header->stride = key.stride; header->contrast = key.contrast; header->phase = key.phase;
+    return true;
+}
+bool book_cover_fast_cache_read(const char *source, const char *title, const char *author,
+                                book_fast_cover_key_t key, uint8_t *out, bool *white_edge) {
+    char path[120]; fast_cover_header_t expected, found;
+    if (!out || !white_edge || !fast_cover_key(source, title, author, key, path, &expected)) return false;
+    FILE *file = fopen(path, "rb"); if (!file) return false;
+    const size_t bytes = (size_t)key.stride * key.height;
+    bool ok = fread(&found, 1, sizeof(found), file) == sizeof(found) &&
+        found.source.magic == expected.source.magic && found.source.schema == expected.source.schema &&
+        found.source.template_version == expected.source.template_version &&
+        found.source.file_size == expected.source.file_size && found.source.modified == expected.source.modified &&
+        found.source.path_hash == expected.source.path_hash && found.source.text_hash == expected.source.text_hash &&
+        found.revision == expected.revision && found.width == key.width && found.height == key.height &&
+        found.stride == key.stride && found.contrast == key.contrast && found.phase == key.phase &&
+        found.white_edge <= 1 && fread(out, 1, bytes, file) == bytes && fgetc(file) == EOF &&
+        fast_cover_checksum(out, bytes) == found.checksum;
+    fclose(file);
+    if (ok) *white_edge = found.white_edge != 0;
+    return ok;
+}
+static void fast_cache_write(const char *source,const char *title,const char *author,
+                             book_fast_cover_key_t key,const uint8_t *out,bool white_edge,int64_t size,int64_t modified) {
+    char path[120], temp[128]; fast_cover_header_t header;
+    if (!out || !fast_cover_key(source, title, author, key, path, &header)) return;
+    if(size>=0&&(header.source.file_size!=(uint64_t)size||header.source.modified!=modified))return;
+    if ((mkdir("/sdcard/.readpico", 0777) && errno != EEXIST) ||
+        (mkdir("/sdcard/.readpico/covers", 0777) && errno != EEXIST)) return;
+    if (snprintf(temp, sizeof(temp), "%s.tmp", path) >= (int)sizeof(temp)) return;
+    header.white_edge = white_edge;
+    const size_t bytes = (size_t)key.stride * key.height;
+    header.checksum = fast_cover_checksum(out, bytes);
+    FILE *file = fopen(temp, "wb"); if (!file) return;
+    bool ok = fwrite(&header, 1, sizeof(header), file) == sizeof(header) && fwrite(out, 1, bytes, file) == bytes;
+    if (fclose(file)) ok = false;
+    if (ok && !rename(temp, path)) return;
+    (void)remove(temp);
 }
 
 static bool file_frame(FILE *file, bool png, uint8_t *sof, unsigned *width, unsigned *height) {
@@ -676,7 +756,7 @@ bool book_image_file_grayscale(const char *path, bool png, unsigned width, unsig
     FILE *file = fopen(path, "rb");
     if (!file) return false;
     bool ok = false;
-    if (png) ok = png_gray_input(NULL, (size_t)st.st_size, file, width, height, out);
+    if (png) ok = png_gray_input(NULL, (size_t)st.st_size, file, width, height, out, NULL);
     else {
         uint8_t sof = 0;
         unsigned source_w = 0, source_h = 0;
@@ -690,6 +770,58 @@ bool book_image_file_grayscale(const char *path, bool png, unsigned width, unsig
             ok = ok && plane.pixels >= (size_t)width * height;
         }
     }
+    fclose(file);
+    return ok;
+}
+
+bool book_cover_load_gray(const char *p,const char *t,const char *a,uint8_t out[BOOK_COVER_W * BOOK_COVER_H],bool decode,bool *pending) {
+    return book_cover_load_gray_impl(p,t,a,out,decode,pending,true,NULL);
+}
+bool book_cover_load_list_gray(const char *p,const char *t,const char *a,uint8_t out[BOOK_COVER_W * BOOK_COVER_H],bool decode,bool *pending,unsigned *w,unsigned *h) {
+    return book_cover_load_list_gray_impl(p,t,a,out,decode,pending,w,h,true,NULL);
+}
+int book_cover_load_io(const char *p,const char *t,const char *a,uint8_t *out,bool list,unsigned *w,unsigned *h,bool *auto_cache) {
+    bool automatic=false;*w=BOOK_COVER_W;*h=BOOK_COVER_H;
+    bool ready=list?book_cover_load_list_gray_impl(p,t,a,out,true,&automatic,w,h,false,auto_cache):
+                    book_cover_load_gray_impl(p,t,a,out,true,&automatic,false,auto_cache);
+    return ready?1:automatic?0:-1;
+}
+bool book_cover_list_cache_dimensions(const char *p,const char *t,const char *a,unsigned *w,unsigned *h) {
+    char canonical[256],path[120];cover_cache_header_t key,found;
+    if(book_title_from_path(p,canonical,sizeof(canonical)))t=canonical;
+    if(!cover_cache_key(p,t,a,path,sizeof(path),&key))return false;
+    char *suffix=strrchr(path,'.');if(!suffix)return false;strcpy(suffix,"-list.bin");
+    FILE *f=fopen(path,"rb");if(!f)return false;
+    bool ok=fread(&found,1,sizeof(found),f)==sizeof(found)&&found.magic==key.magic&&found.schema==key.schema&&
+        found.template_version==key.template_version&&found.file_size==key.file_size&&found.modified==key.modified&&
+        found.path_hash==key.path_hash&&found.text_hash==key.text_hash&&found.width&&found.height&&
+        found.width<=BOOK_COVER_W&&found.height<=BOOK_COVER_H;
+    fclose(f);if(ok){*w=found.width;*h=found.height;}return ok;
+}
+void book_cover_store_generated(const char *p,const char *t,const char *a,const uint8_t *pixels,bool list,int64_t size,int64_t modified) {
+    char canonical[256],path[120];cover_cache_header_t key;
+    if(book_title_from_path(p,canonical,sizeof(canonical)))t=canonical;
+    if(!cover_cache_key(p,t,a,path,sizeof(path),&key))return;
+    if(key.file_size!=(uint64_t)size||key.modified!=modified)return;
+    if(list){char *suffix=strrchr(path,'.');if(!suffix)return;strcpy(suffix,"-list.bin");}
+    cover_cache_write(path,&key,pixels);
+}
+
+void book_cover_fast_cache_write(const char *p,const char *t,const char *a,book_fast_cover_key_t key,const uint8_t *pixels,bool edge) {
+    fast_cache_write(p,t,a,key,pixels,edge,-1,0);
+}
+void book_cover_fast_cache_write_checked(const char *p,const char *t,const char *a,book_fast_cover_key_t key,const uint8_t *pixels,bool edge,int64_t size,int64_t modified) {
+    fast_cache_write(p,t,a,key,pixels,edge,size,modified);
+}
+
+// 与壁纸解码共用行窗口，不保留整张源RGBA图。/ Reuse wallpaper row windows without retaining full-source RGBA.
+bool book_png_file_layer(const char *path, unsigned width, unsigned height, uint8_t *gray, uint8_t *alpha) {
+    struct stat st;
+    if (!path || !gray || !alpha || !width || !height || width > 684 || height > 1216 ||
+        stat(path, &st) || st.st_size <= 0 || (uint64_t)st.st_size > BOOK_IMAGE_FILE_MAX) return false;
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    bool ok = png_gray_input(NULL, (size_t)st.st_size, file, width, height, gray, alpha);
     fclose(file);
     return ok;
 }

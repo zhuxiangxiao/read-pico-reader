@@ -43,3 +43,26 @@ bool book_jpeg_frame(const uint8_t *data, size_t size, uint8_t *sof, unsigned *w
 bool book_cover_load_list_gray(const char *path, const char *title, const char *author,
                                uint8_t out[BOOK_COVER_W * BOOK_COVER_H], bool allow_decode,
                                bool *pending, unsigned *width, unsigned *height);
+
+/// 快刷已处理的点阵封面；按书源身份、尺寸、对比度与抖动相位失效，像素带校验。
+/// Finished fast-cover pixels: invalidate by source, geometry, contrast and dither phase; validate payload.
+typedef struct { unsigned width, height, stride, contrast, phase; } book_fast_cover_key_t;
+bool book_cover_fast_cache_read(const char *path, const char *title, const char *author,
+                                book_fast_cover_key_t key, uint8_t *out, bool *white_edge);
+void book_cover_fast_cache_write(const char *path, const char *title, const char *author,
+                                 book_fast_cover_key_t key, const uint8_t *out, bool white_edge);
+
+/// 仅文件/图像工作，不调用字库；1完成、0需要UI生成封面、-1失败。
+/// File/image work only, no font calls:1 ready,0 UI-generated cover needed,-1 failure.
+int book_cover_load_io(const char *path,const char *title,const char *author,uint8_t *out,bool list,unsigned *width,unsigned *height,bool *auto_cache);
+/// 仅读取有效列表缓存的尺寸头，点阵命中时无需分配灰阶像素。/ Read validated list dimensions without a gray allocation on a packed-cache hit.
+bool book_cover_list_cache_dimensions(const char *path,const char *title,const char *author,unsigned *width,unsigned *height);
+/// 后台持久化UI生成的176x240封面。/ Persist an UI-generated176x240 cover in the worker.
+void book_cover_store_generated(const char *path,const char *title,const char *author,const uint8_t *pixels,bool list,int64_t size,int64_t modified);
+
+/// 异步结果仅在来源尺寸/修改时间仍匹配时持久化，防止换书后固化旧像素。
+/// Persist asynchronous pixels only under their original source identity, never a replaced book's key.
+void book_cover_fast_cache_write_checked(const char *path,const char *title,const char *author,book_fast_cover_key_t key,const uint8_t *pixels,bool edge,int64_t size,int64_t modified);
+
+/// PNG预乘灰度及alpha；输出缓冲各width*height字节。/ Premultiplied PNG gray and alpha; each output buffer holds width*height bytes.
+bool book_png_file_layer(const char *path,unsigned width,unsigned height,uint8_t *gray,uint8_t *alpha);

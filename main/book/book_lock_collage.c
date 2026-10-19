@@ -5,6 +5,10 @@
  * English: D collage: aspect-preserved rounded covers share a 15-degree rotation, with native system glyphs and a white sticker edge.
  * 冻结：不接入在线书源、不切阅读字体、不全量载入字库；仅保留有界工作区和 TF 缓存。
  * Frozen: No online sources, reader-font changes or whole-font loads; bounded workspaces and SD cache only.
+ * 用户修订：复用单次扫描的文件信息，只读封面头取得尺寸；锁屏显示后再提交新整帧缓存。
+ * User revision: reuse scan metadata, read cover headers for dimensions and commit fresh frame caches after presentation.
+ * 冻结：不改拼贴像素、缓存键或校验；延后写入仅引用调用者仍持有的完整画布，不增加整帧副本。
+ * Frozen: Keep artwork, cache keys and checksums. Deferred persistence borrows a caller-owned complete frame, never another full copy.
  */
 #include "book_lock_collage.h"
 #include <dirent.h>
@@ -45,7 +49,7 @@
 #endif
 #define LOCK_CACHE_DIR BOOK_LOCK_CACHE_PARENT "/locks"
 #define LOCK_CACHE_VERSION 1u
-#define LOCK_RENDER_REVISION 3u
+#define LOCK_RENDER_REVISION 4u
 #define LOCK_CACHE_MAGIC UINT32_C(0x4c434431)
 #define LOCK_COVER_HEIGHT 334.f
 #define LOCK_GAP 18.f
@@ -68,6 +72,10 @@ typedef struct {
     int roots_count;
     nvs_handle_t hidden;
     bool cache_complete;
+    const char *font_path;
+    struct stat font_stat;
+    bool font_stat_valid;
+    int font_weight;
 } lock_library_t;
 typedef struct {
     uint32_t magic, version;
@@ -75,6 +83,11 @@ typedef struct {
     uint32_t width, height, source_w, source_h, rotation, bytes;
 } lock_cache_t;
 typedef struct { float x, y, w; unsigned index; } lock_placement_t;
+static lock_library_t *s_library_index;
+static unsigned s_library_revision,s_library_root_count;
+void book_lock_collage_invalidate(void) { free(s_library_index);s_library_index=NULL; }
+static const uint8_t *s_pending_frame;
+static lock_cache_t s_pending_cache;
 
 static void lock_yield(unsigned at) {
 #ifdef ESP_PLATFORM
@@ -96,11 +109,10 @@ static uint64_t hash_bytes(uint64_t h, const void *bytes, size_t length) {
 static uint64_t hash_text(uint64_t h, const char *text) {
     return hash_bytes(h, text, strlen(text) + 1);
 }
-static uint64_t file_key(uint64_t h, const char *path) {
-    struct stat st;
+static uint64_t file_key(uint64_t h, const char *path, const struct stat *st) {
     h = hash_text(h, path);
-    if (!stat(path, &st)) {
-        int64_t size = st.st_size, modified = st.st_mtime;
+    if (st) {
+        int64_t size = st->st_size, modified = st->st_mtime;
         h = hash_bytes(h, &size, sizeof(size));
         h = hash_bytes(h, &modified, sizeof(modified));
     }
@@ -139,11 +151,11 @@ static void collect_book(lock_library_t *library, const char *path,
     book_progress_t progress;
     if (saved) candidate.recent = saved->last_open_s;
     else if (book_progress_load(path, candidate.size, &progress)) candidate.recent = progress.last_open_s;
-    candidate.key = file_key(UINT64_C(14695981039346656037), path);
+    candidate.key = file_key(UINT64_C(14695981039346656037), path, st);
     candidate.key = hash_text(candidate.key, candidate.title);
-    candidate.key = file_key(candidate.key, ttf_font_path());
-    int weight = ttf_get_weight();
-    candidate.key = hash_bytes(candidate.key, &weight, sizeof(weight));
+    candidate.key = file_key(candidate.key, library->font_path,
+        library->font_stat_valid ? &library->font_stat : NULL);
+    candidate.key = hash_bytes(candidate.key, &library->font_weight, sizeof(library->font_weight));
     unsigned at = 0;
     while (at < library->used && book_order(&library->books[at], &candidate) <= 0) ++at;
     if (at >= LOCK_BOOKS) return;
@@ -203,17 +215,56 @@ static bool backfill_book(const char *path, const book_progress_t *progress, voi
         collect_book(library, path, &st, progress);
     return true;
 }
+// 只保留最近十五本及根内总数；阅读进度变化从NVS合并，目录结构变化才重新遍历TF。
+// Retain only the top15 and root count; merge progress from NVS and rescan TF only after structural changes.
+static bool index_progress(const char *path,const book_progress_t *progress,void *opaque) {
+    lock_library_t *library=opaque;struct stat st;
+    if(stat(path,&st)||st.st_size<0||(uint64_t)st.st_size!=progress->file_size||!S_ISREG(st.st_mode)||hidden_book(library->hidden,path))return true;
+    bool inside=false,duplicate=false;
+    for(int i=0;i<library->roots_count;++i){size_t n=strlen(library->roots[i].path);if(!strncmp(path,library->roots[i].path,n)&&path[n]=='/')inside=true;}
+    for(unsigned i=0;i<library->used;++i)if(!strcmp(path,library->books[i].path))duplicate=true;
+    unsigned count=library->count;
+    if(!duplicate)collect_book(library,path,&st,progress);
+    library->count=inside?count:count<UINT_MAX?count+1:count;
+    return true;
+}
+static bool index_restore(lock_library_t *library) {
+    if(!s_library_index||s_library_revision!=book_store_revision()||!library->cache_complete||
+       library->roots_count!=s_library_index->roots_count)return false;
+    for(int i=0;i<library->roots_count;++i)
+        if(strcmp(library->roots[i].path,s_library_index->roots[i].path))return false;
+    for(unsigned i=0;i<s_library_index->used;++i){
+        lock_book_t *old=&s_library_index->books[i];struct stat st;book_progress_t progress={0};
+        if(stat(old->path,&st)||!S_ISREG(st.st_mode)||hidden_book(library->hidden,old->path))return false;
+        bool saved=st.st_size>=0&&(uint64_t)st.st_size<=UINT32_MAX&&book_progress_load(old->path,(uint32_t)st.st_size,&progress);
+        // 清进度可能让此前未进入前十五的书补位，必须重新扫描保证顺序。
+        // Clearing progress can promote an uncached book; rescan to preserve exact ranking.
+        if(old->recent&&(!saved||progress.last_open_s<old->recent))return false;
+        collect_book(library,old->path,&st,saved?&progress:NULL);
+    }
+    library->count=s_library_root_count;
+    return book_progress_list(index_progress,library)==ESP_OK;
+}
 static lock_library_t *library_load(void) {
-    lock_library_t *library = lock_alloc(sizeof(*library));
-    if (!library) return NULL;
-    library->cache_complete = true;
-    (void)nvs_open("rp_shelf", NVS_READONLY, &library->hidden);
-    (void)book_store_roots(library->roots, &library->roots_count);
-    if (book_store_roots_degraded()) library->cache_complete = false;
-    for (int i = 0; i < library->roots_count; ++i) scan_root(library, library->roots[i].path);
-    if (book_progress_list(backfill_book, library) != ESP_OK) library->cache_complete = false;
-    if (library->hidden) nvs_close(library->hidden);
-    library->hidden = 0;
+    lock_library_t *library=lock_alloc(sizeof(*library));if(!library)return NULL;
+    library->cache_complete=true;library->font_path=ttf_font_path();
+    library->font_stat_valid=!stat(library->font_path,&library->font_stat);library->font_weight=ttf_get_weight();
+    (void)nvs_open("rp_shelf",NVS_READONLY,&library->hidden);
+    (void)book_store_roots(library->roots,&library->roots_count);
+    if(book_store_roots_degraded())library->cache_complete=false;
+    unsigned root_count=s_library_root_count;
+    if(!index_restore(library)){
+        library->count=library->used=0;
+        for(int i=0;i<library->roots_count;++i)scan_root(library,library->roots[i].path);
+        root_count=library->count;
+        if(book_progress_list(backfill_book,library)!=ESP_OK)library->cache_complete=false;
+    }
+    if(library->hidden)nvs_close(library->hidden);
+    library->hidden=0;
+    if(library->cache_complete){
+        if(!s_library_index)s_library_index=lock_alloc(sizeof(*s_library_index));
+        if(s_library_index){*s_library_index=*library;s_library_revision=book_store_revision();s_library_root_count=root_count;}
+    }else book_lock_collage_invalidate();
     return library;
 }
 static bool cache_directory(void) {
@@ -243,30 +294,48 @@ static void image_cache_path(const lock_book_t *book, char path[112]) {
     uint64_t path_hash = hash_text(UINT64_C(14695981039346656037), book->path);
     snprintf(path, 112, LOCK_CACHE_DIR "/%016llx-cover.bin", (unsigned long long)path_hash);
 }
+static bool cover_header_valid(const lock_cache_t *h) {
+    return h->width && h->height && h->width <= 1216 && h->height <= 1216 &&
+        h->source_w && h->source_h && h->source_w <= 65535 && h->source_h <= 65535 &&
+        (uint64_t)h->width * h->height == h->bytes && h->bytes <= LOCK_IMAGE_PIXELS;
+}
+static void cover_dimensions_set(lock_book_t *book, const lock_cache_t *h) {
+    book->width = h->width; book->height = h->height;
+    book->source_w = h->source_w; book->source_h = h->source_h;
+}
+static bool cover_dimensions_read(lock_book_t *book) {
+    char path[112]; image_cache_path(book, path);
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    lock_cache_t header;
+    bool ok = cache_header(file, &header, book->key) && cover_header_valid(&header) &&
+        !fseek(file, 0, SEEK_END) && ftell(file) == (long)(sizeof(header) + header.bytes);
+    fclose(file);
+    // 尺寸不代表像素已校验；正式绘制仍完整读取并核对校验和。
+    // Dimensions do not authenticate pixels; the drawing pass still reads and checks the full payload.
+    if (ok) cover_dimensions_set(book, &header);
+    return ok;
+}
 static uint8_t *cover_read(lock_book_t *book) {
     char path[112]; image_cache_path(book, path);
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
     lock_cache_t header;
     uint8_t *gray = NULL;
-    if (cache_header(file, &header, book->key) && header.width && header.height &&
-        header.width <= 1216 && header.height <= 1216 && header.source_w && header.source_h &&
-        header.source_w <= 65535 && header.source_h <= 65535 &&
-        (uint64_t)header.width * header.height == header.bytes && header.bytes <= LOCK_IMAGE_PIXELS) {
+    if (cache_header(file, &header, book->key) && cover_header_valid(&header)) {
         gray = lock_alloc(header.bytes);
         if (gray && (fread(gray, 1, header.bytes, file) != header.bytes || fgetc(file) != EOF ||
             hash_bytes(UINT64_C(14695981039346656037), gray, header.bytes) != header.checksum)) {
             free(gray); gray = NULL;
         }
         if (gray) {
-            book->width = header.width; book->height = header.height;
-            book->source_w = header.source_w; book->source_h = header.source_h;
+            cover_dimensions_set(book, &header);
         }
     }
     fclose(file);
     return gray;
 }
-static uint8_t *cover_load(lock_book_t *book, bool *complete) {
+static uint8_t *cover_load_bounded(lock_book_t *book, bool *complete, size_t limit) {
     uint8_t *gray = cover_read(book);
     if (gray) return gray;
     uint8_t *data = NULL; size_t bytes = 0; bool png = false;
@@ -274,7 +343,7 @@ static uint8_t *cover_load(lock_book_t *book, bool *complete) {
     bool decoded = false;
     size_t available = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     size_t budget = available > LOCK_RESERVE + 512u * 1024u ? available - LOCK_RESERVE - 512u * 1024u : 0;
-    if (budget > 4u * 1024u * 1024u) budget = 4u * 1024u * 1024u;
+    if (budget > limit) budget = limit;
     const char *ext = strrchr(book->path, '.');
     esp_err_t error = ESP_ERR_NOT_FOUND;
     if (budget && ext && !strcasecmp(ext, ".epub") && pico_boot_asset_allowed(book->path))
@@ -314,6 +383,32 @@ static uint8_t *cover_load(lock_book_t *book, bool *complete) {
     if (!gray) *complete = false;
     return gray;
 }
+static uint8_t *cover_load(lock_book_t *book, bool *complete) {
+    return cover_load_bounded(book, complete, 4u * 1024u * 1024u);
+}
+bool book_lock_collage_warm_cover(const char *path) {
+    // 空闲时只处理一本，最多512KiB书内图片；大书或低内存留到原锁屏入口处理。
+    // Idle work handles one book and at most 512KiB of embedded data; large books or low memory use the lock path.
+    struct stat st;
+    if (!path || strlen(path) >= BOOK_STORE_PATH_MAX || !ttf_font_ready() || !pico_boot_asset_allowed(path) ||
+        stat(path, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > 32u*1024u*1024u ||
+        heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) < 3u*1024u*1024u) return false;
+    lock_book_t book = {0};
+    snprintf(book.path, sizeof(book.path), "%s", path);
+    if (!book_title_from_path(path, book.title, sizeof(book.title))) return false;
+    book.key = file_key(UINT64_C(14695981039346656037), path, &st);
+    book.key = hash_text(book.key, book.title);
+    const char *font_path = ttf_font_path(); struct stat font_stat;
+    bool font_valid = !stat(font_path, &font_stat); int weight = ttf_get_weight();
+    book.key = file_key(book.key, font_path, font_valid ? &font_stat : NULL);
+    book.key = hash_bytes(book.key, &weight, sizeof(weight));
+    bool complete = true;
+    uint8_t *gray = cover_load_bounded(&book, &complete, 512u*1024u);
+    bool ok = gray && complete;
+    free(gray);
+    return ok;
+}
+
 static unsigned make_placements(const lock_library_t *library, lock_placement_t out[30]) {
     if (!library->used) return 0;
     static const unsigned starts[6] = {10, 5, 0, 10, 5, 0};
@@ -497,20 +592,24 @@ static bool captions_draw(uint8_t *fb, unsigned count) {
     return sticker_draw(fb, title, title_px, NULL, 0, 42, 70, false) &&
            sticker_draw(fb, number, px, "本", unit_px, 642, 1170, true);
 }
-bool book_lock_collage_draw(uint8_t *fb) {
+static bool collage_draw(uint8_t *fb, bool defer_cache) {
+    s_pending_frame = NULL;
     if (!fb || !ttf_font_ready()) return false;
     lock_library_t *library = library_load();
     if (!library) return false;
     uint64_t key = hash_text(UINT64_C(14695981039346656037), app_settings_device_name());
-    key = file_key(key, ttf_font_path());
-    int weight = ttf_get_weight(), rotation = epd_get_rotation();
+    key = file_key(key, library->font_path, library->font_stat_valid ? &library->font_stat : NULL);
+    int weight = library->font_weight, rotation = epd_get_rotation();
     key = hash_bytes(key, &weight, sizeof(weight)); key = hash_bytes(key, &rotation, sizeof(rotation));
     const uint32_t render_revision = LOCK_RENDER_REVISION;
     key = hash_bytes(key, &render_revision, sizeof(render_revision));
     key = hash_bytes(key, &library->count, sizeof(library->count));
+    // 已排序的封面身份序列决定画面；时间戳本身不参与绘制，进度保存但顺序不变时复用整帧。
+    // Ordered cover identities determine the artwork. Saving progress without changing that order
+    // must not invalidate the full frame merely because a recent timestamp advanced.
+    key = hash_bytes(key, &library->used, sizeof(library->used));
     for (unsigned i = 0; i < library->used; ++i) {
         key = hash_bytes(key, &library->books[i].key, sizeof(library->books[i].key));
-        key = hash_bytes(key, &library->books[i].recent, sizeof(library->books[i].recent));
     }
     FILE *cached = fopen(LOCK_CACHE_DIR "/collage.bin", "rb");
     if (cached) {
@@ -523,9 +622,10 @@ bool book_lock_collage_draw(uint8_t *fb) {
         if (ok) { free(library); return true; }
     }
     memset(fb, 255, LOCK_FRAME_BYTES);
-    // 先取得所有原比例；一次只保留一张图，生成结果落卡后马上释放。
-    // Establish every original ratio while retaining only one image; release as soon as it is cached.
+    // 缓存有效时仅读头取得原比例；不存在或头损坏时才解码，一次只保留一张图。
+    // Read valid headers for original ratios; decode absent/bad caches one image at a time.
     for (unsigned i = 0; i < library->used; ++i) {
+        if (cover_dimensions_read(&library->books[i])) continue;
         uint8_t *gray = cover_load(&library->books[i], &library->cache_complete);
         if (!gray) { free(library); return false; }
         free(gray);
@@ -549,8 +649,17 @@ bool book_lock_collage_draw(uint8_t *fb) {
     if (ok && library->cache_complete) {
         lock_cache_t header = {.magic = LOCK_CACHE_MAGIC, .version = LOCK_CACHE_VERSION,
             .key = key, .width = 684, .height = 1216, .rotation = rotation, .bytes = LOCK_FRAME_BYTES};
-        cache_write(LOCK_CACHE_DIR "/collage.bin", header, fb);
+        if (defer_cache) { s_pending_cache = header; s_pending_frame = fb; }
+        else cache_write(LOCK_CACHE_DIR "/collage.bin", header, fb);
     }
     free(library);
     return ok;
+}
+
+bool book_lock_collage_draw(uint8_t *fb) { return collage_draw(fb, false); }
+bool book_lock_collage_prepare(uint8_t *fb) { return collage_draw(fb, true); }
+void book_lock_collage_cache_commit(const uint8_t *fb) {
+    bool pending = fb && s_pending_frame == fb;
+    s_pending_frame = NULL;
+    if (pending) cache_write(LOCK_CACHE_DIR "/collage.bin", s_pending_cache, fb);
 }

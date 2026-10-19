@@ -40,6 +40,7 @@ unit = r'''
 #include <stdlib.h>
 #include <string.h>
 #include "ota_online.h"
+#include "assets/ui_icons.h"
 #define ESP_ERR_NO_MEM 0x101
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_AREA,APP_REDRAW_PAGE,APP_REDRAW_FULL} app_redraw_t;
 typedef struct {int x,y,width,height;} EpdRect;
@@ -69,6 +70,7 @@ static void epd_fill_rect(EpdRect r,int color,uint8_t *fb){
   pixels[y][x]=color;
  }
 }
+static void ui_fill_rect_fast(EpdRect r,int color,uint8_t *fb){epd_fill_rect(r,color,fb);}
 static void ui_image_bw_rect(uint8_t *fb,EpdRect r){(void)fb;assert(r.x==496&&r.y==472&&r.width==132&&r.height==42);}
 static void assert_progress(int width){
  for(int y=519;y<527;++y)for(int x=61;x<623;++x)
@@ -78,9 +80,14 @@ static void assert_progress(int width){
 static char s_book_title[128]="海边的信",s_title[128]="chapter";
 static bool s_reader_favorite;
 static int back_center,title_center,favorite_center;
+static ui_icon_t favorite_icon;
 static void ui_nav_back(uint8_t *fb,int x,int y){(void)fb;(void)x;back_center=y+35;}
 static void ui_text_title_vc(uint8_t *fb,int x,int y,int px,const char *text,const char *sample,int align){(void)fb;assert(x==342&&px==24&&align==EPD_DRAW_ALIGN_CENTER);assert(!strcmp(text,sample));title_center=y;}
-static void draw_favorite_icon(uint8_t *fb,int x,int y,int w,int h,bool favorite,int gray){(void)fb;(void)x;(void)w;(void)favorite;(void)gray;favorite_center=y+h/2;}
+static void ui_draw_icon(uint8_t *fb,int cx,int cy,int size,ui_icon_t icon,uint8_t gray){
+ (void)fb;assert(cx==620&&size==48&&gray==0x38);
+ assert(cx-size/2>=584&&cx+size/2<=648&&cy-size/2>=76&&cy+size/2<=146);
+ favorite_center=cy;favorite_icon=icon;
+}
 static void ui_hairline(uint8_t *fb,int y,int x,int width,int gray){(void)fb;(void)y;(void)x;(void)width;(void)gray;}
 static void copy_text(char *out,size_t cap,const char *text){snprintf(out,cap,"%s",text);}
 static int ui_text_title_fit(char *text,int px,int width,const char *sample){assert(px==32&&width==450&&!strcmp(text,sample));return 24;}
@@ -181,8 +188,8 @@ int main(void){
  cache_releases=0;backend_status.state=PICO_UPDATE_AVAILABLE;snprintf(backend_status.message,sizeof(backend_status.message),"发现新版本，可下载安装");
  upgrade_schedule(true,60);assert(upgrade_start_pending()==APP_REDRAW_PAGE);
  assert(!strcmp(s_upgrade_notice,"无法开始升级，请退出传书后重试"));
- draw_reader_header(NULL);assert(back_center==title_center&&favorite_center==title_center);
- s_reader_favorite=true;draw_reader_header(NULL);assert(back_center==title_center&&favorite_center==title_center);
+ draw_reader_header(NULL);assert(back_center==title_center&&favorite_center==title_center&&favorite_icon==UI_ICON_BOOKMARK);
+ s_reader_favorite=true;draw_reader_header(NULL);assert(back_center==title_center&&favorite_center==title_center&&favorite_icon==UI_ICON_ANIMATE_BOOKMARK_PLUS);
  snprintf(s_update.release.notes,sizeof(s_update.release.notes),"1. 优化图文混排\n2. 支持滑动翻页\n3. 新增自动休眠\n4. 优化蓝牙翻页器\n5. 优化图标与界面\n6. 优化文件管理排版");
  draw_upgrade_notes(NULL);assert(note_count==6&&!strcmp(note_lines[0],"1. 优化图文混排")&&!strcmp(note_lines[5],"6. 优化文件管理排版"));
  note_count=0;s_update.release.notes[0]=0;draw_upgrade_notes(NULL);assert(note_count==1&&!strcmp(note_lines[0],"本次更新暂无说明"));

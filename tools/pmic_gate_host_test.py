@@ -8,7 +8,7 @@ import tempfile
 root=Path(__file__).resolve().parents[1]
 source=(root/'components/read_pico/read_pico_board.c').read_text()
 def function(name):
-    m=re.search(r'^static [^\n]+\b'+name+r'\([^;{}]*\)\s*\{',source,re.M)
+    m=re.search(r'^(?:static )?[^\n]+\b'+name+r'\([^;{}]*\)\s*\{',source,re.M)
     assert m,name
     at,depth=m.end(),1
     while depth:
@@ -32,7 +32,9 @@ typedef int esp_err_t;
 typedef struct {bool ep_mode,ep_output_enable;} epd_ctrl_state_t;
 typedef struct {int vcom_mv,temperature_c;} sy7636a_status_t;
 static uint8_t ioe_output,hardware;
-static bool rails_on,vcom_gated;
+static bool rails_on,vcom_gated,s_drive_release_retry;
+static epd_ctrl_state_t *current_state;
+static epd_ctrl_state_t *epd_ctrl_state(void){assert(current_state);return current_state;}
 static void *s_ioe,*s_sy;
 static unsigned waits,wait_us,writes;
 static bool power_error,commit_error;
@@ -45,12 +47,13 @@ static int sy7636a_power_on(void *h);
 static int sy7636a_power_off(void *h);
 """
 unit+='\n'.join(re.findall(r'^#define (?:IOE_MODE|IOE_XOE|IOE_SY_VCOM_EN|VCOM_SETTLE_US)\b.*',source,re.M))+'\n'
-for name in ['ioe_commit','ioe_set','board_set_ctrl','board_poweron','board_poweroff']:unit+=function(name)+'\n'
+for name in ['ioe_commit','ioe_set','board_set_ctrl','read_pico_epd_release_drive','board_poweron','board_poweroff']:unit+=function(name)+'\n'
 unit+=r"""
 static int sy7636a_power_on(void *h){(void)h;if(power_error)return -1;return ioe_set(IOE_SY_VCOM_EN,true);}
 static int sy7636a_power_off(void *h){(void)h;return ioe_set(IOE_SY_VCOM_EN,false);}
 int main(void){
  epd_ctrl_state_t state={0},mode={.ep_mode=true},output={.ep_output_enable=true};
+ current_state=&state;
  state.ep_mode=true;board_set_ctrl(&state,&mode);assert(!vcom_gated&&!(hardware&IOE_SY_VCOM_EN)&&!waits);
  power_error=true;board_poweron(&state);assert(!rails_on&&!vcom_gated&&!waits);power_error=false;
  board_poweron(&state);assert(rails_on&&vcom_gated&&(hardware&IOE_SY_VCOM_EN)&&(hardware&IOE_XOE));
@@ -64,6 +67,27 @@ int main(void){
  assert(waits==6&&wait_us==12000);
  state.ep_mode=false;board_set_ctrl(&state,&mode);board_poweroff(&state);assert(!rails_on&&!vcom_gated&&!(hardware&IOE_SY_VCOM_EN)&&!(hardware&IOE_XOE)&&waits==6);
  state.ep_mode=true;board_set_ctrl(&state,&mode);assert(!(hardware&IOE_SY_VCOM_EN)&&waits==6);
+ // 无变化路径：上电后没有扫描器收尾，统一结束出口仍须关闭驱动。
+ // No-change path has no scanner teardown; common completion must still release drive.
+ ioe_output|=0x88;
+ board_poweron(&state);assert(rails_on&&(hardware&IOE_SY_VCOM_EN));
+ assert(read_pico_epd_release_drive());
+ assert(!(hardware&(IOE_MODE|IOE_XOE|IOE_SY_VCOM_EN))&&rails_on&&(hardware&0x88)==0x88);
+ assert(!state.ep_mode&&!state.ep_output_enable);
+ unsigned neutral_writes=writes;
+ for(int i=0;i<10000;++i)assert(read_pico_epd_release_drive());
+ assert(writes==neutral_writes);
+ // 已清零的软件影子不能掩盖最后一次真实 I2C 写入失败。
+ // A zeroed software shadow must not hide a failed physical I2C write.
+ state.ep_mode=true;state.ep_output_enable=true;epd_ctrl_state_t both={true,true};
+ board_set_ctrl(&state,&both);assert(hardware&IOE_SY_VCOM_EN);
+ commit_error=true;state.ep_mode=false;state.ep_output_enable=false;board_set_ctrl(&state,&both);
+ assert(!(ioe_output&(IOE_MODE|IOE_XOE|IOE_SY_VCOM_EN))&&s_drive_release_retry&&(hardware&IOE_SY_VCOM_EN));
+ assert(!read_pico_epd_release_drive()&&s_drive_release_retry);
+ commit_error=false;assert(read_pico_epd_release_drive()&&!s_drive_release_retry);
+ assert(!(hardware&(IOE_MODE|IOE_XOE|IOE_SY_VCOM_EN)));
+ neutral_writes=writes;assert(read_pico_epd_release_drive()&&writes==neutral_writes);
+ puts("PASS: idle/no-change drive release, zero redundant I2C and retry after failed neutral hardware writes");
  puts("PASS: VCOM follows masked ep_mode only with powered rails, each rising edge settles for 2 ms, failed power-on and power-off retain gating boundaries");
 }
 """

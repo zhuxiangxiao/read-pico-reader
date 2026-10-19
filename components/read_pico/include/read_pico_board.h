@@ -91,6 +91,9 @@ esp_err_t read_pico_sd_detect(bool* present);
 /// / Convenience detection returns false on I/O failure; mounting and removal use checked detect.
 bool read_pico_sd_present(void);
 bool read_pico_rails_on(void);
+/// 刷新结束后释放 MODE/XOE/VCOM_EN，保留高压轨与原电压；已经中性时不访问 I2C，失败返回 false 供重试。
+/// Release MODE/XOE/VCOM_EN after output, retaining HV rails and voltage settings; neutral state does no I2C, false requests a retry.
+bool read_pico_epd_release_drive(void);
 
 /// 翻转 VCOMCTL：1=外部 VCOM_EN，0=自动时序。
 /// / Toggle VCOMCTL: 1=external VCOM_EN, 0=auto timing.
@@ -109,6 +112,12 @@ esp_err_t read_pico_tp_rst(bool high);
 /// / Read 9555 inputs. INT# is not latched and releases once inputs are stable;
 /// call before light sleep and after wake.
 void read_pico_clear_ioe_int(void);
+
+/// 睡前收口 9555：悬空的 Port1 推高；host_off 时 CW_INT 也改输出低，关机期间 INT# 不再被 PMU 事件拉低。浅睡不能用 host_off，按键唤醒要靠 CW_INT。
+/// Park the 9555 before sleep: drive unconnected Port1 high; with host_off, CW_INT turns output-low so PMU events cannot pull INT# while off. Never use host_off for light sleep; key wake needs CW_INT.
+esp_err_t read_pico_ioe_sleep(bool host_off);
+/// 恢复运行时的方向配置并清 INT#。/ Restore running directions and clear INT#.
+esp_err_t read_pico_ioe_wake(void);
 
 #ifdef __cplusplus
 }

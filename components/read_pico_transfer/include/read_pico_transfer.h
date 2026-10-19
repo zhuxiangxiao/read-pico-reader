@@ -97,7 +97,8 @@ bool read_pico_transfer_wifi_backup_valid(const read_pico_transfer_wifi_backup_t
 /// 恢复单个 NVS 凭据；已运行的 WiFi 会话在下次重连时采用新配置。
 /// Restore the single NVS record; an active WiFi session adopts it on its next connection.
 esp_err_t read_pico_transfer_import_wifi_backup(const read_pico_transfer_wifi_backup_t *backup);
-/// 仅热点或停止状态可遗忘；上传中拒绝。/ Forget only while AP or stopped; rejected during upload.
+/// 仅热点或 STA 资源已释放时可遗忘（含启动失败）；上传中拒绝。
+/// Forget while AP or after releasing STA resources, including a failed start; rejected during upload.
 esp_err_t read_pico_transfer_forget_wifi(void);
 /// 停服后同步扫描2.4GHz网络；最多16个去重SSID，按信号降序，临时射频和STA接口均释放。/ Scan synchronously while stopped; up to 16 unique SSIDs by descending RSSI; release temporary radio and STA resources.
 esp_err_t read_pico_transfer_scan_wifi(read_pico_transfer_network_t out[READ_PICO_TRANSFER_SCAN_MAX], size_t *count);
@@ -108,3 +109,9 @@ esp_err_t read_pico_transfer_save_wifi(const char *ssid, const char *password);
 esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds);
 /// 已连接 STA 时对时，不断开 WiFi；供 HTTPS 页面校验证书。/ Sync time on connected STA without disconnecting WiFi for HTTPS certificate checks.
 esp_err_t read_pico_transfer_sync_time_online(uint32_t *utc_seconds);
+
+/// 后台短时校准，可被手动联网或睡眠取消；不读取 TF 文件。
+/// Brief background calibration, cancellable by manual networking or sleep; no TF access.
+esp_err_t read_pico_transfer_sync_time_auto(uint32_t *utc_seconds);
+/// 主循环消费成功校准事件，用于 PMU/NVS 交接。/ Consume successful sync events on the main loop for PMU/NVS handoff.
+bool read_pico_transfer_take_time_sync(uint32_t *utc_seconds);

@@ -1,3 +1,4 @@
+#include "book_progress.h"
 /*
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
@@ -47,6 +48,7 @@ static bool valid_record(unsigned ns, uint8_t type, const char *key, const uint8
         uint32_t magic = 0;
         if (len >= 4) memcpy(&magic, data, 4);
         if (!strcmp(key, "stats")) return type == NVS_TYPE_BLOB && len == 32 && magic == UINT32_C(0x52505431);
+        if (!strcmp(key, "heat32")) return type == NVS_TYPE_BLOB && len == 260 && magic == UINT32_C(0x52504832);
         if (!strcmp(key, "heatmap")) return type == NVS_TYPE_BLOB && len == 244 && magic == UINT32_C(0x52504831);
         return false;
     }
@@ -187,6 +189,7 @@ static esp_err_t read_stream(FILE *file, bool restore) {
         esp_err_t commit = result == ESP_OK ? nvs_commit(h) : result;
         nvs_close(h);
         if (result == ESP_OK) result = commit;
+        if (restore) book_progress_notify_changed();
     }
     if (result != ESP_OK) return result;
     uint8_t seal[6];
@@ -214,6 +217,7 @@ esp_err_t book_history_backup_restore(FILE *file) {
         err = nvs_erase_all(h);
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
+        book_progress_notify_changed();
         if (err != ESP_OK) return err;
     }
     return read_stream(file, true);

@@ -5,6 +5,8 @@
  * User revision: fast acrylic retains calibrated GL16; remove the dark, slow experimental gray drive and keep directional whitening for shelf paging/exit.
  */
 #include "display_main_waveform.h"
+#include "display_waveform_smooth.h"
+#include "esp_heap_caps.h"
 #include "app_config.h"
 #include "e0470_epaper_waveform.h"
 #include <stdbool.h>
@@ -113,4 +115,52 @@ const EpdWaveform* display_main_bw_waveform(void) {
         s_bw_waveform.temp_intervals=E0470_WAVEFORM.temp_intervals;s_bw_ready=true;
     }
     return &s_bw_waveform;
+}
+
+// 普通切页独立派生；水波纹/快刷不改，内存紧张回退现有柔和表。
+// Derive ordinary output independently; water/fast stay unchanged and low memory falls back to the existing soft table.
+const EpdWaveform* display_main_normal_waveform(void) {
+    static EpdWaveformPhases phases;
+    static const EpdWaveformPhases *ranges[]={&phases};
+    static EpdWaveformMode mode={MODE_GL16,1,ranges};
+    static const EpdWaveformMode *modes[]={&mode};
+    static EpdWaveform waveform={.num_modes=1,.num_temp_ranges=1,.mode_data=modes};
+    if(phases.luts)return &waveform;
+    const EpdWaveform *base=display_main_water_waveform();
+    const EpdWaveformPhases *original=e0470_waveform_phases(base,MODE_GL16);
+    if(!original||!original->luts||original->phases!=E0470_GL16_FRAMES||original->phase_times)return base;
+    uint8_t *data=heap_caps_malloc(E0470_GL16_FRAMES*16*4,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(!data)return base;
+    memcpy(data,original->luts,E0470_GL16_FRAMES*16*4);
+    for(int to=1;to<15;++to)for(int from=0;from<16;++from)
+        if(to!=from)display_soften_gray_pair(data,original,to,from);
+    phases=(EpdWaveformPhases){E0470_GL16_FRAMES,data,NULL};
+    waveform.temp_intervals=base->temp_intervals;
+    return &waveform;
+}
+
+// 仅书架普通切页：封面/材质灰阶完整保留，留白只向白推动，不再先压黑。
+// Ordinary shelf transitions retain calibrated art grays; whitespace drives only white without reverse blackening.
+const EpdWaveform* display_main_shelf_waveform(enum EpdDrawMode draw_mode) {
+    static EpdWaveformPhases phases[2];
+    static const EpdWaveformPhases *ranges[2][1]={{&phases[0]},{&phases[1]}};
+    static EpdWaveformMode modes[2]={{MODE_GL16,1,ranges[0]},{MODE_GC16,1,ranges[1]}};
+    static const EpdWaveformMode *mode_ptrs[2][1]={{&modes[0]},{&modes[1]}};
+    static EpdWaveform waves[2]={
+        {.num_modes=1,.num_temp_ranges=1,.mode_data=mode_ptrs[0]},
+        {.num_modes=1,.num_temp_ranges=1,.mode_data=mode_ptrs[1]}};
+    int index=draw_mode==MODE_GC16?1:0;
+    if(phases[index].luts)return &waves[index];
+    const EpdWaveformPhases *original=e0470_waveform_phases(&E0470_WAVEFORM,draw_mode);
+    const EpdWaveformPhases *soft=e0470_waveform_phases(display_main_normal_waveform(),MODE_GL16);
+    if(!original||!soft||!original->luts||!soft->luts||original->phase_times||soft->phase_times||original->phases>soft->phases)
+        return &E0470_WAVEFORM;
+    size_t size=(size_t)original->phases*16*4;
+    uint8_t *data=heap_caps_malloc(size,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(!data)return &E0470_WAVEFORM;
+    memcpy(data,original->luts,size);
+    for(int f=0;f<original->phases;++f)memcpy(data+f*16*4+15*4,soft->luts+f*16*4+15*4,4);
+    phases[index]=(EpdWaveformPhases){original->phases,data,NULL};
+    waves[index].temp_intervals=E0470_WAVEFORM.temp_intervals;
+    return &waves[index];
 }

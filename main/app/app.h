@@ -136,6 +136,9 @@ struct app_desc_s {
     /// 默认只收 UI_KEY_1；owns_keys 页面在菜单外接收三键。
     /// / Only KEY1 normally; owns_keys pages receive all three keys outside the menu.
     app_redraw_t (*on_key)(app_ctx_t* ctx, int key);
+    /// 可选主页面短按覆盖；返回true表示已消费，边界也不能误切主页面。
+    /// Optional main-page short-key override; true consumes the input, including paging boundaries.
+    bool (*on_main_key)(app_ctx_t* ctx,int key,app_redraw_t *redraw);
     /// 可选：owns_keys 页面同键持续按住500ms触发一次；defer_middle_short 时中键短按只在抬起执行。
     /// Optional: fire after a 500ms hold; with defer_middle_short, the middle short action runs only on release.
     app_redraw_t (*on_key_long)(app_ctx_t* ctx, int key);
@@ -166,3 +169,6 @@ void app_lock_ignore_for(int64_t ms);
 #ifdef __cplusplus
 }
 #endif
+
+/// Yield a long main-page load when another bottom tab is pressed. No display or lifecycle calls.
+bool app_poll_main_navigation(app_ctx_t *ctx);

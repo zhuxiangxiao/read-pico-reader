@@ -4,5 +4,5 @@
 idf_component_register(
     SRCS "src/ble_page_turner.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash esp_timer
+    REQUIRES bt nvs_flash esp_timer read_pico
 )

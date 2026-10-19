@@ -59,6 +59,13 @@
 // P0.2 CW_INT / P0.5 PGOOD / P0.6 SD_CD 为输入，其余为输出。
 // / P0.2 CW_INT / P0.5 PGOOD / P0.6 SD_CD are inputs; the rest are outputs.
 #define IOE_CONFIG_PORT0 0x64
+// 主机下电时 CW_INT 也改输出低：CW32 是开漏，同为低不冲突，关机期间 PMU 事件不再翻 INT#。
+// On host power-down CW_INT also becomes output-low: CW32 is open-drain, so both low never fight, and PMU events stop toggling INT#.
+#define IOE_CONFIG_PORT0_HOST_OFF (IOE_CONFIG_PORT0 & (uint8_t)~IOE_CW_INT)
+// Port1 板上悬空；睡眠时改推挽输出高，有无内部上拉都没有电流。
+// Port1 is unconnected; drive it high in sleep so it draws nothing with or without internal pull-ups.
+#define IOE_CONFIG_PORT1_SLEEP 0x00
+#define IOE_CONFIG_PORT1 0xFF
 #define IOE_REG_COUNT 8
 
 #define D0 GPIO_NUM_4
@@ -84,6 +91,10 @@
 #define EPD_SPV GPIO_NUM_47
 #define EPD_CKV GPIO_NUM_48
 
+// TF 卡 CLK 没有外部上拉，浅睡时下拉，不让卡的输入悬空。
+// TF CLK has no external pull-up; pull it down in light sleep so the card input does not float.
+#define SD_CLK_GPIO GPIO_NUM_38
+
 // VCOM_EN 拉高后到扫描开始的等待，给 VCOM 建立留余量。
 // / Wait after raising VCOM_EN before the scan starts, so VCOM can settle.
 #define VCOM_SETTLE_US 2000
@@ -94,6 +105,8 @@ static bool rails_on;
 // / With rails up, VCOM_EN follows ep_mode and is on only while scanning; holding VCOM
 // during idle rails slowly drives the image dark.
 static bool vcom_gated;
+// 中性控制写入失败时，不能把软件影子当作硬件已经关断。/ Retry a failed neutral write instead of trusting the software shadow.
+static bool s_drive_release_retry;
 static i2c_master_bus_handle_t s_i2c_bus;
 static sy7636a_handle_t s_sy;
 static fca9555_handle_t s_ioe;
@@ -297,12 +310,12 @@ static esp_err_t fca9555_selftest(void) {
     err = fca_expect_reg(6, IOE_CONFIG_PORT0, "CFG0");
     if (err != ESP_OK) return err;
 
-    err = fca9555_set_config(s_ioe, 1, 0xFF);
+    err = fca9555_set_config(s_ioe, 1, IOE_CONFIG_PORT1);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "FCA9555 CFG1 write failed: %s", esp_err_to_name(err));
         return err;
     }
-    err = fca_expect_reg(7, 0xFF, "CFG1");
+    err = fca_expect_reg(7, IOE_CONFIG_PORT1, "CFG1");
     if (err != ESP_OK) return err;
 
     // 只翻转 MODE / TP_RST，SY_EN 和 VCOM 保持低。
@@ -385,11 +398,41 @@ static void board_set_ctrl(epd_ctrl_state_t* state, const epd_ctrl_state_t* cons
         // / Do not abort on a dead I2C; a self-test interrupt mid-refresh would
         // bounce the device back to home.
         esp_err_t err = ioe_commit();
+        s_drive_release_retry = err != ESP_OK;
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "ioe_commit %s", esp_err_to_name(err));
         } else if (vcom_rise) {
             esp_rom_delay_us(VCOM_SETTLE_US);
         }
+    }
+}
+
+// 差分无变化不会进入扫描器；同样需要退出上电时开启的驱动状态。
+// An unchanged differential skips the scanner, but must still release the drive enabled by power-on.
+bool read_pico_epd_release_drive(void) {
+    if (!rails_on) return true;
+    const uint8_t drive = IOE_MODE | IOE_XOE | IOE_SY_VCOM_EN;
+    if (!(ioe_output & drive) && !s_drive_release_retry) return true;
+    epd_ctrl_state_t *state = epd_ctrl_state();
+    state->ep_mode = false;
+    state->ep_output_enable = false;
+    ioe_output &= (uint8_t)~drive;
+    s_drive_release_retry = ioe_commit() != ESP_OK;
+    return !s_drive_release_retry;
+}
+
+// 面板源/栅驱动的逻辑电源接常开 SYS_VDD；IDF 默认把睡眠中的 GPIO 隔离成悬空，这里改为浅睡下拉。
+// Panel source/gate driver logic sits on always-on SYS_VDD; IDF isolates sleeping GPIOs as floating, so pull them down in light sleep instead.
+static void sleep_pulldown_pins(void) {
+    const gpio_num_t pins[] = {
+        EPD_XCL, EPD_CKV, EPD_XLE, EPD_XSTL, EPD_SPV,
+        D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14, D15,
+        SD_CLK_GPIO,
+    };
+    for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        gpio_sleep_set_direction(pins[i], GPIO_MODE_INPUT);
+        gpio_sleep_set_pull_mode(pins[i], GPIO_PULLDOWN_ONLY);
+        gpio_sleep_sel_en(pins[i]);
     }
 }
 
@@ -445,6 +488,7 @@ static void board_init(uint32_t epd_row_width) {
     read_pico_epd_scan_t scan;
     read_pico_epd_scan(init_pclk_mhz, READ_PICO_EPD_SCAN_FULL, &scan);
     read_pico_epd_init_lcd(&lcd_config, display->bus_width, display->width, display->height, &scan);
+    sleep_pulldown_pins();
     ESP_LOGI(TAG, "EPD bus initialized, SY7636A address 0x%02X", SY7636A_ADDR_DEFAULT);
 }
 
@@ -692,6 +736,36 @@ bool read_pico_sd_present(void) {
 
 void read_pico_clear_ioe_int(void) {
     (void)fca9555_clear_int(s_ioe);
+}
+
+static bool s_mode_parked;
+
+esp_err_t read_pico_ioe_sleep(bool host_off) {
+    if (s_ioe == NULL) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = fca9555_set_output(s_ioe, 1, 0xFF);
+    if (err == ESP_OK) err = fca9555_set_config(s_ioe, 1, IOE_CONFIG_PORT1_SLEEP);
+    // 面板逻辑在常开 SYS_VDD 上，轨已断时 MODE 保持高会多耗电，一并拉低。
+    // Panel logic is on always-on SYS_VDD; with rails off a high MODE costs extra current, so drop it too.
+    s_mode_parked = !rails_on && (ioe_output & IOE_MODE) != 0;
+    if (!rails_on) ioe_output &= (uint8_t)~IOE_MODE;
+    if (host_off) ioe_output &= (uint8_t)~IOE_CW_INT;
+    if (err == ESP_OK) err = ioe_commit();
+    if (err == ESP_OK && host_off) err = fca9555_set_config(s_ioe, 0, IOE_CONFIG_PORT0_HOST_OFF);
+    (void)fca9555_clear_int(s_ioe);
+    return err;
+}
+
+esp_err_t read_pico_ioe_wake(void) {
+    if (s_ioe == NULL) return ESP_ERR_INVALID_STATE;
+    if (s_mode_parked) {
+        ioe_output |= IOE_MODE;
+        (void)ioe_commit();
+        s_mode_parked = false;
+    }
+    esp_err_t err = fca9555_set_config(s_ioe, 0, IOE_CONFIG_PORT0);
+    esp_err_t err1 = fca9555_set_config(s_ioe, 1, IOE_CONFIG_PORT1);
+    (void)fca9555_clear_int(s_ioe);
+    return err != ESP_OK ? err : err1;
 }
 
 esp_err_t read_pico_tp_rst(bool high) {

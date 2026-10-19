@@ -40,20 +40,23 @@ extern "C" {
 #define DISPLAY_PCLK_MAX_MHZ READ_PICO_EPD_PCLK_MAX_MHZ
 #define DISPLAY_PCLK_STEP_MHZ 1
 
+/// 保留高压轨并释放像素驱动，包括无变化刷新；不增加扫描。/ Retain HV rails and release pixel drive, including no-change updates, without another scan.
 void rails_keepalive(void);
 void rails_idle_check(int64_t now_ms);
 
 /// 大量文件I/O期间增加扫描预填，调用方离开时恢复。/ Increase scan prefill during bulk file I/O; caller restores on exit.
 void display_set_bulk_io(bool active);
 
+/// 请求下一张完成绘制的画面整屏清理一次，用于解锁。/ Clean the next completed frame once after unlock.
+void display_request_full_refresh(void);
 enum EpdDrawError update_display_mode(EpdiyHighlevelState* hl, enum EpdDrawMode mode);
 /// 普通页面切换使用真实差分 GL16；未变化像素不进入 dirty map。
 /// True differential GL16 for ordinary page transitions; unchanged pixels stay clean.
 enum EpdDrawError update_display_mode_diff(EpdiyHighlevelState* hl, enum EpdDrawMode mode);
-/// 系统页切换：16 灰阶差分 GL16，间隔性全像素灰阶整理，累计若干次同步做 GC16；不安排延迟二次刷新。
-/// System page transition: 16-gray differential GL16 with periodic full-pixel gray settling and synchronous GC16 cleanup.
+/// 系统页切换：普通模式柔和16灰阶差分，等灰保持、黑白端点单向推动，周期GC16清残影；不安排二次刷新。
+/// System transitions: ordinary soft 16-gray differences hold equal grays and drive BW endpoints directionally, with periodic GC16 cleanup and no second pass.
 /// 四主页面固定底栏，仅横条局部更新；普通保留灰阶与内容区整理，快刷用完整黑白表及棋盘格亚克力。
-/// All main screens retain navigation with local marker updates; ordinary retains grays and body settling, fast uses complete monochrome and checkerboard acrylic.
+/// All main screens retain navigation with local markers; ordinary uses soft gray differences and periodic body cleanup, fast uses monochrome/checkerboard acrylic.
 enum EpdDrawError update_display_fast_page(EpdiyHighlevelState* hl);
 /// 为下一次主页面输出启用固定底栏；标记书架切出与真正切页，避免同页重绘播放动画。
 /// Arm fixed navigation for the next main-screen output; tag shelf exit and actual navigation so same-page repaints do not animate.
@@ -76,6 +79,12 @@ enum EpdDrawError update_display_from_white_with(
 /// Paint the front buffer white and GC16 the panel back to white.
 enum EpdDrawError update_display_white(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_full(EpdiyHighlevelState* hl);
+
+/// 面板修复：不看 framebuffer 的整屏盲刷，专治刷新中途断电留下的条纹。
+/// Panel repair: a blind full-screen drive that ignores the framebuffer, for the stripes a power
+/// cut in the middle of a refresh leaves behind.
+/// 返回最终整屏输出结果；失败时调用方不能报告成功。/ Return the final full-frame result; callers must not report success on failure.
+enum EpdDrawError display_panel_repair(EpdiyHighlevelState* hl);
 /// 图片页清除旧光学状态，再驱动完整灰阶。/ Clear the prior optical state and drive the full gray ladder for images.
 enum EpdDrawError update_display_image_gray(EpdiyHighlevelState* hl);
 enum EpdDrawError update_display_with(
@@ -92,6 +101,8 @@ enum EpdDrawError update_display_area_with(
 /// 动画定稿只驱动真实差异，不强制把区域内所有 GL16 像素重刷。
 /// Animation settle drives real differences only instead of forcing every GL16 pixel in the area.
 /// 在指定区域驱动全部像素，用于局部定稿和清残影。/ Drive all pixels within an area for local settling and ghost cleanup.
+/// 控件局部反馈暂存后续主页刷新入口，不提前消耗其裁剪、灰阶和底栏保护。/ Local control feedback preserves the pending main crop, gray policy and footer protection.
+enum EpdDrawError update_display_click_feedback(EpdiyHighlevelState* hl,EpdRect area);
 enum EpdDrawError update_display_area_full_with(
     EpdiyHighlevelState* hl, const EpdWaveform* waveform, enum EpdDrawMode mode,
     EpdRect area
@@ -101,7 +112,8 @@ enum EpdDrawError update_display_area_diff_with(
     EpdRect area
 );
 /// 阅读页可选的真实错相 GL16 翻页；缺相位时回退现有 GL16，失败时恢复基准帧。
-/// Optional staggered GL16 reader turn; fall back on missing phases and recover the baseline after failure.
+/// 纯文字水波纹复用柔和文字灰边，8带节拍不变；缺相回退GL16，扫描失败重建真实基准。
+/// Staggered text phases retain eight-band pacing, hold unchanged grays and soften edge transients; missing phases fall back and failures rebuild the baseline.
 enum EpdDrawError update_display_water_turn(EpdiyHighlevelState* hl, EpdRect area,
                                              e0470_turn_dir_t dir);
 /// 动画中间帧使用灰阶波形，但不累计周期清屏计数；动画最终帧走普通刷新出口。

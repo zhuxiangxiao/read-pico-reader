@@ -11,6 +11,8 @@
  * 用户修订：输入只刷新变化区域，布局切换局部灰阶，避免打字累计整屏清残影。
  * User revision: input refreshes changed regions; layout switches use local grayscale, without accumulating whole-page cleanup.
  */
+#include "ui_avatar.h"
+#include "book_cover_jobs.h"
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
@@ -62,6 +64,9 @@ static int s_count, s_folder, s_page;
 static int s_requested_folder = -1;
 static int s_counts[3];
 static bool s_scan_pending;
+static int s_pager_pressed=UI_PAGER_NONE;
+static bool s_pager_paint_pending;
+static int64_t s_space_poll_ms;
 static char s_message[96];
 static char s_dir[288] = "/sdcard";
 static read_pico_sd_info_t s_sd;
@@ -91,8 +96,39 @@ static const char *folder_root(int folder) {
     if (folder == 2) return app_settings_fonts_dir();
     return s_dir;
 }
-static int visible_rows(void) { return s_folder == 3 ? 7 : FILE_ROWS; }
+static int visible_rows(void) { return s_view == FILE_VIEW_MOVE ? 7 : FILE_ROWS; }
 static int root_rows(void) { return 5; }
+static int file_pager_pages(void) {
+    int rows=s_folder<0?root_rows():visible_rows();
+    return s_count?1+(s_count-1)/rows:1;
+}
+static void draw_file_pager(uint8_t *fb) {
+    char label[48];snprintf(label,sizeof(label),"第 %d 页 · 共 %d 页",s_page+1,file_pager_pages());
+    ui_pager_draw(fb,label,s_page,file_pager_pages(),false,s_pager_pressed);
+}
+static app_redraw_t file_pager_paint(app_ctx_t *ctx) {
+    ui_fill_rect_fast(ui_pager_area(),UI_GRAY_WHITE,ctx->fb);
+    draw_file_pager(ctx->fb);s_pager_paint_pending=true;
+    return APP_REDRAW_AREA;
+}
+// 四键共用命中和目标计算；只在抬手提交，同一按钮外移/长按/取消只恢复箭头。
+// Share hits/targets across four controls; commit on release, while leaving/holding/cancelling only restores arrows.
+static bool file_pager_event(app_ctx_t *ctx,const ui_gesture_event_t *ev,app_redraw_t *redraw) {
+    if(s_view!=FILE_VIEW_LIST&&s_view!=FILE_VIEW_MOVE)return false;
+    int start=ui_pager_hit(ev->x0,ev->y0),end=ui_pager_hit(ev->x,ev->y);
+    if(start<0&&s_pager_pressed<0)return false;
+    *redraw=APP_REDRAW_NONE;
+    if(s_scan_pending)return true;
+    if(ev->type==UI_GESTURE_PRESS){s_pager_pressed=start;*redraw=file_pager_paint(ctx);return true;}
+    if(ev->type==UI_GESTURE_MOVE&&start==end)return true;
+    bool decorated=s_pager_pressed>=0;s_pager_pressed=UI_PAGER_NONE;
+    if(ev->type==UI_GESTURE_TAP&&start>=0&&start==end){
+        int target=ui_pager_target(start,s_page,file_pager_pages());
+        if(target!=s_page){s_page=target;*redraw=APP_REDRAW_PAGE;return true;}
+    }
+    if(decorated)*redraw=file_pager_paint(ctx);
+    return true;
+}
 static EpdRect home_transfer_rect(int index) {
     return (EpdRect){36 + index * 156, 346, 144, 100};
 }
@@ -182,10 +218,10 @@ static bool rebased_path(const char *path, const char *old_path, const char *new
 
 static bool moved_settings_fit(const char *old_path, const char *new_path) {
     char updated[288];
-    const char *paths[] = {app_settings_books_dir(), app_settings_fonts_dir(),
-        app_settings_system_font_path(), app_settings_font_path(), app_settings_wallpaper_path()};
-    const size_t limits[] = {96, 96, 160, 160, 288};
-    for (int i = 0; i < 5; ++i) {
+    const char *paths[] = {app_settings_system_font_path(),
+        app_settings_font_path(), app_settings_wallpaper_path()};
+    const size_t limits[] = {160, 160, 288};
+    for (int i = 0; i < 3; ++i) {
         if (!file_tree_same_or_below(paths[i], old_path)) continue;
         if (!rebased_path(paths[i], old_path, new_path, updated, sizeof(updated)) ||
             strlen(updated) >= limits[i]) return false;
@@ -195,12 +231,6 @@ static bool moved_settings_fit(const char *old_path, const char *new_path) {
 
 static void sync_moved_settings(const char *old_path, const char *new_path) {
     char updated[288];
-    if (rebased_path(app_settings_books_dir(), old_path, new_path, updated, sizeof(updated)))
-        (void)app_settings_set_books_dir(updated);
-    if (rebased_path(app_settings_fonts_dir(), old_path, new_path, updated, sizeof(updated))) {
-        (void)app_settings_set_fonts_dir(updated);
-        ttf_font_scan();
-    }
     if (rebased_path(app_settings_system_font_path(), old_path, new_path, updated, sizeof(updated))) {
         app_settings_set_system_font_path(updated);
         app_font_activate_system();
@@ -247,6 +277,7 @@ static void file_deleted(const char *path, bool directory, void *ctx) {
         app_font_activate_system();
     }
     if (!strcmp(app_settings_font_path(), path)) app_settings_set_font_path("");
+    if (!strcmp(app_settings_book_background_path(), path)) (void)app_settings_set_book_background_path("");
     if (!strcmp(app_settings_wallpaper_path(), path)) {
         app_settings_set_wallpaper_path("");
         app_settings_set_lock_style(0);
@@ -257,11 +288,9 @@ static void repair_deleted_directories(void) {
     struct stat st;
     if (stat(app_settings_books_dir(), &st) || !S_ISDIR(st.st_mode)) {
         (void)mkdir("/sdcard/books", 0775);
-        (void)app_settings_set_books_dir("/sdcard/books");
     }
     if (stat(app_settings_fonts_dir(), &st) || !S_ISDIR(st.st_mode)) {
         (void)mkdir("/sdcard/fonts", 0775);
-        (void)app_settings_set_fonts_dir("/sdcard/fonts");
         ttf_font_scan();
     }
 }
@@ -497,6 +526,24 @@ static void render_rename(uint8_t *fb) {
     ui_keyboard_draw(fb, 560);
 }
 
+static bool storage_space_valid(const read_pico_sd_info_t *info) {
+    return info->mounted && info->space_valid && info->filesystem_bytes &&
+           info->free_bytes<=info->filesystem_bytes && info->filesystem_bytes<=info->capacity_bytes;
+}
+static void storage_amount(char *text,size_t size,uint64_t bytes) {
+    if (bytes>=1073741824ULL) snprintf(text,size,"%.2f GB",bytes/1073741824.0);
+    else if (bytes>=1048576ULL) snprintf(text,size,"%.1f MB",bytes/1048576.0);
+    else if (bytes) snprintf(text,size,"%.1f KB",bytes/1024.0);
+    else snprintf(text,size,"0 MB");
+}
+static void storage_usage(const read_pico_sd_info_t *info,char *total,size_t total_size,char *usage,size_t usage_size) {
+    storage_amount(total,total_size,info->space_valid?info->filesystem_bytes:info->capacity_bytes);
+    if (!storage_space_valid(info)) { snprintf(usage,usage_size,"空间统计暂不可用，请重新进入此页"); return; }
+    char used[24],available[24];
+    storage_amount(used,sizeof(used),info->filesystem_bytes-info->free_bytes);
+    storage_amount(available,sizeof(available),info->free_bytes);
+    snprintf(usage,usage_size,"已用 %s · 可用 %s",used,available);
+}
 static void render(app_ctx_t *ctx, uint8_t *fb) {
     if (s_view == FILE_VIEW_ACTIONS) {
         file_view_t restore = s_view;
@@ -530,7 +577,7 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         for (int row = 0; row < visible_rows(); ++row) {
             int index = s_page * visible_rows() + row;
             if (index >= s_count) break;
-            int y = 214 + row * 91;
+            int y = 214 + row * 88;
             char name[128]; snprintf(name, sizeof(name), "%s", s_files[index].name);
             while (*name && ttf_text_width_px(ui_text_effective_px(23), name) > 450) {
                 size_t n = strlen(name) - 1;
@@ -545,17 +592,15 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
                               !strcmp(s_files[index].path, app_settings_fonts_dir()) ? "字体目录" : NULL;
             if (tag) ui_text(fb, 588, y + 35, 18, tag, EPD_DRAW_ALIGN_RIGHT, false);
             ui_text(fb, 640, y + 30, 22, "›", EPD_DRAW_ALIGN_RIGHT, false);
-            file_rule(fb, 101, y + 85, 547);
+            file_rule(fb, 101, y + 82, 547);
         }
-        if (s_folder == 3) {
+        if (s_view == FILE_VIEW_MOVE) {
             ui_draw_control_frame(fb, (EpdRect){36, 875, 293, 76}, 8, UI_GRAY_BLACK);
             ui_draw_control_frame(fb, (EpdRect){355, 875, 293, 76}, 8, UI_GRAY_BLACK);
-            ui_text(fb, 182, 897, 24, s_view == FILE_VIEW_MOVE ? "取消移动" : "设为书籍目录", EPD_DRAW_ALIGN_CENTER, false);
-            ui_text(fb, 501, 897, 24, s_view == FILE_VIEW_MOVE ? "移动到此处" : "设为字体目录", EPD_DRAW_ALIGN_CENTER, false);
+            ui_text(fb, 182, 897, 24, "取消移动", EPD_DRAW_ALIGN_CENTER, false);
+            ui_text(fb, 501, 897, 24, "移动到此处", EPD_DRAW_ALIGN_CENTER, false);
             if (s_message[0]) ui_text(fb, 36, 995, 22, s_message, EPD_DRAW_ALIGN_LEFT, false);
         }
-        char page[32]; snprintf(page, sizeof(page), "%d / %d", s_page + 1, s_count ? (s_count + visible_rows() - 1) / visible_rows() : 1);
-        ui_text(fb, 648, 1057, 22, page, EPD_DRAW_ALIGN_RIGHT, false);
     } else {
         ui_text(fb, 36, 91, 52, "文件", EPD_DRAW_ALIGN_LEFT, false);
         EpdRect storage = storage_card_rect();
@@ -564,10 +609,7 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_text(fb, 58, 188, 27, "存储卡", EPD_DRAW_ALIGN_LEFT, false);
         char total[32], usage[80];
         if (s_sd.mounted) {
-            snprintf(total, sizeof(total), "%.1f GB", s_sd.capacity_bytes / 1073741824.0);
-            snprintf(usage, sizeof(usage), "已用 %.1f GB · 可用 %.1f GB",
-                     (s_sd.capacity_bytes - s_sd.free_bytes) / 1073741824.0,
-                     s_sd.free_bytes / 1073741824.0);
+            storage_usage(&s_sd,total,sizeof(total),usage,sizeof(usage));
         } else if (sd_needs_format()) {
             // 卡在但读不了：说清是文件系统的问题，并给出可点的出路。
             // Present but unreadable: say the filesystem is the problem and offer the way out.
@@ -582,8 +624,8 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         ui_text(fb, 58, 231, 19, usage, EPD_DRAW_ALIGN_LEFT, false);
         EpdRect capacity = {58, 263, 566, 6};
         ui_fill_round_rect(fb, capacity, 3, 0xa0);
-        if (s_sd.mounted && s_sd.capacity_bytes) {
-            capacity.width = (int)((s_sd.capacity_bytes - s_sd.free_bytes) * 566 / s_sd.capacity_bytes);
+        if (storage_space_valid(&s_sd)) {
+            capacity.width = (int)((s_sd.filesystem_bytes - s_sd.free_bytes) * 566 / s_sd.filesystem_bytes);
             if (capacity.width > 0) ui_fill_round_rect(fb, capacity, 3, 0x68);
         }
         ui_text(fb, 42, 308, 21, "传输文件", EPD_DRAW_ALIGN_LEFT, false);
@@ -629,24 +671,24 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
                 ui_text_vc(fb, 624, y + 44, 22, "›", EPD_DRAW_ALIGN_RIGHT, false);
             }
         }
-        if (s_count > root_rows()) {
-            char page[24]; snprintf(page, sizeof(page), "%d / %d", s_page + 1,
-                                     (s_count + root_rows() - 1) / root_rows());
-            ui_text_vc(fb, 342, 1030, 20, page, EPD_DRAW_ALIGN_CENTER, false);
-        }
     }
+    draw_file_pager(fb);
     ui_nav_draw(fb, 2);
 }
 
 static void on_enter(app_ctx_t *ctx) {
     (void)ctx;
+    s_pager_pressed=UI_PAGER_NONE;s_pager_paint_pending=false;
     s_folder = s_requested_folder; s_requested_folder = -1;
     s_view = FILE_VIEW_LIST;
     s_delete_confirm = false;
     snprintf(s_dir, sizeof(s_dir), "/sdcard");
     s_page = 0; s_scan_pending = true;
     read_pico_sd_start_probe();
-    read_pico_sd_get_info(&s_sd);
+    if (read_pico_sd_get_info(&s_sd)==ESP_OK && s_sd.mounted) {
+        (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd);
+    }
+    s_space_poll_ms=ctx->now_ms;
     s_sd_format_confirm = false;
     s_sd_notice[0] = 0;
     for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i);
@@ -654,6 +696,7 @@ static void on_enter(app_ctx_t *ctx) {
     else scan_folder(3);
 }
 static void on_media_lost(app_ctx_t *ctx) {
+    s_pager_pressed=UI_PAGER_NONE;s_pager_paint_pending=false;
     (void)ctx; ui_keyboard_end(); s_folder = -1; s_count = 0; s_scan_pending = false;
     s_view = FILE_VIEW_LIST; s_delete_confirm = false;
     memset(s_counts, 0, sizeof(s_counts)); read_pico_sd_get_info(&s_sd);
@@ -672,9 +715,20 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
         return ui_keyboard_idle_tick(ctx->touch && ctx->touch->touched, ctx->now_ms) == UI_KEYBOARD_CHANGED
             ? rename_paint(ctx, false) : APP_REDRAW_NONE;
     }
-    if (!s_scan_pending) return APP_REDRAW_NONE;
+    if (!s_scan_pending) {
+        if (s_folder<0 && s_sd.mounted && !(ctx->touch && ctx->touch->touched) && ctx->now_ms-s_space_poll_ms>=15000) {
+            s_space_poll_ms=ctx->now_ms;
+            read_pico_sd_info_t previous=s_sd;
+            (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd);
+            if (previous.space_valid!=s_sd.space_valid || previous.filesystem_bytes!=s_sd.filesystem_bytes || previous.free_bytes!=s_sd.free_bytes)
+                return APP_REDRAW_PAGE;
+        }
+        return APP_REDRAW_NONE;
+    }
     if (read_pico_sd_get_info(&s_sd) == ESP_ERR_NOT_FINISHED) return APP_REDRAW_NONE;
     s_scan_pending = false;
+    if (s_sd.mounted) { (void)read_pico_sd_refresh_space(); read_pico_sd_get_info(&s_sd); }
+    s_space_poll_ms=ctx->now_ms;
     for (int i = 0; i < 3; ++i) s_counts[i] = count_root(i);
     if (s_folder >= 0) scan_folder(s_folder);
     else scan_folder(3);
@@ -799,6 +853,12 @@ static app_redraw_t rename_paint(app_ctx_t *ctx, bool field) {
     return update.area.width ? APP_REDRAW_AREA : APP_REDRAW_NONE;
 }
 static bool files_present(app_ctx_t *ctx, app_redraw_t redraw) {
+    bool pager=s_pager_paint_pending;s_pager_paint_pending=false;
+    if(pager&&redraw==APP_REDRAW_AREA&&!ctx->request_app&&
+        (s_view==FILE_VIEW_LIST||s_view==FILE_VIEW_MOVE)){
+        guard_draw_result(ctx->hl,update_display_area_diff_with(ctx->hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,ui_pager_area()));
+        return true;
+    }
     if (redraw != APP_REDRAW_AREA || s_view != FILE_VIEW_RENAME) return false;
     if (s_input_settle) {
         guard_draw_result(ctx->hl, update_display_area_full_with(ctx->hl, &E0470_WAVEFORM, MODE_GL16, s_input_area));
@@ -830,6 +890,8 @@ static app_redraw_t rename_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev)
 }
 
 static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    app_redraw_t pager;
+    if(file_pager_event(ctx,ev,&pager))return pager;
     if (s_view == FILE_VIEW_ACTIONS) return action_gesture(ctx, ev);
     if (s_view == FILE_VIEW_RENAME) return rename_gesture(ctx, ev);
     if (s_view == FILE_VIEW_MOVE) {
@@ -850,7 +912,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             else return move_selected();
             return APP_REDRAW_PAGE;
         }
-        int row = (ev->y0 - 214) / 91;
+        int row = (ev->y0 - 214) / 88;
         int index = s_page * visible_rows() + row;
         if (ev->y0 >= 214 && row >= 0 && row < visible_rows() && index < s_count) {
             copy_utf8(s_dir, sizeof(s_dir), s_files[index].path);
@@ -876,25 +938,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             } else s_folder = -1;
             return APP_REDRAW_PAGE;
         }
-        if (!long_press && s_folder == 3 && ev->y0 >= 875 && ev->y0 < 951) {
-            struct stat selected;
-            if (!strcmp(s_dir, "/sdcard") || stat(s_dir, &selected) || !S_ISDIR(selected.st_mode))
-                snprintf(s_message, sizeof(s_message), "请先进入 TF 卡内的文件夹");
-            else if (ev->x0 < 342) {
-                if (app_settings_set_books_dir(s_dir)) {
-                    book_store_notify_changed();
-                    snprintf(s_message, sizeof(s_message), "已设为书籍目录");
-                } else snprintf(s_message, sizeof(s_message), "目录路径过长，无法设置");
-            } else {
-                if (app_settings_set_fonts_dir(s_dir)) {
-                    ttf_font_scan();
-                    snprintf(s_message, sizeof(s_message), "已设为字体目录");
-                } else snprintf(s_message, sizeof(s_message), "目录路径过长，无法设置");
-            }
-            s_counts[0] = count_root(0); s_counts[2] = count_root(2);
-            return APP_REDRAW_PAGE;
-        }
-        int row = (int)(ev->y0 - 214) / 91;
+        int row = (int)(ev->y0 - 214) / 88;
         int index = s_page * visible_rows() + row;
         if (ev->y0 >= 214 && row >= 0 && row < visible_rows() && index < s_count) {
             if (long_press) {
@@ -926,7 +970,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         } else {
             s_sd_format_confirm = false;
             snprintf(s_sd_notice, sizeof(s_sd_notice), "正在格式化…");
-            esp_err_t err = read_pico_sd_format();
+            esp_err_t err = (book_cover_jobs_quiesce(2000) && ui_avatar_quiesce(2000)) ? read_pico_sd_format() : ESP_ERR_NOT_FINISHED;
             read_pico_sd_get_info(&s_sd);
             if (err == ESP_OK) {
                 s_sd_notice[0] = 0;
@@ -998,13 +1042,14 @@ static bool main_page_visible(app_ctx_t *ctx) {
     (void)ctx;
     return s_view == FILE_VIEW_LIST && s_folder < 0 && !strcmp(s_dir, "/sdcard") && !s_delete_confirm;
 }
-static void files_exit(app_ctx_t *ctx) { (void)ctx; ui_keyboard_end(); }
+static void files_before_lock(app_ctx_t *ctx) { (void)ctx;s_pager_pressed=UI_PAGER_NONE;s_pager_paint_pending=false; }
+static void files_exit(app_ctx_t *ctx) { files_before_lock(ctx); ui_keyboard_end(); }
 
 const app_desc_t app_files = {
     .title = "文件管理 Files", .detail = "TF 卡文件与传输", .enter_full = false,
     .owns_keys = true, .menu_handle_enabled = no_menu_handle,
     .main_page_visible = main_page_visible,
     .on_enter = on_enter, .on_media_lost = on_media_lost, .on_media_ready = on_media_ready,
-    .on_exit = files_exit, .render = render, .on_tick = on_tick,
+    .on_exit = files_exit, .on_before_lock=files_before_lock, .render = render, .on_tick = on_tick,
     .on_gesture = on_gesture, .on_key = on_key, .present = files_present,
 };

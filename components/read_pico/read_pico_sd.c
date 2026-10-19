@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -23,6 +24,8 @@
 #include "freertos/task.h"
 #include "read_pico_board.h"
 #include "sdmmc_cmd.h"
+#include "ff.h"
+#include "diskio_sdmmc.h"
 
 #define SD_MOUNT_POINT "/sdcard"
 #define SD_PIN_CLK GPIO_NUM_38
@@ -68,6 +71,39 @@ static void publish_info(const read_pico_sd_info_t* info) {
     portEXIT_CRITICAL(&state_lock);
 }
 
+static esp_err_t fill_space(read_pico_sd_info_t *info) {
+    uint64_t total = 0, available = 0;
+    esp_err_t err = esp_vfs_fat_info(SD_MOUNT_POINT, &total, &available);
+    // 出错或损坏的计数不等于「卡已满」，也不能发生无符号减法下溢。
+    // Failed/corrupt counters never mean a full card, and must not underflow subtraction.
+    if (err == ESP_OK && (!total || available > total || total > info->capacity_bytes)) err = ESP_FAIL;
+    info->space_valid = err == ESP_OK;
+    info->space_error = err;
+    info->filesystem_bytes = err == ESP_OK ? total : 0;
+    info->free_bytes = err == ESP_OK ? available : 0;
+    return err;
+}
+
+// FAT32 的 FSInfo 可能仍是电脑上旧的计数。每次挂载仅一次作废它，首轮统计只读扫描 FAT。
+// Invalidate possibly stale FAT32 FSInfo once per mount; the first read-only FAT scan then counts allocations.
+static void invalidate_mount_space(void) {
+    BYTE drive = ff_diskio_get_pdrv_card(card);
+    if (drive == 0xff) return;
+    char path[12]; snprintf(path,sizeof(path),"%u:",(unsigned)drive);
+    FF_DIR root;
+    if (f_opendir(&root,path) != FR_OK) return;
+    FATFS *fs = root.obj.fs;
+    (void)f_closedir(&root);
+    if (!fs) return;
+#if FF_FS_REENTRANT
+    if (!ff_mutex_take(fs->ldrv)) return;
+#endif
+    fs->free_clst = UINT32_MAX;
+#if FF_FS_REENTRANT
+    ff_mutex_give(fs->ldrv);
+#endif
+}
+
 static void fill_info(read_pico_sd_info_t* info, esp_err_t mount_err) {
     memset(info, 0, sizeof(*info));
     bool present = false;
@@ -85,10 +121,9 @@ static void fill_info(read_pico_sd_info_t* info, esp_err_t mount_err) {
     info->needs_format = false;
     strlcpy(info->name, card->cid.name, sizeof(info->name));
     info->capacity_bytes = (uint64_t)card->csd.capacity * card->csd.sector_size;
-    uint64_t total_bytes = 0;
-    info->error = esp_vfs_fat_info(
-        SD_MOUNT_POINT, &total_bytes, &info->free_bytes
-    );
+    // 空间统计失败不覆盖「挂载成功」，仍允许正常读取文件。
+    // Allocation-query failure must not turn a mounted filesystem into a mount failure.
+    (void)fill_space(info);
 }
 
 static void ensure_media_dirs(void) {
@@ -201,7 +236,10 @@ static esp_err_t mount_card(bool format_if_failed) {
         card = NULL;
         ESP_LOGW(TAG, "Mount failed: %s", esp_err_to_name(err));
         if (!format_if_failed && err == ESP_FAIL) filesystem_unreadable = probe_unsupported_filesystem(host, &slot);
-    } else ensure_media_dirs();
+    } else {
+        invalidate_mount_space();
+        ensure_media_dirs();
+    }
     return err;
 }
 
@@ -301,6 +339,16 @@ static bool begin_operation(void) {
     if (ready) probe_state = 1;
     portEXIT_CRITICAL(&state_lock);
     return ready;
+}
+
+esp_err_t read_pico_sd_refresh_space(void) {
+    read_pico_sd_info_t info;
+    esp_err_t err = read_pico_sd_get_info(&info);
+    if (err != ESP_OK || !info.mounted) return err != ESP_OK ? err : ESP_ERR_INVALID_STATE;
+    if (!begin_operation()) return ESP_ERR_NOT_FINISHED;
+    err = fill_space(&info);
+    publish_info(&info);
+    return err;
 }
 
 esp_err_t read_pico_sd_remount(void) {

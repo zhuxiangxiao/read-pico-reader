@@ -16,8 +16,16 @@
 #include "boot_state.h"
 #include "ttf_font.h"
 #include "ui_kit.h"
+#include "ui_nav.h"
 
 static bool s_reading;
+// Failed unchanged files are not repeatedly opened (opening unloads the active slot).
+static char s_rejected[TTF_FONT_PATH_MAX];
+static time_t s_rejected_mtime;
+static off_t s_rejected_size;
+static bool font_file(const char *path, struct stat *st) {
+    return path && stat(path, st) == 0 && S_ISREG(st->st_mode) && st->st_size > 0;
+}
 
 static const char* system_path(char fallback[TTF_FONT_PATH_MAX]) {
     if (pico_boot_recovery()) return TTF_FONT_BUILTIN;
@@ -29,46 +37,56 @@ static const char* system_path(char fallback[TTF_FONT_PATH_MAX]) {
     if (stat(fallback, &st) == 0 && S_ISREG(st.st_mode)) return fallback;
     if (!ttf_font_count()) ttf_font_scan();
     const ttf_font_item_t *item = ttf_font_item(0);
-    return item ? item->path : TTF_FONT_BUILTIN;
+    return item && font_file(item->path, &st) ? item->path : TTF_FONT_BUILTIN;
 }
 
 static bool activate(const char* path) {
+    struct stat st = {0};
+    bool builtin = ttf_font_path_is_builtin(path);
+    bool valid = builtin || font_file(path, &st);
+    bool rejected = !builtin && !strcmp(s_rejected, path) &&
+        s_rejected_mtime == st.st_mtime && s_rejected_size == st.st_size;
+    if (!valid || rejected) path = TTF_FONT_BUILTIN;
     if (ttf_font_ready() && !strcmp(ttf_font_path(), path)) return false;
-    return ttf_font_open(path) == ESP_OK;
+    if (ttf_font_open(path) == ESP_OK) {
+        if (!ttf_font_path_is_builtin(path)) s_rejected[0] = 0;
+        return true;
+    }
+    if (!ttf_font_path_is_builtin(path)) {
+        snprintf(s_rejected, sizeof(s_rejected), "%s", path);
+        s_rejected_mtime = st.st_mtime;
+        s_rejected_size = st.st_size;
+    }
+    if (ttf_font_ready() && ttf_font_is_builtin()) return false;
+    return ttf_font_open_builtin() == ESP_OK;
 }
 
 bool app_font_activate_system(void) {
     s_reading = false;
+    ttf_set_stroke_adjust(0);
+    ttf_set_antialias(true);
     const char* chosen = app_settings_system_font_path();
     char fallback[TTF_FONT_PATH_MAX];
     const char* path = system_path(fallback);
     bool changed = activate(path);
-    // 目标字体打不开时回退内建。内建已经在用时，这次回退既不需要重新加载、也没有改变任何东西：
-    // 把它报成 changed，主循环的定期重试就会当成"字体就绪"并整屏重画，卡上缺这个字体文件时
-    // 就是每 FONT_RETRY_INTERVAL_MS 一次全刷（还附带一次完整字体重载）。
-    // Fall back to the built-in when the target will not open. When the built-in is already the
-    // active face this neither needs a reload nor changes anything, and reporting a change would
-    // make the loop's periodic retry read it as "font ready" and repaint the whole screen: a full
-    // refresh every FONT_RETRY_INTERVAL_MS, plus a full font reload, whenever the card lacks the
-    // chosen face.
-    if (!(ttf_font_ready() && ttf_font_is_builtin()) &&
-        (!ttf_font_ready() || strcmp(path, ttf_font_path()))) {
-        changed = ttf_font_open_builtin() == ESP_OK || changed;
-    }
     // 未选字体时由内建思源黑体绘制界面；TTF 仍保留完整字库供文件名缺字回退。
     // Built-in Source Han Sans draws default UI; the full TTF remains loaded for missing glyphs.
     ui_text_set_system_font(!pico_boot_recovery() && chosen[0] && ttf_font_ready() &&
                            !strcmp(chosen, ttf_font_path()) && !ttf_font_is_builtin());
     ui_text_set_system_scale(true);
+    ui_nav_status_font_context(false, changed);
     return changed;
 }
 
 bool app_font_activate_reading(void) {
     s_reading = true;
+    ttf_set_stroke_adjust_fine(app_settings_book_weight_fine());
+    ttf_set_antialias(app_settings_book_antialias());
     const char* saved = pico_boot_recovery() ? TTF_FONT_BUILTIN : app_settings_font_path();
     bool changed = activate(ttf_font_path_is_builtin(saved) ? TTF_FONT_BUILTIN : saved);
     ui_text_set_system_font(false);
     ui_text_set_system_scale(false);
+    ui_nav_status_font_context(true, changed);
     return changed;
 }
 
@@ -85,11 +103,13 @@ void app_font_begin_lock(app_lock_font_t *saved) {
 
 void app_font_end_lock(const app_lock_font_t *saved) {
     if (!saved) return;
-    if (strcmp(saved->path, ttf_font_path()) && !activate(saved->path))
-        (void)ttf_font_open_builtin();
+    (void)activate(saved->path);
     s_reading = saved->reading;
+    ttf_set_stroke_adjust_fine(s_reading ? app_settings_book_weight_fine() : 0);
+    ttf_set_antialias(!s_reading || app_settings_book_antialias());
     const char *chosen = app_settings_system_font_path();
     ui_text_set_system_font(!s_reading && !pico_boot_recovery() && chosen[0] &&
                            !strcmp(chosen, ttf_font_path()) && !ttf_font_is_builtin());
     ui_text_set_system_scale(!s_reading);
+    ui_nav_status_font_context(s_reading, false);
 }

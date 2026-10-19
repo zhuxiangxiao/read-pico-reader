@@ -18,6 +18,8 @@ cc -std=gnu11 -Wall -Wextra -Werror -Itools/settings_backup_stubs \
 build/book-tests/book-history-backup
 python3 tools/book_ui_host_test.py
 python3 tools/reader_fullscreen_host_test.py
+python3 tools/reader_controls_host_test.py
+python3 tools/reader_ui_scale_host_test.py
 python3 tools/lock_font_host_test.py
 python3 tools/file_sd_format_host_test.py
 python3 tools/lock_collage_host_test.py
@@ -56,6 +58,7 @@ gcc "${flags[@]}" -Icomponents/read_pico_search/include tools/transfer_host_test
 build/book-tests/transfer
 gcc "${flags[@]}" -Imanaged_components/espressif__cjson/cJSON tools/transfer_wifi_host_test.c managed_components/espressif__cjson/cJSON/cJSON.c -lm -o build/book-tests/transfer-wifi
 build/book-tests/transfer-wifi
+python3 tools/test_transfer_wifi_forget.py
 gcc "${flags[@]}" -Itools/transfer_ui_stubs -Icomponents/read_pico_transfer/include -Icomponents/read_pico_search/include -Imain/ui \
     tools/transfer_ui_host_test.c main/ui/ui_text_edit.c main/ui/ui_text_input.c main/ui/ui_keyboard.c main/ui/ui_ime.c components/read_pico_search/read_pico_search.c -o build/book-tests/transfer-ui
 python3 tools/test_usb_storage.py

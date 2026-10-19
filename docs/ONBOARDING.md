@@ -32,7 +32,7 @@ This document is for **first-time human developers and AI agents**. After readin
   1. 用户通过功能菜单逐项检查硬件（屏、触摸、传感器、电源、TF 卡、蜂鸣器）。
   2. 开发者以它的板级支持包（BSP）与芯片驱动为起点写自己的固件。
 - **不是**：通用阅读器产品固件。页面是"演示 + 自检"，不追求功能完备。
-- **许可**：主体 Apache-2.0；`components/epdiy` 为 LGPL-3.0-or-later（上游 epdiy v2.0.0 的裁剪 fork）；内置字体 ChillDuanSans 为 SIL OFL-1.1。复用/分发前看各组件 `LICENSE`。
+- **许可**：适用范围以 [LICENSE](../LICENSE) 为准；已有代码和历史授权保留 Apache-2.0 或各组件许可。政策实施后明确标注的新增原创内容可适用个人学习、禁止商用许可；不能追溯撤回原授权。`components/epdiy` 仍为 LGPL-3.0-or-later，字体、图标等保留各自许可。复用/分发前看 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。
 - **仓库关系**：上游为 `MindReset/read_pico_firmware`。在 fork 上工作时把上游加为 `upstream` 远端；向上游提 PR 前请阅读 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 - **配套生态**：Dot Open Platform <https://github.com/MindReset/dot_open_platform>。
 
@@ -399,7 +399,7 @@ flowchart TD
 
 - 格式：[.clang-format](../.clang-format)（Google 基础，4 空格，100 列，指针贴类型，`else` 跟右括号）。
 - 注释**全仓中英双语**，规范在 AGENTS.md "注释规范"。速记：
-  - 文件头固定模板（SPDX 2026 mindreset / Apache-2.0 → 中文职责 → English → 冻结 → Frozen）。
+  - 文件头保留真实版权人与适用许可；既有文件不得批量改授权。新增原创文件按根目录 LICENSE 与 CONTRIBUTING.md 明确许可；结构仍为 SPDX → 中文职责 → English → 冻结 → Frozen。
   - 头文件公开 API 与 struct 成员 `///`；`.c` 内部 `//`；不要 `/** */`。
   - 单行 `// 中文。/ English.`；多行中文一行紧跟英文一行；enum 尾注 `///< 中文 / English`。
   - 大 `.c` 用 `/* ---- 区块名 / Section ---- */` 分区。

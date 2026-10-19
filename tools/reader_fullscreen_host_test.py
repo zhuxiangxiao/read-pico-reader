@@ -40,10 +40,12 @@ static bool s_save_failed;
 static char s_message[128];
 static unsigned layout_span=100,reflows,paints,saves,failed_reflows;
 static uint8_t full_pages;
+static const char *app_settings_book_background_path(void){return "";}
 static void copy_text(char *to,size_t cap,const char *from){snprintf(to,cap,"%s",from);}
 static void lock_draw(void){assert(!draw_locked);draw_locked=true;}
 static void unlock_draw(void){assert(draw_locked);draw_locked=false;}
 static void invalidate_prep(void){}
+static void refresh_chapter_lead(void){}
 static EpdRect body_rect(void){return(EpdRect){0,0,684,s_reader_fullscreen?150:100};}
 static size_t book_layout_page_start_offset(size_t page){return page*layout_span;}
 static size_t book_layout_page_for_offset(size_t off){return off/layout_span;}
@@ -61,8 +63,10 @@ static bool load_chapter(app_ctx_t *ctx,size_t chapter,int off,bool last){(void)
 static void set_reader_view(int view){s_view=view;}
 static void skip_hidden_image_pages(app_ctx_t *ctx,int dir){(void)ctx;(void)dir;}
 static uint8_t app_settings_reader_full_pages(void){return full_pages;}
-static int app_settings_reader_turn_effect(void){return 1;}
-static int book_layout_page_image_count(size_t page){(void)page;return 0;}
+static int effect=1;
+static int app_settings_reader_turn_effect(void){return effect;}
+static int test_images;
+static int book_layout_page_image_count(size_t page){(void)page;return test_images;}
 static app_redraw_t paint_reading(app_ctx_t *ctx,int mode){(void)ctx;assert(mode==MODE_GL16);++paints;return APP_REDRAW_AREA;}
 '''
 unit += r"""
@@ -111,6 +115,19 @@ int main(void){
   assert(r==((!full||tools)?APP_REDRAW_PAGE:APP_REDRAW_AREA));
   assert(s_water_turn_pending==!!(full&&!tools));
  }
+ // 普通文字恢复正式版的翻页与周期清屏标志。/ Restore release text-turn and periodic-cleanup state.
+ effect=0;
+ for(int tools=0;tools<2;++tools)for(int full=0;full<2;++full)for(int prior=0;prior<2;++prior){
+  reset(full,tools,2,0);s_reader_text_frame=prior;full_pages=5;s_turns=4;
+  assert(turn_page(&ctx,1)!=APP_REDRAW_NONE&&!s_water_turn_pending&&s_reader_cleanup);
+ }
+ reset(true,false,2,0);test_images=1;assert(turn_page(&ctx,1)==APP_REDRAW_AREA);
+ test_images=0;effect=1;
+ // Mixed/image targets and leaving an image never run the text ripple waveform.
+ reset(true,false,2,0);test_images=2;assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_water_turn_pending&&!s_reader_turn_pending);
+ reset(true,false,2,0);test_images=0;s_reader_text_frame=false;
+ assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_water_turn_pending&&!s_reader_turn_pending);
+ test_images=0;
  reset(false,true,0,0);assert(turn_page(&ctx,-1)==APP_REDRAW_PAGE);
  assert(s_reader_fullscreen&&!s_toolbar&&s_page==0&&!paints&&!s_stats_pending_turns);
  reset(false,true,8,1);assert(turn_page(&ctx,1)==APP_REDRAW_PAGE);

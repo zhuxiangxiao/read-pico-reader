@@ -53,9 +53,10 @@ static uint8_t selected_style;
 static const char *wallpaper="";
 uint8_t app_settings_lock_style(void){return selected_style;}
 const char *app_settings_wallpaper_path(void){return wallpaper;}
+const char *app_settings_bookmark_path(void){return wallpaper;}
 
 static unsigned stage,idx,waits,verified,ready,held,pushes,fulls,wiped,stops,entries,settles;
-static bool valid_storage=true,low_memory,boot_scenario,timeout_scenario,display_failure;
+static bool enabled_storage=true,valid_storage=true,low_memory,boot_scenario,timeout_scenario,display_failure;
 static uint64_t now;
 static int power_pending;
 static jmp_buf deep;
@@ -65,6 +66,7 @@ static void tap(int x,int y){add(x,y,1,0);add(x,y,0,0);}
 static void correct(void){tap(158,862);tap(526,544);tap(526,862);tap(158,544);}
 void lock_pin_wipe(void *bytes,unsigned n){volatile uint8_t *p=bytes;while(n--)*p++=0;++wiped;}
 static bool lock_pin_available(void){return valid_storage;}
+static bool lock_pin_enabled(void){return valid_storage&&enabled_storage;}
 static bool lock_pin_verify(const char pin[5]){++verified;return valid_storage&&!strcmp(pin,"7391");}
 static uint8_t *epd_hl_get_framebuffer(EpdiyHighlevelState *h){(void)h;return framebuffer;}
 enum EpdRotation epd_get_rotation(void){return 1;}
@@ -88,7 +90,7 @@ static void pico_boot_hold_resume(void){++held;}
 static int cst836u_read(void *tp,cst836u_touch_t *t){(void)tp;if(idx>=sample_count){*t=(cst836u_touch_t){0};return 0;}typeof(samples[0]) s=samples[idx++];*t=(cst836u_touch_t){.touched=s.count!=0,.count=s.count,.x=s.x,.y=s.y};if(s.error<-1){power_pending=-s.error;return ESP_OK;}return s.error;}
 static void vTaskDelay(int ms){now+=ms;assert(now<35000||timeout_scenario||!valid_storage);}
 static void ui_pinpad_begin(ui_pinpad_t *p,const uint8_t *fb,const char *title){(void)fb;ui_pinpad_end(p);ui_pinpad_reset(p,title,"");if(!low_memory)p->background=malloc(1);}
-static void ui_pinpad_paint_input(uint8_t *f,const ui_pinpad_t *p){(void)p;f[0]=0xaa;}
+static void ui_pinpad_paint_input(uint8_t *f,ui_pinpad_t *p){(void)p;f[0]=0xaa;}
 static void ui_pinpad_paint(uint8_t *fb,const ui_pinpad_t *p,EpdRect area){(void)p;if(area.y==470)++settles;if(area.y==0&&area.height==1216)++entries;fb[0]=0xaa;}
 
 enum EpdDrawError {EPD_GOOD=0,EPD_BAD=1};
@@ -100,12 +102,19 @@ static void guard_draw_result(void *h,enum EpdDrawError result){(void)h;(void)re
  unit=unit.replace('static void ui_pinpad_paint_input(', 'void ui_pinpad_paint_input(').replace('static void ui_pinpad_begin(', 'void ui_pinpad_begin(').replace('static void ui_pinpad_paint(', 'void ui_pinpad_paint(')
  for n in ('ui_pinpad_full','ui_pinpad_entry_area','ui_pinpad_end','ui_pinpad_reset','key_rect','joined','hit_test','ui_pinpad_handle'):
   unit+=function(n,ROOT/'main/ui/ui_pinpad.c')+'\n'
- for n in ('checksum','wallpaper_key','lock_screen_restore','save_art','restore_art','present','present_input','lock_screen_authenticate'):
+ for n in ('checksum','wallpaper_key','lock_screen_restore','lock_screen_save','restore_art','present','present_input','lock_screen_authenticate'):
   unit+=function(n,ROOT/'main/lock_screen.c')+'\n'
  unit+=r'''
 static void start(void){idx=sample_count=waits=verified=ready=held=pushes=fulls=entries=settles=0;now=0;power_pending=0;memset(framebuffer,0x37,sizeof(framebuffer));add(0,0,0,0);}
 int main(void){
  EpdiyHighlevelState hl={0};
+ // 未开启和读取失败均不绘制密码、等待触摸或停蓝牙；读取恢复后已设密码正常验证。
+ // Disabled/unreadable settings neither paint a PIN nor wait/stop BLE; a recovered enabled PIN requires verification.
+ start();enabled_storage=false;
+ lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(!verified&&!entries&&!pushes&&!waits&&!ready&&!held);
+ start();enabled_storage=true;valid_storage=false;
+ lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(!verified&&!entries&&!pushes&&!waits&&!ready&&!held);
+ start();valid_storage=true;correct();lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(verified==1&&entries==1);
  // Wrong PIN, cancel, pickup, physical touch buttons, multitouch and read errors, then valid PIN.
  start();for(int i=0;i<4;++i)tap(342,1021);tap(144,1132);add(0,0,0,0);
  tap(342,1350);add(158,544,1,0);add(158,544,2,0);add(158,544,0,0);
@@ -123,33 +132,34 @@ int main(void){
  start();display_failure=true;correct();lock_screen_authenticate(&hl,(void*)1,(void*)2,false);assert(verified==1&&entries==1&&!settles&&fulls>0);display_failure=false;
  // Cancel never releases the caller: deep sleep terminates the protected loop instead.
  start();tap(144,1132);timeout_scenario=true;if(!setjmp(deep)){lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(0);}assert(!verified&&waits==1);timeout_scenario=false;
- // Corrupt credentials remain locked even with a valid-looking sequence.
- start();correct();valid_storage=false;timeout_scenario=true;if(!setjmp(deep)){lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(0);}assert(!verified);valid_storage=true;timeout_scenario=false;
+ // 按用户选择，持续不可读状态直接返回，不显示虚假的四位密码。
+ // User-selected unreadable storage returns immediately without a spurious four-digit prompt.
+ start();correct();valid_storage=false;lock_screen_authenticate(&hl,(void*)1,(void*)2,true);assert(!verified&&!entries&&!waits&&!pushes);valid_storage=true;
  uint8_t *f=malloc(FRAME_BYTES);assert(lock_screen_restore(f));
  // 旧拼贴缓存不能跨样式进入票根或壁纸。/ Collage art must not cross into ticket or wallpaper mode.
  for(unsigned saved=0;saved<3;++saved){
-  selected_style=saved;save_art(framebuffer);
+  selected_style=saved;lock_screen_save(framebuffer);
   for(unsigned current=0;current<3;++current){selected_style=current;memset(f,0xee,FRAME_BYTES);assert(lock_screen_restore(f)==(current==saved));if(current!=saved)assert(f[0]==0xee);}
  }
- selected_style=2;save_art(framebuffer);assert(lock_screen_restore(f));
+ selected_style=2;lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  selected_style=0;memset(f,0xee,FRAME_BYTES);assert(!lock_screen_restore(f)&&f[0]==0xee);
  selected_style=1;assert(!lock_screen_restore(f));
- wallpaper=LOCK_SCREEN_CACHE_PARENT "/a.jpg";save_art(framebuffer);assert(lock_screen_restore(f));
+ wallpaper=LOCK_SCREEN_CACHE_PARENT "/a.jpg";lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  wallpaper=LOCK_SCREEN_CACHE_PARENT "/b.jpg";memset(f,0xee,FRAME_BYTES);assert(!lock_screen_restore(f)&&f[0]==0xee);
- save_art(framebuffer);assert(lock_screen_restore(f));
+ lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  FILE *image=fopen(wallpaper,"wb");assert(image);assert(fputs("new image",image)>=0&&fclose(image)==0);
- assert(!lock_screen_restore(f));save_art(framebuffer);assert(lock_screen_restore(f));
+ assert(!lock_screen_restore(f));lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  image=fopen(wallpaper,"ab");assert(image);assert(fputc(1,image)!=EOF&&fclose(image)==0);assert(!lock_screen_restore(f));
- assert(remove(wallpaper)==0);save_art(framebuffer);assert(lock_screen_restore(f));
+ assert(remove(wallpaper)==0);lock_screen_save(framebuffer);assert(lock_screen_restore(f));
  assert(!lock_screen_restore(NULL));
  // 旧版缓存必须重绘当前样式，旋转不符也不能复用。/ Old cache versions and mismatched rotations require current-style redraw.
  FILE *old=fopen(LOCK_ART_PATH,"wb");assert(old);uint32_t legacy[3]={UINT32_C(0x50414431),1,checksum(framebuffer)};
  assert(fwrite(legacy,1,sizeof(legacy),old)==sizeof(legacy)&&fwrite(framebuffer,1,FRAME_BYTES,old)==FRAME_BYTES&&fclose(old)==0);
  assert(!lock_screen_restore(f));
- selected_style=0;save_art(framebuffer);FILE *rotated=fopen(LOCK_ART_PATH,"r+b");assert(rotated);
+ selected_style=0;lock_screen_save(framebuffer);FILE *rotated=fopen(LOCK_ART_PATH,"r+b");assert(rotated);
  uint32_t rotation=2;assert(fseek(rotated,4,SEEK_SET)==0&&fwrite(&rotation,1,sizeof(rotation),rotated)==sizeof(rotation)&&fclose(rotated)==0);assert(!lock_screen_restore(f));
- selected_style=0;save_art(framebuffer);assert(lock_screen_restore(f));FILE *bad=fopen(LOCK_ART_PATH,"r+b");assert(bad);fputc(0,bad);fclose(bad);assert(!lock_screen_restore(f));free(f);
- assert(stops>=5);puts("PASS: actual exclusive auth loop blocks wrong/cancel/touch keys/pickup/multitouch/read faults; cold boot holds resume; OOM/display errors fail closed; cancel/idle deep-sleep; corrupt credentials/art cannot bypass");
+ selected_style=0;lock_screen_save(framebuffer);assert(lock_screen_restore(f));FILE *bad=fopen(LOCK_ART_PATH,"r+b");assert(bad);fputc(0,bad);fclose(bad);assert(!lock_screen_restore(f));free(f);
+ assert(stops>=5);puts("PASS: actual exclusive auth loop blocks wrong/cancel/touch keys/pickup/multitouch/read faults; cold boot holds resume; OOM/display errors fail closed; cancel/idle deep-sleep; read faults follow the nonblocking policy; normal PIN and cached-art validation retained");
 }
 '''
  (p/'test.c').write_text(unit)

@@ -108,8 +108,14 @@ void ui_draw_frosted_pocket(uint8_t *framebuffer, EpdRect rect);
 void ui_text_set_system_scale(bool enabled);
 void ui_text_set_system_font(bool enabled);
 int ui_text_effective_px(int px);
+/// 按系统字号绘制单行文字，按字形真实边界适配控件；不打开第二份字体。
+/// Scale one line to the UI preference, fitting native glyphs within a control without loading another face.
+void ui_text_box(uint8_t *fb, EpdRect box, int px, const char *text,
+                 enum EpdFontFlags align, bool inverted);
 /// 灰阶图片在绘制时增强明暗差，原始缓存保持不变。/ Increase image contrast at draw time without altering cached pixels.
 uint8_t ui_contrast_gray(uint8_t gray);
+/// 按逻辑旋转坐标读取当前帧，返回0..15灰阶；调用方保证坐标有效。/ Read the rotated frame at valid logical coordinates, returning gray level 0..15.
+uint8_t ui_read_pixel(const uint8_t *framebuffer,int x,int y);
 /// 将已画图片区域转为稳定黑白点阵，仅由本地主页面测试调用。/ Convert a painted image region to stable black/white dots; used only by the local main-page trial.
 void ui_image_bw_rect(uint8_t* fb, EpdRect rect);
 /// 亚克力最终合成区转换为稳定的一像素细点阵，裁剪到屏幕；调用者限定快刷书架。/ Convert the final acrylic composition to stable one-pixel dots, clipped to the screen; callers restrict this to fast shelves.
@@ -141,13 +147,20 @@ void ui_text_fixed_vc(
 /// 固定字号文字使用指定灰阶墨色，复用活动字体。/ Fixed-size text with a chosen gray ink, reusing the active face.
 void ui_text_fixed_ink_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
                           enum EpdFontFlags align, uint8_t gray);
+/// 原字号灰阶抗锯齿，边缘混合到实际底色；暂时启用后恢复正文开关，不加载另一份字体。
+/// Native-size gray antialiasing against the actual background; restore the body switch afterward and never load another face.
+void ui_text_fixed_context_aa_vc(uint8_t *fb,int x,int center_y,int px,const char *text,
+                               const char *font_sample,enum EpdFontFlags align,uint8_t gray,uint8_t background);
 /// 标题复用当前活动字体并按固定字号截短：首页系统字体、阅读页阅读字体；不加载第二份字体。
 /// Fit titles in the active face at a fixed size: Home's system face or the reader face, without loading a second font.
 int ui_text_title_fit(char *text, int preferred_px, int width, const char *font_sample);
-/// 当前页字体按目标字号直接绘制黑色标题，视觉中心对齐，不受系统字号缩放影响。
-/// Rasterize the active face directly at the target size in black, visually centered and independent of UI scaling.
+/// 当前页字体按目标字号直接绘制灰阶抗锯齿标题，视觉中心对齐，不受系统字号缩放影响。
+/// Rasterize the active face directly with gray antialiasing at the target size, visually centered and independent of UI scaling.
 void ui_text_title_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
                       const char *font_sample, enum EpdFontFlags align);
+/// 与标题共用字体及抗锯齿规则，边缘混合至卡片实际底色。/ Share title font/AA rules while blending edges into the card's actual background.
+void ui_text_title_background_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
+                                 const char *font_sample, enum EpdFontFlags align, uint8_t background);
 void ui_text_bw(
     uint8_t* framebuffer, int x, int y_top, int px, const char* text,
     enum EpdFontFlags align, bool inverted
@@ -172,6 +185,15 @@ void ui_blit_bmp(
 void ui_draw_icon(
     uint8_t* framebuffer, int cx, int cy, int size, ui_icon_t icon, uint8_t gray
 );
+
+/// 书架与文件目录共用四向分页栏；矩形止于导航触摸区之上，无圆圈或反馈底框。
+/// Shared shelf/file pager, ending above the navigation touch strip, without circles or backing boxes.
+enum { UI_PAGER_NONE=-1, UI_PAGER_FIRST, UI_PAGER_PREVIOUS, UI_PAGER_NEXT, UI_PAGER_LAST };
+EpdRect ui_pager_area(void);
+EpdRect ui_pager_rect(int action);
+int ui_pager_hit(int x,int y);
+int ui_pager_target(int action,int page,int pages);
+void ui_pager_draw(uint8_t *fb,const char *label,int page,int pages,bool key_mode,int pressed);
 
 void ui_draw_round_rect(
     uint8_t* framebuffer, EpdRect rect, int radius, uint8_t color
@@ -287,6 +309,10 @@ int ui_datamatrix_side(const char* text);
 void ui_draw_datamatrix(uint8_t* framebuffer, EpdRect rect, const char* text);
 
 void ui_clear_page(uint8_t* framebuffer);
+/// Exact logical fill using contiguous packed rows; preserves boundary nibbles.
+void ui_fill_rect_fast(EpdRect rect, uint8_t gray, uint8_t *framebuffer);
+/// 直接写入已裁剪的一位位图，源数据按行、低位在先；不缩放、不申请内存。/ Blit a clipped row-major, least-bit-first mono bitmap directly, without rescaling or allocation.
+void ui_blit_mono_bitmap(uint8_t *framebuffer, EpdRect rect, const uint8_t *bits, size_t stride);
 /// 把逻辑矩形换算成 framebuffer 里的物理矩形。
 /// Map a logical rect to the physical rect in the framebuffer.
 EpdRect ui_rotate_rect_to_fb(EpdRect rect);

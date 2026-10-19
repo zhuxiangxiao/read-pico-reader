@@ -12,6 +12,7 @@ void epd_draw_pixel(int x, int y, uint8_t color, uint8_t *fb);
 uint8_t epd_get_pixel(int x, int y, int width, int height, const uint8_t *fb);
 void epd_draw_line(int x0, int y0, int x1, int y1, uint8_t color, uint8_t *fb);
 void epd_draw_circle(int x, int y, int radius, uint8_t color, uint8_t *fb);
+void epd_fill_circle(int x, int y, int radius, uint8_t color, uint8_t *fb);
 void epd_fill_rect(EpdRect rect, uint8_t color, uint8_t *fb);
 void epd_fill_circle_helper(int x, int y, int radius, int corners, int delta, uint8_t color, uint8_t *fb);
 void epd_draw_rotated_image(EpdRect rect, const uint8_t *image, uint8_t *fb);

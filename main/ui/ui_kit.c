@@ -10,6 +10,8 @@
  * Latest user revision: titles reuse the page's active face: system on Home, reader in books, directly rasterized at the original size.
  * 不为标题切换或重复加载字库；内建缺字回退保留原生位图尺寸，截短保持完整内容的字体来源。
  * Never switch or duplicate fonts for titles; built-in missing-glyph fallback retains native bitmap sizes and the full text fixes the face during truncation.
+ * 用户修复：目录标题复用相同路径，抗锯齿边缘混合至当前行底色，不留下白边。
+ * User fix: directory titles share this path and blend antialiasing into their row background without white fringes.
  */
 
 #include "ui_kit.h"
@@ -35,8 +37,8 @@ void ui_text_set_system_font(bool enabled) { s_system_ttf = enabled; }
 
 int ui_text_effective_px(int px) {
     px += 2;
-    // 用户的系统字号只应用于系统界面；阅读正文及工具保持书内设置。
-    // Apply the UI-size preference only to system screens; reading uses its own settings.
+    // 系统界面与阅读工具跟随系统字号；正文关闭此开关，保持书内字号。
+    // System screens and reader controls follow UI size; body drawing disables this switch.
     return s_system_text_scale && px < 46 ?
         (px * app_settings_system_font_size() + 50) / 100 : px;
 }
@@ -48,7 +50,7 @@ uint8_t ui_contrast_gray(uint8_t gray) {
     return (uint8_t)value & 0xf0;
 }
 
-static uint8_t ui_read_pixel(const uint8_t *fb, int x, int y) {
+uint8_t ui_read_pixel(const uint8_t *fb, int x, int y) {
     int px = x, py = y;
     switch (epd_get_rotation()) {
         case EPD_ROT_PORTRAIT: px = epd_width() - y - 1; py = x; break;
@@ -141,6 +143,49 @@ void ui_draw_icon(
                 (background * (15 - cover) + (int)gray * cover + 7) / 15;
             epd_draw_pixel(px, py, ui_contrast_gray((uint8_t)blended), framebuffer);
         }
+    }
+}
+
+EpdRect ui_pager_area(void) { return (EpdRect){36,1006,612,50}; }
+EpdRect ui_pager_rect(int action) {
+    static const int left[]={36,116,480,576},width[]={72,88,88,72};
+    return action>=UI_PAGER_FIRST&&action<=UI_PAGER_LAST?
+        (EpdRect){left[action],1006,width[action],50}:(EpdRect){0};
+}
+int ui_pager_hit(int x,int y) {
+    for(int action=UI_PAGER_FIRST;action<=UI_PAGER_LAST;++action)
+        if(ui_rect_hit(ui_pager_rect(action),x,y))return action;
+    return UI_PAGER_NONE;
+}
+int ui_pager_target(int action,int page,int pages) {
+    if(pages<1)pages=1;
+    if(page<0)page=0;
+    if(page>=pages)page=pages-1;
+    if(action==UI_PAGER_FIRST)return 0;
+    if(action==UI_PAGER_PREVIOUS)return page>0?page-1:page;
+    if(action==UI_PAGER_NEXT)return page+1<pages?page+1:page;
+    if(action==UI_PAGER_LAST)return pages-1;
+    return page;
+}
+void ui_pager_draw(uint8_t *fb,const char *label,int page,int pages,bool key_mode,int pressed) {
+    ui_text_box(fb,(EpdRect){212,1006,260,50},21,label,EPD_DRAW_ALIGN_CENTER,false);
+    for(int action=UI_PAGER_FIRST;action<=UI_PAGER_LAST;++action){
+        EpdRect r=ui_pager_rect(action);
+        bool previous=action==UI_PAGER_FIRST||action==UI_PAGER_PREVIOUS;
+        bool end=action==UI_PAGER_FIRST||action==UI_PAGER_LAST;
+        bool down=pressed==action,outlined=key_mode&&!end;
+        bool enabled=ui_pager_target(action,page,pages)!=page;
+        int cx=r.x+r.width/2+(down?(previous?-3:3):0),cy=r.y+r.height/2;
+        int size=down?42:36;
+        static const ui_icon_t icons[]={UI_ICON_PAGER_CHEVRON_FIRST,UI_ICON_CHEVRON_LEFT,
+            UI_ICON_CHEVRON_RIGHT,UI_ICON_PAGER_CHEVRON_LAST};
+        ui_icon_t icon=icons[action];
+        // AnimateIcons 的首末页竖线与箭头；按键模式仅沿轮廓描边，不添加圆圈或底框。
+        // AnimateIcons end stops and chevrons; key mode outlines the glyph without circles or backing boxes.
+        if(outlined)
+            for(int dy=-2;dy<=2;++dy)for(int dx=-2;dx<=2;++dx)
+                if(dx*dx+dy*dy<=4)ui_draw_icon(fb,cx+dx,cy+dy,size,icon,enabled?0x10:0x90);
+        ui_draw_icon(fb,cx,cy,size,icon,outlined?(down?0x30:0xf0):(enabled?0:0xa0));
     }
 }
 
@@ -283,6 +328,32 @@ void ui_text_fixed_context_vc(
     }
 }
 
+void ui_text_box(uint8_t *fb, EpdRect box, int px, const char *text,
+                 enum EpdFontFlags align, bool inverted) {
+    if (!fb || !text || !text[0] || box.width <= 0 || box.height <= 0) return;
+    px = ui_text_effective_px(px);
+    const bool builtin = (!s_system_ttf || ttf_font_is_builtin()) && ui_font_has_text(text);
+    while (px > 1) {
+        int above = 0, below = 0;
+        if (builtin) ui_font_measure_line_px(px,text,&above,&below);
+        else ttf_measure_line_px(px,text,&above,&below);
+        // 基线与居中坐标分别取整，预留两像素避免奇数字形越过控件边界。
+        // Reserve two pixels for separate baseline/center rounding on odd glyph bounds.
+        const int width = ui_text_fixed_width_px(px,text), height = above + below + 2;
+        if (width <= box.width && height <= box.height) break;
+        int next = px - 1;
+        if (width > box.width && width > 0 && px * box.width / width < next)
+            next = px * box.width / width;
+        if (height > box.height && height > 0 && px * box.height / height < next)
+            next = px * box.height / height;
+        px = next > 0 ? next : 1;
+    }
+    int x = box.x;
+    if (align == EPD_DRAW_ALIGN_CENTER) x += box.width / 2;
+    else if (align == EPD_DRAW_ALIGN_RIGHT) x += box.width;
+    ui_text_fixed_vc(fb,x,box.y+box.height/2,px,text,align,inverted);
+}
+
 void ui_text_fixed_ink_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
                           enum EpdFontFlags align, uint8_t gray) {
     if (!fb || !text || !*text || px <= 0) return;
@@ -303,6 +374,22 @@ static bool title_uses_active_font(const char *sample) {
     return ttf_font_ready() && (!ttf_font_is_builtin() || ttf_font_has_text(sample));
 }
 
+void ui_text_fixed_context_aa_vc(uint8_t *fb,int x,int center_y,int px,const char *text,
+                               const char *font_sample,enum EpdFontFlags align,uint8_t gray,uint8_t background) {
+    if(!fb||!text||!*text||px<=0)return;
+    int above=0,below=0;
+    uint8_t ink=ui_contrast_gray(gray)>>4,back=ui_contrast_gray(background)>>4;
+    if((!s_system_ttf||ttf_font_is_builtin())&&ui_font_has_text(font_sample?font_sample:text)) {
+        ui_font_measure_line_px(px,text,&above,&below);
+        ui_font_draw_text_px(fb,x,center_y+(above-below)/2,px,text,align,ink,back,false);
+    } else {
+        bool prior=ttf_get_antialias();ttf_set_antialias(true);
+        ttf_measure_line_px(px,text,&above,&below);
+        ttf_draw_text_px(fb,x,center_y+(above-below)/2,px,text,align,ink,back);
+        ttf_set_antialias(prior);
+    }
+}
+
 int ui_text_title_fit(char *text, int preferred_px, int width, const char *font_sample) {
     const char *sample = font_sample ? font_sample : text;
     bool builtin = !title_uses_active_font(sample) && ui_font_has_text(sample);
@@ -318,19 +405,28 @@ int ui_text_title_fit(char *text, int preferred_px, int width, const char *font_
     return px;
 }
 
-void ui_text_title_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
-                      const char *font_sample, enum EpdFontFlags align) {
+void ui_text_title_background_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
+                                 const char *font_sample, enum EpdFontFlags align, uint8_t background) {
     if (!fb || !text || !*text) return;
     int above = 0, below = 0;
+    uint8_t back = background >> 4;
     if (!title_uses_active_font(font_sample ? font_sample : text) &&
         ui_font_has_text(font_sample ? font_sample : text)) {
         ui_font_measure_line_px(px, text, &above, &below);
-        ui_font_draw_title_px(fb, x, center_y + (above - below) / 2, px, text, align);
+        ui_font_draw_text_px(fb, x, center_y + (above - below) / 2, px, text, align,
+                             UI_INK_BLACK, back, false);
     } else {
+        bool prior=ttf_get_antialias();ttf_set_antialias(true);
         ttf_measure_line_px(px, text, &above, &below);
-        ttf_draw_text_px_bw(fb, x, center_y + (above - below) / 2, px, text,
-                            align, UI_INK_BLACK, UI_INK_WHITE);
+        ttf_draw_text_px(fb, x, center_y + (above - below) / 2, px, text,
+                         align, UI_INK_BLACK, back);
+        ttf_set_antialias(prior);
     }
+}
+
+void ui_text_title_vc(uint8_t *fb, int x, int center_y, int px, const char *text,
+                      const char *font_sample, enum EpdFontFlags align) {
+    ui_text_title_background_vc(fb, x, center_y, px, text, font_sample, align, UI_GRAY_WHITE);
 }
 
 void ui_text_bw(
@@ -438,21 +534,21 @@ void ui_draw_round_rect(
     const int span_v = rect.height - 2 * r;
 
     if (span_h > 0) {
-        epd_fill_rect(
+        ui_fill_rect_fast(
             (EpdRect){ .x = rect.x + r, .y = rect.y, .width = span_h, .height = 1 },
             color, framebuffer
         );
-        epd_fill_rect(
+        ui_fill_rect_fast(
             (EpdRect){ .x = rect.x + r, .y = y1, .width = span_h, .height = 1 },
             color, framebuffer
         );
     }
     if (span_v > 0) {
-        epd_fill_rect(
+        ui_fill_rect_fast(
             (EpdRect){ .x = rect.x, .y = rect.y + r, .width = 1, .height = span_v },
             color, framebuffer
         );
-        epd_fill_rect(
+        ui_fill_rect_fast(
             (EpdRect){ .x = x1, .y = rect.y + r, .width = 1, .height = span_v },
             color, framebuffer
         );
@@ -485,7 +581,7 @@ void ui_draw_control_frame(uint8_t* framebuffer, EpdRect rect, int radius, uint8
 
 void ui_draw_separator(uint8_t* framebuffer, int y, int x, int width, uint8_t color) {
     if (width <= 0) return;
-    epd_fill_rect((EpdRect){x, y, width, 2}, ui_contrast_gray(color > 0x60 ? 0x60 : color), framebuffer);
+    ui_fill_rect_fast((EpdRect){x, y, width, 2}, ui_contrast_gray(color > 0x60 ? 0x60 : color), framebuffer);
 }
 
 void ui_draw_selected_round_rect(
@@ -519,7 +615,7 @@ void ui_fill_round_rect(
     color = ui_contrast_gray(color);
     radius = clamp_radius(rect, radius);
 
-    epd_fill_rect(
+    ui_fill_rect_fast(
         (EpdRect){
             .x = rect.x + radius,
             .y = rect.y,
@@ -613,7 +709,7 @@ EpdRect ui_content_refresh_area(void) {
 
 void ui_hairline(uint8_t* framebuffer, int y, int x, int w, uint8_t color) {
     color = ui_contrast_gray(color);
-    epd_fill_rect(
+    ui_fill_rect_fast(
         (EpdRect){ .x = x, .y = y, .width = w, .height = 1 }, color, framebuffer
     );
 }
@@ -923,7 +1019,7 @@ static void c39_char(
     for (int i = 8; i >= 0; i--) {
         const int w = ((pat >> i) & 1) ? wide : narrow;
         if (((8 - i) & 1) == 0) {
-            epd_fill_rect(
+            ui_fill_rect_fast(
                 (EpdRect){ .x = *x, .y = y, .width = w, .height = h },
                 UI_GRAY_BLACK, framebuffer
             );
@@ -1062,7 +1158,7 @@ static void c128_bars(
         const int on = (pat >> i) & 1;
         if (run > 0 && on != run_on) {
             if (run_on) {
-                epd_fill_rect(
+                ui_fill_rect_fast(
                     (EpdRect){ .x = px, .y = y, .width = run * mod, .height = h },
                     UI_GRAY_BLACK, framebuffer
                 );
@@ -1074,7 +1170,7 @@ static void c128_bars(
         run++;
     }
     if (run > 0 && run_on) {
-        epd_fill_rect(
+        ui_fill_rect_fast(
             (EpdRect){ .x = px, .y = y, .width = run * mod, .height = h },
             UI_GRAY_BLACK, framebuffer
         );
@@ -1286,7 +1382,7 @@ void ui_draw_datamatrix(uint8_t* framebuffer, EpdRect rect, const char* text) {
             const int on = (c < dim && mods[r * dim + c]);
             if (on && run0 < 0) run0 = c;
             if (!on && run0 >= 0) {
-                epd_fill_rect(
+                ui_fill_rect_fast(
                     (EpdRect){
                         .x = x0 + run0 * mod,
                         .y = y0 + r * mod,
@@ -1304,6 +1400,59 @@ void ui_draw_datamatrix(uint8_t* framebuffer, EpdRect rect, const char* text) {
 void ui_clear_page(uint8_t* framebuffer) {
 
     memset(framebuffer, 0xFF, (size_t)epd_width() * epd_height() / 2);
+}
+
+void ui_blit_mono_bitmap(uint8_t *fb,EpdRect rect,const uint8_t *bits,size_t stride) {
+    if(!fb||!bits||rect.width<=0||rect.height<=0||stride<((size_t)rect.width+7)/8)return;
+    int64_t right=(int64_t)rect.x+rect.width,bottom=(int64_t)rect.y+rect.height;
+    int x0=rect.x<0?0:rect.x,y0=rect.y<0?0:rect.y;
+    int width=epd_rotated_display_width(),height=epd_rotated_display_height();
+    if(right>width)right=width;
+    if(bottom>height)bottom=height;
+    if(right<=x0||bottom<=y0)return;
+    const int pw=epd_width();
+    int dx=1,dy=pw;
+    switch(epd_get_rotation()) {
+        case EPD_ROT_PORTRAIT:dx=pw;dy=-1;break;
+        case EPD_ROT_INVERTED_LANDSCAPE:dx=-1;dy=-pw;break;
+        case EPD_ROT_INVERTED_PORTRAIT:dx=-pw;dy=1;break;
+        default:break;
+    }
+    EpdRect origin=ui_rotate_rect_to_fb((EpdRect){x0,y0,1,1});
+    int row_pixel=origin.y*pw+origin.x;
+    for(int y=y0;y<bottom;++y,row_pixel+=dy) {
+        const uint8_t *source=bits+(size_t)(y-(int64_t)rect.y)*stride;
+        int pixel=row_pixel;
+        for(int x=x0;x<right;++x,pixel+=dx) {
+            size_t sx=(size_t)(x-(int64_t)rect.x);
+            unsigned shift=(pixel&1)*4,value=source[sx/8]&(1u<<(sx&7))?15:0;
+            fb[pixel/2]=(fb[pixel/2]&~(15u<<shift))|(value<<shift);
+        }
+    }
+}
+
+void ui_fill_rect_fast(EpdRect rect, uint8_t gray, uint8_t *framebuffer) {
+    if (!framebuffer || rect.width <= 0 || rect.height <= 0) return;
+    int64_t right=(int64_t)rect.x+rect.width, bottom=(int64_t)rect.y+rect.height;
+    int width=epd_rotated_display_width(),height=epd_rotated_display_height();
+    if(rect.x<0)rect.x=0;
+    if(rect.y<0)rect.y=0;
+    if(right>width)right=width;
+    if(bottom>height)bottom=height;
+    if(right<=rect.x||bottom<=rect.y)return;
+    rect.width=(int)(right-rect.x);rect.height=(int)(bottom-rect.y);
+    EpdRect physical=ui_rotate_rect_to_fb(rect);
+    const size_t stride=(size_t)epd_width()/2;
+    const uint8_t nibble=gray>>4, packed=nibble*17u;
+    const int start=physical.x,end=physical.x+physical.width;
+    for(int y=physical.y;y<physical.y+physical.height;++y) {
+        uint8_t *row=framebuffer+(size_t)y*stride;
+        int x=start;
+        if(x&1){row[x/2]=(row[x/2]&0x0f)|(nibble<<4);++x;}
+        const int pairs=(end-x)/2;
+        if(pairs>0){memset(row+x/2,packed,(size_t)pairs);x+=pairs*2;}
+        if(x<end)row[x/2]=(row[x/2]&0xf0)|nibble;
+    }
 }
 
 // 旋转都是 90° 的整数倍，逻辑矩形映射过去仍是矩形，所以取两个对角点的包围盒就

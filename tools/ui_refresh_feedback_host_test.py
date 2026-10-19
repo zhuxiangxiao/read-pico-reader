@@ -41,7 +41,7 @@ shelf = r'''
 #include <string.h>
 #include <stddef.h>
 typedef struct {int x,y,width,height;} EpdRect;
-typedef struct {void *hl;uint8_t *fb;int64_t now_ms;unsigned leaf;} app_ctx_t;
+typedef struct {void *hl;uint8_t *fb;int64_t now_ms;unsigned leaf;void *request_app;} app_ctx_t;
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_DONE,APP_REDRAW_AREA,APP_REDRAW_PAGE,APP_REDRAW_FULL} app_redraw_t;
 enum {SHELF,MANAGE,READING,READER_PANEL_NONE,TOC,EDIT,SEARCH};
 enum EpdDrawMode {MODE_GL16,MODE_DU,MODE_GC16};
@@ -49,7 +49,8 @@ enum EpdDrawError {EPD_DRAW_SUCCESS,EPD_DRAW_ERROR};
 #define APP_PAGE_REFRESH_MODE MODE_GL16
 #define SHELF_BOOK_LIFT_PX 16
 #define portMAX_DELAY 0
-static const int E0470_WAVEFORM=0,E0470_FULL_WAVEFORM=1,E0470_FOLLOW_WAVEFORM=2,E0470_TEXTTURN_WAVEFORM=3;
+static const int E0470_WAVEFORM=0,E0470_FULL_WAVEFORM=1,E0470_FOLLOW_WAVEFORM=2,E0470_TEXTTURN_WAVEFORM=3,E0470_SOFT_TEXTTURN_WAVEFORM=4;
+static const int* display_reader_text_waveform(void){return &E0470_SOFT_TEXTTURN_WAVEFORM;}
 static const char *TAG="test";
 static int s_view,s_presented_view,s_reader_panel,s_pressed_control,s_reader_slider;
 static bool s_shelf_page_pending,s_shelf_feedback_pending,s_reader_cleanup,s_reader_image_refresh_pending,s_toolbar,s_clear_confirm;
@@ -68,11 +69,22 @@ static EpdRect pushed_area;
 static int trace_route[256], trace_mode[256], trace_wave[256];
 static EpdRect trace_area[256];
 static unsigned trace_count;
-enum {DIFF=1,AREA,FULL,WHOLE,FAST,WATER,READER,LOCAL_FULL};
+enum {DIFF=1,AREA,FULL,WHOLE,FAST,WATER,READER,LOCAL_FULL,READER_CLEANUP};
 static int test_style;static bool test_fast;
 static int app_settings_shelf_style(void){return test_style;}
 static bool app_settings_main_fast_refresh(void){return test_fast;}
 static int shelf_rows(void){return test_style==5?4:9;}
+static bool s_reader_clock_pending,s_cover_batch_present_pending;
+static int64_t s_reader_clock_minute,s_reader_clock_painted_minute;
+static unsigned s_cover_dirty_mask,s_cover_present_mask;
+static bool reader_status_visible(void){return false;}
+static EpdRect reader_status_area(void){return (EpdRect){24,18,156,44};}
+static int64_t ui_nav_clock_minute(void){return 100;}
+static void reader_status_paint(uint8_t *fb){(void)fb;}
+static bool shelf_cover_frame_ready(void){return true;}
+#define READER_PANEL_BACKGROUND_PREVIEW 98
+static const char *app_settings_book_background_path(void){return "";}
+static void ui_reader_background_prepare(const char *path){(void)path;}
 static unsigned test_list_draws,test_prepares;
 static EpdRect paint_list_cover_feedback(app_ctx_t *ctx,int row){(void)ctx;++test_list_draws;return (EpdRect){71,228+row*197,120,164};}
 static EpdRect row_rect(int row){return (EpdRect){42+(row%3)*210,220+(row/3)*272,176,240};}
@@ -112,7 +124,6 @@ static int test_tick_us=12000,test_tick_sets;
 static int e0470_page_turn_tick_us(void){return test_tick_us;}
 static void e0470_page_turn_set_tick_us(int us){test_tick_us=us;++test_tick_sets;}
 static int book_layout_page_image_count(unsigned page){return !test_hide_images&&test_types[s_chapter][page]?1:0;}
-static int book_layout_page_image(unsigned page){return !test_hide_images&&test_types[s_chapter][page]==2?0:-1;}
 static unsigned book_layout_page_count(void){return 2;}
 static unsigned book_chapter_count(void){return 2;}
 static bool app_settings_reader_hide_images(void){return test_hide_images;}
@@ -135,6 +146,7 @@ static enum EpdDrawError update_display_area_diff_with(void *hl,const int *wave,
 static enum EpdDrawError update_display_area_with(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){(void)hl;trace_wave[trace_count]=*wave;return record(AREA,mode,area);}
 static enum EpdDrawError update_display_area_full_with(void *hl,const int *wave,enum EpdDrawMode mode,EpdRect area){(void)hl;trace_wave[trace_count]=*wave;return record(LOCAL_FULL,mode,area);}
 static enum EpdDrawError update_display_with(void *hl,const int *wave,enum EpdDrawMode mode){(void)hl;(void)wave;return record(WHOLE,mode,(EpdRect){0});}
+static enum EpdDrawError update_display_reader_cleanup(void *hl,const int *wave){(void)hl;trace_wave[trace_count]=*wave;return record(READER_CLEANUP,MODE_GL16,(EpdRect){0});}
 static enum EpdDrawError update_display_full(void *hl){(void)hl;return record(FULL,MODE_GC16,(EpdRect){0});}
 static enum EpdDrawError update_display_fast_page(void *hl){(void)hl;return record(FAST,MODE_GL16,(EpdRect){0});}
 static enum EpdDrawError update_display_mode_diff(void *hl,enum EpdDrawMode mode){(void)hl;return record(READER,mode,(EpdRect){0});}
@@ -194,14 +206,14 @@ int main(void){
  s_view=s_presented_view=READING;s_text="text";s_reader_panel=READER_PANEL_NONE;
  s_area=reader_area();s_mode=MODE_GL16;s_reader_turn_pending=s_reader_footer_pending=true;
  trace_count=0;assert(present(&ctx,APP_REDRAW_AREA));
- assert(trace_count==2&&trace_route[0]==DIFF&&trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_TEXTTURN_WAVEFORM);
+ assert(trace_count==2&&trace_route[0]==DIFF&&trace_mode[0]==MODE_GL16&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
  assert(trace_area[0].y==reader_area().y&&trace_area[0].height==reader_area().height);
  assert(trace_route[1]==AREA&&trace_mode[1]==MODE_DU&&trace_wave[1]==E0470_FOLLOW_WAVEFORM);
  assert(trace_area[1].y==progress_rect().y&&!s_reader_turn_pending);
  for(int full=0;full<2;++full){
    s_reader_fullscreen=full;s_reader_turn_pending=true;s_reader_cleanup=true;
    s_reader_footer_pending=!full;trace_count=0;
-   assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==1&&route==FULL&&pushed_mode==MODE_GC16);
+   assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==1&&route==READER_CLEANUP&&pushed_mode==MODE_GL16&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
    s_reader_turn_pending=true;trace_count=0;
    assert(present(&ctx,APP_REDRAW_FULL)&&trace_count==1&&route==FULL);
  }
@@ -215,7 +227,7 @@ int main(void){
  s_reader_panel=99;trace_count=0;
  assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==1&&route==AREA&&pushed_mode==MODE_GL16&&trace_wave[0]==E0470_WAVEFORM);
  s_reader_panel=READER_PANEL_NONE;s_reader_fullscreen=true;s_reader_turn_pending=true;trace_count=0;
- assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==DIFF&&trace_route[1]==DIFF&&trace_wave[0]==E0470_TEXTTURN_WAVEFORM&&trace_wave[1]==E0470_WAVEFORM);
+ assert(present(&ctx,APP_REDRAW_AREA)&&trace_count==2&&trace_route[0]==DIFF&&trace_route[1]==DIFF&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM&&trace_wave[1]==E0470_WAVEFORM);
  // 快水波仅接管实际动画输出；成功、失败及全屏都恢复主页节拍，优先级分支不改节拍。
  // Fast ripple scopes pacing to actual animation output; success, failure and full screen restore main pacing, while priority branches never change it.
  for(int full=0;full<2;++full)for(int error=0;error<2;++error){
@@ -261,11 +273,11 @@ int main(void){
    app_redraw_t redraw=turn_page(&ctx,1);
    bool eligible=hidden||(from==0&&to==0);
    assert(s_reader_fullscreen && s_reader_panel==READER_PANEL_NONE);
-   if (!full) {assert(redraw==APP_REDRAW_PAGE&&!s_reader_turn_pending);trace_count=0;present(&ctx,redraw);assert(trace_route[0]==(to==2&&!hidden?WHOLE:READER));continue;}
+   if (!full) {assert(redraw==APP_REDRAW_PAGE&&!s_reader_turn_pending);trace_count=0;present(&ctx,redraw);assert(trace_route[0]==(to&&!hidden?WHOLE:READER));continue;}
    assert(redraw==APP_REDRAW_AREA&&s_reader_turn_pending==eligible);
    trace_count=0;present(&ctx,redraw);
-   if(eligible)assert(trace_route[0]==DIFF&&trace_wave[0]==E0470_TEXTTURN_WAVEFORM);
-   else if(to==2)assert(trace_mode[0]==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
+   if(eligible)assert(trace_route[0]==DIFF&&trace_wave[0]==E0470_SOFT_TEXTTURN_WAVEFORM);
+   else if(to)assert(trace_mode[0]==MODE_GC16&&trace_wave[0]==E0470_FULL_WAVEFORM);
    else assert(trace_wave[0]==E0470_WAVEFORM&&trace_route[0]==(full?DIFF:AREA));
    assert(!s_reader_turn_pending&&s_reader_text_frame==(hidden||to==0));
  }
@@ -278,7 +290,7 @@ int main(void){
    app_redraw_t redraw=turn_page(&ctx,dir);
    assert(s_chapter==(unsigned)new&&s_reader_turn_pending==(from==0&&to==0));
    trace_count=0;present(&ctx,redraw);
-   assert(trace_wave[0]!=(int)E0470_TEXTTURN_WAVEFORM||(from==0&&to==0));
+   assert((trace_wave[0]!=E0470_TEXTTURN_WAVEFORM&&trace_wave[0]!=E0470_SOFT_TEXTTURN_WAVEFORM)||(from==0&&to==0));
  }
  // 失败推屏、面板及离开阅读会失效旧基准；下一次正常绘制后恢复。
  // Failed presents, panels and leaving reading invalidate history; a successful body restores it.
@@ -299,7 +311,7 @@ int main(void){
    s_page=0;trace_count=0;present(&ctx,paint_reading(&ctx,MODE_GL16));
    test_full_pages=policy?1:0;test_effect=policy?0:1;s_turns=0;
    app_redraw_t redraw=turn_page(&ctx,1);trace_count=0;present(&ctx,redraw);
-   assert(trace_route[0]==(policy?FULL:WATER));
+   assert(trace_route[0]==(policy?READER_CLEANUP:WATER));
  }
  test_full_pages=0;test_effect=0;s_page=0;test_types[0][0]=1;test_image.gray=NULL;
  trace_count=0;present(&ctx,paint_reading(&ctx,MODE_GL16));assert(!s_reader_text_frame);
@@ -331,6 +343,10 @@ typedef struct {bool network_ready;int mode;} read_pico_transfer_status_t;
 static pmu_snapshot_t pmu;
 static int pct;
 static bool wifi,bluetooth,s_system_ttf;
+#define TTF_FONT_PATH_MAX 160
+static bool chosen_system,reading_context;
+static const char *app_settings_system_font_path(void){return chosen_system?"system.ttf":"";}
+static const char *ttf_font_path(void){return reading_context?"reader.ttf":chosen_system?"system.ttf":"builtin";}
 static bool ttf_font_is_builtin(void){return false;}
 static char signature[96];
 static const pmu_snapshot_t *read_pico_pmu_get(void){return &pmu;}
@@ -365,14 +381,18 @@ status += defines + "\n"
 for path, name in (("main/ui/ui_kit.c", "ui_text_fixed_context_width_px"),
                    ("main/ui/ui_kit.c", "ui_text_fixed_width_px"),
                    ("main/ui/ui_kit.c", "ui_text_fixed_context_vc"),
-                   ("main/ui/ui_kit.c", "ui_text_fixed_vc"), ("main/ui/ui_nav.c", "ui_nav_status")):
+                   ("main/ui/ui_kit.c", "ui_text_fixed_vc")):
     status += function(path, name) + "\n"
+status += nav[nav.index('static bool s_status_reading;'):nav.index('static const char *const labels[]')]
+for name in ('status_time','clock_text','ui_nav_status'):
+    status += function('main/ui/ui_nav.c',name) + '\n'
 status += r'''
 int main(void){
  uint8_t fb=0;const int percentages[]={0,9,78,100,-1};
  for(int font=0;font<2;++font)for(int mask=0;mask<4;++mask)for(unsigned p=0;p<5;++p){
-   s_system_ttf=font;wifi=mask&1;bluetooth=mask&2;pct=percentages[p];text_count=0;network_left=1000;
+   reading_context=false;chosen_system=s_system_ttf=font;wifi=mask&1;bluetooth=mask&2;pct=percentages[p];text_count=0;network_left=1000;
    snprintf(signature,sizeof(signature),"时间统一 · 正在阅读我的收藏书籍，保持热爱 ABCabc");
+   ui_nav_status_font_context(false,true);
    ui_nav_status(&fb);assert(text_count==3&&texts[0].px==28&&texts[1].px==26&&texts[2].px==28);
    for(int i=0;i<3;++i)assert(texts[i].center>=39&&texts[i].center<=41);
    assert(texts[0].right+12<=texts[1].left);
@@ -380,7 +400,15 @@ int main(void){
    assert(texts[2].right==595&&texts[1].align==EPD_DRAW_ALIGN_CENTER);
    assert(texts[1].left+texts[1].right>=683&&texts[1].left+texts[1].right<=685);
    size_t length=strlen(texts[1].text);assert(length&&((unsigned char)texts[1].text[length-1]&0xc0)!=0xc0);
+   char system_prefix[96];snprintf(system_prefix,sizeof(system_prefix),"%s",texts[1].text);
+   int system_network_left=network_left;
+   // 阅读字体变化不重算系统签名宽度；不同字体仍显示同一UTF8前缀并保持图标间距。
+   // Reader face changes do not recompute system signature widths: retain the same UTF8 prefix and icon spacing.
+   reading_context=true;s_system_ttf=false;ui_nav_status_font_context(true,true);text_count=0;network_left=1000;
+   ui_nav_status(&fb);assert(text_count==3&&!strcmp(texts[1].text,system_prefix)&&network_left==system_network_left);
+   assert(texts[0].right+12<=texts[1].left&&texts[1].right+12<=(mask?network_left:texts[2].left));
  }
+ reading_context=false;ui_nav_status_font_context(false,false);
  signature[0]=0;text_count=0;ui_nav_status(&fb);assert(text_count==2);
  puts("PASS: larger status text shares the icon centerline with builtin/custom metrics; simultaneous radios, 100% and long UTF-8 signatures do not overlap");
 }
@@ -420,15 +448,23 @@ static void epd_fill_rect(EpdRect area,int gray,uint8_t *fb){
 static void ui_hairline(uint8_t *fb,int y,int x,int width,int gray){(void)fb;(void)x;(void)width;(void)gray;assert(y==UI_NAV_TOP);}
 static void ui_text(uint8_t *fb,int x,int y,int px,const char *label,int align,bool wrap){(void)fb;(void)x;(void)label;(void)align;(void)wrap;assert(y==UI_NAV_TOP+74&&px==17);++texts;}
 '''
+navigation += 'static void ui_fill_rect_fast(EpdRect r,uint8_t gray,uint8_t *fb){epd_fill_rect(r,gray,fb);}'
 for path, name in (("main/ui/ui_kit.c", "icon_nibble"), ("main/ui/ui_kit.c", "ui_draw_icon"),
-                   ("main/ui/ui_nav.c", "icon"), ("main/ui/ui_nav.c", "ui_nav_draw")):
+                   ("main/ui/ui_nav.c", "icon"), ("main/ui/ui_nav.c", "ui_nav_draw"), ("main/ui/ui_nav.c", "ui_nav_hit")):
     navigation += function(path, name) + "\n"
 navigation += r'''
 int main(void){
  uint8_t fb=0;
+ for(int x=0;x<684;++x){
+   assert(ui_nav_hit(x,UI_NAV_TOUCH_TOP-1)==-1);
+   for(int y=UI_NAV_TOUCH_TOP;y<1216;++y)assert(ui_nav_hit(x,y)==x/171);
+   assert(ui_nav_hit(x,1216)==-1);
+ }
+ assert(ui_nav_hit(684,1141)==-1&&ui_nav_hit(UINT16_MAX,1141)==-1);
+ assert(UI_NAV_TOUCH_TOP==1080&&UI_NAV_TOP==1096&&UI_NAV_REFRESH_END==1088);
  for(main_choice=0;main_choice<3;++main_choice)for(int active=0;active<4;++active){
    first_ink=2000;markers=tracks=texts=guards=0;ui_nav_draw(&fb,active);
-   assert(markers==1&&texts==4&&tracks==(main_choice!=0)&&guards==(main_choice!=0));
+   assert(markers==1&&texts==4&&tracks==(main_choice!=0)&&guards==1);
    // 验证真实图标掩模的第一笔，单次刷新32列对齐后不能触碰图标。
    // Check actual mask ink: the 32-column-expanded single update must not reach an icon.
    assert(first_ink>=UI_NAV_MARKER_SCAN_END);

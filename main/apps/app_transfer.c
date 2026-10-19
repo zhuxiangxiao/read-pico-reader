@@ -99,32 +99,6 @@ static bool transfer_book_file(const char *path) {
     return ext && (!strcasecmp(ext, ".epub") || !strcasecmp(ext, ".txt"));
 }
 
-static bool transfer_path_below(const char *path, const char *directory) {
-    size_t n = strlen(directory);
-    return !strncmp(path, directory, n) && (!path[n] || path[n] == '/');
-}
-
-static void transfer_directory_deleted(const char *path) {
-    if (transfer_path_below(app_settings_books_dir(), path))
-        (void)app_settings_set_books_dir("/sdcard/books");
-    if (transfer_path_below(app_settings_fonts_dir(), path))
-        (void)app_settings_set_fonts_dir("/sdcard/fonts");
-}
-
-static void transfer_directory_moved(const char *old_path, const char *new_path) {
-    const char *selected[2] = {app_settings_books_dir(), app_settings_fonts_dir()};
-    for (int i = 0; i < 2; ++i) {
-        if (!transfer_path_below(selected[i], old_path)) continue;
-        char updated[288];
-        if (snprintf(updated, sizeof(updated), "%s%s", new_path, selected[i] + strlen(old_path)) >= (int)sizeof(updated)) continue;
-        bool saved = i == 0 ? app_settings_set_books_dir(updated) : app_settings_set_fonts_dir(updated);
-        if (!saved) {
-            if (i == 0) (void)app_settings_set_books_dir("/sdcard/books");
-            else (void)app_settings_set_fonts_dir("/sdcard/fonts");
-        }
-    }
-}
-
 static void transfer_file_deleted(const char *path) {
     if (transfer_book_file(path)) {
         (void)book_progress_forget(path);
@@ -241,7 +215,7 @@ static EpdRect method_control_rect(int id) {
 // S05 keeps method selection separate from the service details shown on the next page.
 static void draw_methods(uint8_t *fb) {
     ui_clear_page(fb);
-    epd_fill_rect((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
+    ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
     transfer_header(fb, "Wifi/热点传书", NULL);
     ui_text(fb, 42, 180, 21, "选择方式", EPD_DRAW_ALIGN_LEFT, false);
     EpdRect card = {36, 224, 612, 224};
@@ -256,7 +230,7 @@ static void draw_methods(uint8_t *fb) {
     for (int i = 0; i < 2; ++i) {
         EpdRect row = method_control_rect(i);
         if (s_pressed == i) ui_draw_pressed_round_rect(fb, row, 0);
-        if (i) epd_fill_rect((EpdRect){68, row.y, 548, 2}, 0x80, fb);
+        if (i) ui_fill_rect_fast((EpdRect){68, row.y, 548, 2}, 0x80, fb);
         int cy = row.y + row.height / 2;
         if (i == 0) ui_nav_wifi_icon(fb, 72, cy, 30, 0x6a);
         else if (i == 1) ui_draw_icon(fb, 72, cy, 48, UI_ICON_RADIO_TOWER, 0x6a);
@@ -330,7 +304,7 @@ static void network_button(uint8_t *fb, int id, const char *label, bool dark) {
 
 static void draw_networks(uint8_t* fb) {
     ui_clear_page(fb);
-    epd_fill_rect((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
+    ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_NAV_TOP}, 0xe0, fb);
     if (s_forget_confirm) {
         transfer_header(fb, "遗忘网络", "仅清除 WiFi 连接信息，不影响图书");
         char name[33];
@@ -388,7 +362,7 @@ static void draw_networks(uint8_t* fb) {
         const read_pico_transfer_network_t* network = &s_networks[index];
         EpdRect rect = network_control_rect(row);
         if (s_pressed == row) ui_draw_pressed_round_rect(fb, rect, 0);
-        if (row) epd_fill_rect((EpdRect){64, rect.y, 556, 2}, 0x70, fb);
+        if (row) ui_fill_rect_fast((EpdRect){64, rect.y, 556, 2}, 0x70, fb);
         char name[33], detail[64];
         snprintf(name, sizeof(name), "%s", network->ssid);
         fit_label(name, 28, 520);
@@ -550,9 +524,16 @@ static app_redraw_t provisioning_action(int id) {
     if (s_forget_confirm) {
         if (id == 12) { s_forget_confirm = false; s_network_message[0] = 0; }
         else if (id == 11) {
-            if (s_session_started) stop_session();
+            // 断联后页面标记可能已丢失；以组件的真实会话为准，上传中不能清配置。
+            // A failed reconnect may lose the page flag; stop the actual component session, never an active upload.
+            if (!stop_upload_if_idle()) {
+                snprintf(s_network_message, sizeof(s_network_message), "正在传输，请完成后再遗忘");
+                return APP_REDRAW_PAGE;
+            }
+            s_network_connect_pending = s_scan_pending = false;
             esp_err_t err = read_pico_transfer_forget_wifi();
             if (err == ESP_OK) {
+                read_pico_transfer_get_status(&s_status);
                 s_forget_confirm = false;
                 s_saved_configured = false;
                 s_saved_ssid[0] = 0;
@@ -589,7 +570,16 @@ static app_redraw_t provisioning_action(int id) {
                 }
                 s_network_connect_pending = false;
                 snprintf(s_network_message, sizeof(s_network_message), "已断开，连接信息保留");
-            } else queue_network_start(READ_PICO_TRANSFER_MODE_STA);
+            } else {
+                // 未连上不等于驱动已停止；重试前先释放仍在等待或超时的旧 STA。
+                // Disconnected does not mean stopped; release the pending or timed-out STA before retrying.
+                if (!stop_upload_if_idle()) {
+                    snprintf(s_network_message, sizeof(s_network_message), "正在传输，请完成后再连接");
+                    return APP_REDRAW_PAGE;
+                }
+                s_network_connect_pending = false;
+                queue_network_start(READ_PICO_TRANSFER_MODE_STA);
+            }
         }
         else if (id == 7 && s_network_page) --s_network_page;
         else if (id == 8) {
@@ -1213,8 +1203,6 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
                 .file_limit = book_store_file_limit(&s_root), .free_bytes_cb = free_bytes, .free_bytes_ctx = &s_root,
                 .file_changed_cb = book_progress_forget, .file_deleted_cb = transfer_file_deleted,
                 .file_moved_cb = transfer_file_moved,
-                .directory_deleted_cb = transfer_directory_deleted,
-                .directory_moved_cb = transfer_directory_moved,
                 .wallpaper_set_cb = transfer_set_wallpaper,
                 .signature_get_cb = transfer_signature_get, .signature_set_cb = transfer_signature_set,
                 .title_get_cb = NULL, .title_set_cb = NULL};

@@ -4,7 +4,16 @@
  */
 (() => {
   const screens = {
-    home: {label: "首页", caption: "继续阅读、阅读记录和常用操作，打开就能找到。", asset: "home"},
+    home: {label: "首页", styles: [
+      {label: "最近阅读书夹", asset: "home-rc95-folder", caption: "rc97 首页：阅读时长、目标圆环与资料卡头像，续读卡片搭配最近三本书和月阅读记录。"},
+      {label: "经典时钟", asset: "home-rc95-clock", caption: "经典时钟与月阅读记录并排，续读卡片保留书摘、作者和阅读进度。"},
+      {label: "圆形月相", asset: "home-rc95-moon", caption: "圆形月相刻度时钟，搭配右侧月历；首页组件可在设备上切换。"},
+      {label: "亚克力圆钟", asset: "home-rc95-kehai", caption: "磨砂表盘、长短指针与圆点秒针，沿用正式版的亚克力圆钟样式。"},
+      {label: "Cat Clock", asset: "home-rc95-cat", caption: "猫咪时钟搭配月阅读记录；这是静态预览，猫眼动效请以实机为准。"},
+      {label: "Dali Clock", asset: "home-rc95-dali", caption: "融化轮廓与罗马数字表盘，完整保留正式版首页的排版比例。"},
+      {label: "放射时钟", asset: "home-rc95-asterisk", caption: "深灰放射形表盘搭配清晰指针，与月阅读记录并排显示。"},
+      {label: "小屋时钟", asset: "home-rc95-house", caption: "小屋轮廓与布谷鸟时钟，让首页多一点趣味。"}
+    ]},
     shelf: {label: "书架", styles: [
       {label: "亚克力书架", asset: "shelf-acrylic", caption: "真实封面搭配亚克力书架，收藏优先，用底部箭头翻页。"},
       {label: "深色书轨", asset: "shelf-dark", caption: "深色书轨托起封面，清楚呈现每一本书。"},
@@ -22,7 +31,7 @@
   const screen = document.getElementById("screen-image");
   const styleGroup = document.getElementById("screen-styles");
   const dialog = document.getElementById("screen-dialog");
-  const selectedStyle = {shelf: 0, lock: 0};
+  const selectedStyle = {home: 0, shelf: 0, lock: 0};
   if (screen) {
     function showPreview(item) {
       screen.src = `./assets/screens/${item.asset}.png`;
@@ -61,6 +70,7 @@
         if (next !== undefined) { event.preventDefault(); selectScreen(tabs[next]); tabs[next].focus(); }
       });
     }
+    selectScreen(tabs.find(tab => tab.getAttribute("aria-selected") === "true") || tabs[0]);
     document.getElementById("screen-open").addEventListener("click", () => {
       document.getElementById("dialog-image").src = screen.src;
       document.getElementById("dialog-image").alt = screen.alt;

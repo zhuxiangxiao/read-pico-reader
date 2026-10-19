@@ -21,14 +21,17 @@ static inline bool book_reader_center(EpdRect body, int x, int y) {
     return x >= body.x + body.width / 3 && x < body.x + 2 * body.width / 3 &&
            y >= body.y + body.height / 3 && y < body.y + 2 * body.height / 3;
 }
-static inline int book_reader_tap_direction(EpdRect body, int x, int y, bool vertical) {
+/// rtl 表示竖排从右到左：横向分区的「上一页」在右半边，左右翻转。
+/// rtl marks right-to-left vertical text: the previous-page half is the right one.
+static inline int book_reader_tap_direction(EpdRect body, int x, int y, bool vertical, bool rtl) {
     if (x < body.x || x >= body.x + body.width || y < body.y || y >= body.y + body.height) return 0;
-    return vertical ? (y < body.y + body.height / 3 ? -1 : 1)
-                    : (x < body.x + body.width / 2 ? -1 : 1);
+    if (vertical) return y < body.y + body.height / 3 ? -1 : 1;
+    bool previous_half = rtl ? x >= body.x + body.width / 2 : x < body.x + body.width / 2;
+    return previous_half ? -1 : 1;
 }
 static inline int book_reader_tap_feed(book_reader_tap_t *tap, EpdRect body,
-                                      int x, int y, bool vertical, int64_t now_ms) {
-    const int direction = book_reader_tap_direction(body, x, y, vertical);
+                                      int x, int y, bool vertical, bool rtl, int64_t now_ms) {
+    const int direction = book_reader_tap_direction(body, x, y, vertical, rtl);
     if (!direction) { tap->pending = false; return 0; }
     if (!book_reader_center(body, x, y)) { tap->pending = false; return direction; }
     const int dx = x - tap->x, dy = y - tap->y;

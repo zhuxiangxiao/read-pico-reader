@@ -19,8 +19,23 @@ unit = r'''
 typedef struct {char path[288];bool reading;} app_lock_font_t;
 typedef struct {char path[288];} ttf_font_item_t;
 static bool s_reading,system_face,system_scale,recovery;
+static char s_rejected[TTF_FONT_PATH_MAX],corrupt[288];
+static time_t s_rejected_mtime;
+static off_t s_rejected_size;
+static int stroke,reading_weight=2;
+static int app_settings_book_weight_fine(void){return reading_weight;}
+static void ttf_set_stroke_adjust_fine(int level){stroke=level;}
+static void ttf_set_stroke_adjust(int level){stroke=level*16;}
+static bool reading_aa=false,aa=true;
+static bool app_settings_book_antialias(void){return reading_aa;}
+static void ttf_set_antialias(bool enabled){aa=enabled;}
 static char chosen[288]="/fonts/system.ttf",reader[288]="/fonts/reader.ttf",active[288]="builtin",missing[288];
 static unsigned opens;
+static int mock_stat(const char *path,struct stat *st){
+ if(!*path || !strncmp(path,"/absent/",8) || !strcmp(path,missing))return -1;
+ memset(st,0,sizeof(*st));st->st_mode=S_IFREG;st->st_size=100;st->st_mtime=1;return 0;
+}
+#define stat(path,st) mock_stat(path,st)
 static bool pico_boot_recovery(void){return recovery;}
 static const char *app_settings_system_font_path(void){return chosen;}
 static const char *app_settings_font_path(void){return reader;}
@@ -32,12 +47,13 @@ static bool ttf_font_path_is_builtin(const char *path){return !*path||!strcmp(pa
 static int ttf_font_count(void){return 0;}
 static void ttf_font_scan(void){}
 static const ttf_font_item_t *ttf_font_item(int index){(void)index;return NULL;}
-static int ttf_font_open(const char *path){++opens;if(!strcmp(path,missing))return -1;snprintf(active,sizeof(active),"%s",path);return ESP_OK;}
+static int ttf_font_open(const char *path){++opens;if(!strcmp(path,missing)||!strcmp(path,corrupt)){active[0]=0;return -1;}snprintf(active,sizeof(active),"%s",path);return ESP_OK;}
 static int ttf_font_open_builtin(void){return ttf_font_open("builtin");}
 static void ui_text_set_system_font(bool on){system_face=on;}
 static void ui_text_set_system_scale(bool on){system_scale=on;}
+static void ui_nav_status_font_context(bool reading,bool changed){(void)changed;assert(reading==s_reading);}
 '''
-for name in ('system_path', 'activate', 'app_font_activate_system', 'app_font_activate_reading',
+for name in ('font_file', 'system_path', 'activate', 'app_font_activate_system', 'app_font_activate_reading',
              'app_font_retry_active', 'app_font_begin_lock', 'app_font_end_lock'):
     unit += function(name, FONT) + '\n'
 unit += r'''
@@ -45,17 +61,17 @@ int main(void){
  app_lock_font_t saved;
  // 缺失字体可重复尝试，但不会重载内建或报告变化。/ Retry missing fonts without reloading built-in or reporting changes.
  strcpy(missing,chosen);unsigned first=opens;
- assert(!app_font_activate_system()&&ttf_font_is_builtin()&&opens==first+1);
- assert(!app_font_retry_active()&&ttf_font_is_builtin()&&opens==first+2);
+ assert(!app_font_activate_system()&&ttf_font_is_builtin()&&opens==first);
+ assert(!app_font_retry_active()&&ttf_font_is_builtin()&&opens==first);
  missing[0]=0;assert(app_font_retry_active()&&!strcmp(active,chosen));
  assert(!app_font_retry_active());
 
- app_font_activate_reading();assert(s_reading&&!system_face&&!system_scale&&!strcmp(active,reader));
- app_font_begin_lock(&saved);assert(!s_reading&&system_face&&system_scale&&!strcmp(active,chosen));
+ app_font_activate_reading();assert(s_reading&&!system_face&&!system_scale&&!strcmp(active,reader)&&stroke==reading_weight&&!aa);
+ app_font_begin_lock(&saved);assert(!s_reading&&system_face&&system_scale&&!strcmp(active,chosen)&&stroke==0&&aa);
  assert(saved.reading&&!strcmp(saved.path,reader));
- app_font_end_lock(&saved);assert(s_reading&&!system_face&&!system_scale&&!strcmp(active,reader));
+ app_font_end_lock(&saved);assert(s_reading&&!system_face&&!system_scale&&!strcmp(active,reader)&&stroke==reading_weight&&!aa);
  app_font_activate_system();unsigned before=opens;
- app_font_begin_lock(&saved);assert(!s_reading&&system_face&&system_scale&&!strcmp(active,chosen));
+ app_font_begin_lock(&saved);assert(!s_reading&&system_face&&system_scale&&!strcmp(active,chosen)&&stroke==0);
  app_font_end_lock(&saved);assert(!s_reading&&system_face&&system_scale&&!strcmp(active,chosen)&&opens==before);
  app_font_activate_reading();app_font_begin_lock(&saved);strcpy(missing,reader);
  app_font_end_lock(&saved);assert(s_reading&&!system_face&&!system_scale&&ttf_font_is_builtin());
@@ -64,6 +80,18 @@ int main(void){
  app_font_end_lock(&saved);assert(s_reading&&!system_face&&!system_scale);
  missing[0]=chosen[0]=0;app_font_begin_lock(&saved);assert(ttf_font_is_builtin()&&!system_face&&system_scale);
  app_font_end_lock(&saved);assert(s_reading&&!system_scale);
+ // Imported reading face disappears while already active: fallback once and remain stable.
+ strcpy(reader,"/fonts/reader.ttf");missing[0]=0;app_font_activate_reading();strcpy(missing,reader);
+ assert(app_font_retry_active()&&ttf_font_is_builtin());before=opens;
+ for(int i=0;i<100;++i)assert(!app_font_retry_active()&&opens==before);
+ missing[0]=0;assert(app_font_retry_active());strcpy(corrupt,reader);active[0]=0;
+ assert(app_font_retry_active()&&ttf_font_is_builtin());before=opens;
+ for(int i=0;i<100;++i)assert(!app_font_retry_active()&&opens==before);
+ corrupt[0]=0;s_rejected[0]=0;assert(app_font_retry_active());
+ strcpy(chosen,"/fonts/system.ttf");app_font_activate_system();strcpy(missing,chosen);
+ assert(app_font_retry_active()&&ttf_font_is_builtin());before=opens;
+ for(int i=0;i<100;++i)assert(!app_font_retry_active()&&opens==before);
+ missing[0]=0;
  strcpy(chosen,"/fonts/system.ttf");recovery=true;
  app_font_begin_lock(&saved);assert(ttf_font_is_builtin()&&!system_face);app_font_end_lock(&saved);
  app_font_begin_lock(NULL);app_font_end_lock(NULL);

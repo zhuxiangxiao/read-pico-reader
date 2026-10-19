@@ -64,3 +64,7 @@ CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=8192
 CONFIG_TINYUSB_DESC_PRODUCT_STRING="Read Pico SD"
 CONFIG_TINYUSB_DESC_MANUFACTURER_STRING="MindReset"
+
+# 对时服务数量与产品配置一致，允许三个备用服务器。
+# Match product SNTP capacity for the three configured time servers.
+CONFIG_LWIP_SNTP_MAX_SERVERS=3

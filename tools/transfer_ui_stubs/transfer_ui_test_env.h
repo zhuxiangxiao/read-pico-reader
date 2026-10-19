@@ -116,10 +116,11 @@ static size_t test_scan_count = 8;
 static char test_saved_ssid[33];
 static inline bool read_pico_transfer_try_stop_if_idle(void) {return !test_busy;}
 static int test_stop_count;
-static inline void read_pico_transfer_stop(void) { ++test_stop_count; }
+static bool test_wifi_running;
+static inline void read_pico_transfer_stop(void) { ++test_stop_count; test_wifi_running=false; }
 static inline void read_pico_transfer_get_status(read_pico_transfer_status_t* s) {*s=test_status;}
 static inline int read_pico_transfer_get_saved_wifi(char* s,bool* c) {strcpy(s,test_configured?"saved":"");*c=test_configured;return 0;}
-static inline int read_pico_transfer_start(const read_pico_transfer_cfg_t* c) {if (!c->network_only && (!c->file_changed_cb || !c->wallpaper_set_cb || c->file_changed_cb("/flash/books/test.txt"))) return ESP_FAIL;return 0;}
+static inline int read_pico_transfer_start(const read_pico_transfer_cfg_t* c) {if (test_wifi_running) return ESP_FAIL;if (!c->network_only && (!c->file_changed_cb || !c->wallpaper_set_cb || c->file_changed_cb("/flash/books/test.txt"))) return ESP_FAIL;return 0;}
 static inline void read_pico_transfer_service_poll(void) {}
 static inline int read_pico_transfer_save_wifi(const char* s,const char* p) {(void)p;test_save_count++;snprintf(test_saved_ssid,33,"%s",s);return test_save_error;}
 static inline int read_pico_transfer_scan_wifi(read_pico_transfer_network_t* out,size_t* count) {*count=test_scan_error?0:test_scan_count;for(size_t i=0;i<*count;i++){out[i]=(read_pico_transfer_network_t){.supported=true,.requires_password=true};snprintf(out[i].ssid,33,"network%u",(unsigned)i);}if(*count)snprintf(out[0].ssid,33,"中文家庭网络");return test_scan_error;}
@@ -134,7 +135,7 @@ static inline bool ui_wifi_qr_prepare(const char* s,const char* p) {(void)p;++te
 static inline bool ui_wifi_qr_prepare_url(const char* s) {++test_qr_encodes;snprintf(test_qr_payload,sizeof(test_qr_payload),"%s",s);return !test_qr_failure;}
 static inline void ui_wifi_qr_draw(uint8_t* fb,EpdRect r) {(void)fb;(void)r;}
 
-static inline int read_pico_transfer_forget_wifi(void) { ++test_forget_count; if (!test_forget_error) test_configured=false; return test_forget_error; }
+static inline int read_pico_transfer_forget_wifi(void) { ++test_forget_count; if (test_wifi_running) return ESP_FAIL; if (!test_forget_error) test_configured=false; return test_forget_error; }
 
 static inline int book_progress_forget(const char* path) {(void)path;return ESP_OK;}
 typedef struct {uint32_t file_size;} book_progress_t;

@@ -472,6 +472,50 @@ static bool s_wifi, s_started, s_loop_owned;
 static char *s_buffer;
 static bool s_stopping, s_upload_active;
 static bool s_config_busy;
+// 对时独占 SNTP 与临时 WiFi；取消后等待清理完成，才允许拆网络或睡眠。
+// Time sync owns SNTP/temporary WiFi; wait for cleanup before network teardown or sleep.
+static bool s_time_active, s_time_automatic, s_time_cancel;
+static uint32_t s_time_pending_utc;
+static bool cancel_time_sync(bool automatic_only) {
+    portENTER_CRITICAL(&s_lock);
+    bool active = s_time_active;
+    bool cancellable = !active || !automatic_only || s_time_automatic;
+    if (active && cancellable) s_time_cancel = true;
+    portEXIT_CRITICAL(&s_lock);
+    if (!cancellable) return false;
+    const int64_t deadline = esp_timer_get_time() + 2000000;
+    while (active) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        portENTER_CRITICAL(&s_lock); active = s_time_active; portEXIT_CRITICAL(&s_lock);
+        if (active && esp_timer_get_time() >= deadline) return false;
+    }
+    return true;
+}
+static bool time_sync_cancelled(void) {
+    portENTER_CRITICAL(&s_lock); bool cancelled = s_time_cancel; portEXIT_CRITICAL(&s_lock);
+    return cancelled;
+}
+static esp_err_t sync_time_online_impl(uint32_t *utc_seconds);
+static esp_err_t time_sync_ntp(uint32_t *utc_seconds) {
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(3,
+        ESP_SNTP_SERVER_LIST("ntp.aliyun.com", "time.cloudflare.com", "pool.ntp.org"));
+    if (time_sync_cancelled()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err != ESP_OK) return err;
+    const int64_t deadline = esp_timer_get_time() + 12000000;
+    do {
+        if (time_sync_cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
+        err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(100));
+    } while (err == ESP_ERR_TIMEOUT && esp_timer_get_time() < deadline);
+    if (err == ESP_OK && time_sync_cancelled()) err = ESP_ERR_INVALID_STATE;
+    if (err == ESP_OK) {
+        time_t now = time(NULL);
+        if (now >= 1704067200 && now <= 4102444799U) *utc_seconds = (uint32_t)now;
+        else err = ESP_ERR_INVALID_RESPONSE;
+    }
+    esp_netif_sntp_deinit();
+    return err;
+}
 static EventGroupHandle_t s_time_events;
 #define TIME_GOT_IP BIT0
 #define TIME_DISCONNECTED BIT1
@@ -583,6 +627,7 @@ esp_err_t read_pico_transfer_import_wifi_backup(const read_pico_transfer_wifi_ba
 }
 
 esp_err_t read_pico_transfer_save_wifi(const char *ssid, const char *password) {
+    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
     if (s_wifi || s_http || s_netif || status.state != READ_PICO_TRANSFER_STOPPED) return ESP_ERR_INVALID_STATE;
@@ -597,7 +642,7 @@ esp_err_t read_pico_transfer_save_wifi(const char *ssid, const char *password) {
     clear_secret(&next, sizeof(next)); release_config(); return err;
 }
 
-esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
+static esp_err_t sync_time_impl(uint32_t *utc_seconds) {
     if (!utc_seconds) return ESP_ERR_INVALID_ARG;
     *utc_seconds = 0;
     read_pico_transfer_status_t status;
@@ -605,18 +650,17 @@ esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
     transfer_time_route_t route = time_route(s_wifi,
         status.mode == READ_PICO_TRANSFER_MODE_STA, status.network_ready,
         !s_http && !s_netif && status.state == READ_PICO_TRANSFER_STOPPED);
-    if (route == TRANSFER_TIME_ONLINE) return read_pico_transfer_sync_time_online(utc_seconds);
+    if (route == TRANSFER_TIME_ONLINE) return sync_time_online_impl(utc_seconds);
     if (route != TRANSFER_TIME_TEMPORARY) return ESP_ERR_INVALID_STATE;
-    if (!claim_config()) return ESP_ERR_INVALID_STATE;
     transfer_credentials_t saved = {0};
     esp_err_t err = load_credentials(&saved);
     if (err != ESP_OK || saved.version != 1) {
-        clear_secret(&saved, sizeof(saved)); release_config();
+        clear_secret(&saved, sizeof(saved));
         return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
     }
     err = ble_pt_network_acquire();
-    if (err != ESP_OK) { clear_secret(&saved, sizeof(saved)); release_config(); return err; }
-    bool loop_owned = false, wifi_initialized = false, wifi_started = false, sntp_started = false;
+    if (err != ESP_OK) { clear_secret(&saved, sizeof(saved)); return err; }
+    bool loop_owned = false, wifi_initialized = false, wifi_started = false;
     esp_netif_t *netif = NULL;
     esp_event_handler_instance_t wifi_handler = NULL, ip_handler = NULL;
     wifi_config_t wifi = {0};
@@ -629,7 +673,7 @@ esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
     wifi.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
     clear_secret(&saved, sizeof(saved));
     s_time_events = xEventGroupCreate();
-    if (!s_time_events) { clear_secret(&wifi, sizeof(wifi)); ble_pt_network_release(); release_config(); return ESP_ERR_NO_MEM; }
+    if (!s_time_events) { clear_secret(&wifi, sizeof(wifi)); ble_pt_network_release(); return ESP_ERR_NO_MEM; }
     err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) goto time_cleanup;
     err = esp_event_loop_create_default();
@@ -653,19 +697,15 @@ esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
     err = esp_wifi_start(); if (err != ESP_OK) goto time_cleanup;
     wifi_started = true;
     err = esp_wifi_connect(); if (err != ESP_OK) goto time_cleanup;
-    EventBits_t bits = xEventGroupWaitBits(s_time_events, TIME_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
-    if (!(bits & TIME_GOT_IP)) { err = ESP_ERR_TIMEOUT; goto time_cleanup; }
-    esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    err = esp_netif_sntp_init(&sntp); if (err != ESP_OK) goto time_cleanup;
-    sntp_started = true;
-    err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(12000));
-    if (err == ESP_OK) {
-        time_t now = time(NULL);
-        if (now >= 1704067200 && now <= UINT32_MAX) *utc_seconds = (uint32_t)now;
-        else err = ESP_ERR_INVALID_RESPONSE;
+    const int64_t ip_deadline = esp_timer_get_time() + 15000000;
+    EventBits_t bits = 0;
+    while (!(bits & TIME_GOT_IP) && esp_timer_get_time() < ip_deadline) {
+        if (time_sync_cancelled()) { err = ESP_ERR_INVALID_STATE; goto time_cleanup; }
+        bits = xEventGroupWaitBits(s_time_events, TIME_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(100));
     }
+    if (!(bits & TIME_GOT_IP)) { err = ESP_ERR_TIMEOUT; goto time_cleanup; }
+    err = time_sync_ntp(utc_seconds);
 time_cleanup:
-    if (sntp_started) esp_netif_sntp_deinit();
     if (wifi_started) esp_wifi_stop();
     if (ip_handler) esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_handler);
     if (wifi_handler) esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_handler);
@@ -675,31 +715,64 @@ time_cleanup:
     vEventGroupDelete(s_time_events); s_time_events = NULL;
     clear_secret(&wifi, sizeof(wifi));
     ble_pt_network_release();
-    release_config();
+
     return err;
 }
 
-esp_err_t read_pico_transfer_sync_time_online(uint32_t *utc_seconds) {
-    if (!utc_seconds) return ESP_ERR_INVALID_ARG;
-    *utc_seconds = 0;
+static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
-    if (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready)
-        return ESP_ERR_INVALID_STATE;
-    esp_sntp_config_t sntp = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    esp_err_t err = esp_netif_sntp_init(&sntp);
-    if (err != ESP_OK) return err;
-    err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(12000));
-    if (err == ESP_OK) {
-        time_t now = time(NULL);
-        if (now >= 1704067200 && now <= UINT32_MAX) *utc_seconds = (uint32_t)now;
-        else err = ESP_ERR_INVALID_RESPONSE;
+    if (!s_wifi || status.mode != READ_PICO_TRANSFER_MODE_STA || !status.network_ready ||
+        status.state == READ_PICO_TRANSFER_UPLOADING) return ESP_ERR_INVALID_STATE;
+    return time_sync_ntp(utc_seconds);
+}
+
+static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+    if (!utc_seconds) return ESP_ERR_INVALID_ARG;
+    *utc_seconds = 0;
+    // 手动操作优先于自动任务；配置和对时的准入在同一个锁下，防止双初始化。
+    // Manual actions preempt automatic work; one lock admits configuration and time ownership.
+    if (!automatic && !cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
+    portENTER_CRITICAL(&s_lock);
+    bool available = !s_config_busy && !s_time_active && !s_stopping;
+    // 停服的 s_stopping 是正常状态，已有资源则仍拒绝正在拆除的网络。
+    // A stopped service normally keeps s_stopping set; reject only a teardown with resources.
+    if (!s_config_busy && !s_time_active && s_status.state == READ_PICO_TRANSFER_STOPPED)
+        available = true;
+    if (available) {
+        s_config_busy = s_time_active = true;
+        s_time_automatic = automatic;
+        s_time_cancel = false;
     }
-    esp_netif_sntp_deinit();
+    portEXIT_CRITICAL(&s_lock);
+    if (!available) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
+    portENTER_CRITICAL(&s_lock);
+    if (err == ESP_OK) s_time_pending_utc = *utc_seconds;
+    s_time_active = s_time_automatic = s_config_busy = false;
+    portEXIT_CRITICAL(&s_lock);
     return err;
+}
+esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
+    return sync_time_run(utc_seconds, false, false);
+}
+esp_err_t read_pico_transfer_sync_time_online(uint32_t *utc_seconds) {
+    return sync_time_run(utc_seconds, true, false);
+}
+esp_err_t read_pico_transfer_sync_time_auto(uint32_t *utc_seconds) {
+    return sync_time_run(utc_seconds, false, true);
+}
+bool read_pico_transfer_take_time_sync(uint32_t *utc_seconds) {
+    if (!utc_seconds) return false;
+    portENTER_CRITICAL(&s_lock);
+    *utc_seconds = s_time_pending_utc;
+    s_time_pending_utc = 0;
+    portEXIT_CRITICAL(&s_lock);
+    return *utc_seconds != 0;
 }
 
 esp_err_t read_pico_transfer_scan_wifi(read_pico_transfer_network_t out[READ_PICO_TRANSFER_SCAN_MAX], size_t *count) {
+    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
     if (!out || !count) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out) * READ_PICO_TRANSFER_SCAN_MAX); *count = 0;
     read_pico_transfer_status_t status;
@@ -820,10 +893,14 @@ cleanup:
 }
 
 esp_err_t read_pico_transfer_forget_wifi(void) {
+    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
+    // 启动失败会保留 ERROR 提示，但已释放驱动；此时仍允许用户清除坏配置。
+    // A failed start retains its ERROR message after releasing the driver; allow clearing its credentials.
     if (status.state == READ_PICO_TRANSFER_UPLOADING ||
-        (status.state != READ_PICO_TRANSFER_STOPPED && status.mode == READ_PICO_TRANSFER_MODE_STA)) return ESP_ERR_INVALID_STATE;
+        (status.mode == READ_PICO_TRANSFER_MODE_STA && (s_wifi || s_started || s_http || s_netif)))
+        return ESP_ERR_INVALID_STATE;
     if (!claim_config()) return ESP_ERR_INVALID_STATE;
     esp_err_t err = store_credentials(NULL);
     if (err == ESP_OK) {
@@ -1764,6 +1841,7 @@ static esp_err_t files_mutation_handler(httpd_req_t *req) {
 
 /* ---- 生命周期 / Lifecycle ---- */
 bool read_pico_transfer_try_stop_if_idle(void) {
+    if (!cancel_time_sync(false)) return false;
     portENTER_CRITICAL(&s_lock);
     bool accepted = admission_stop(&s_stopping, s_upload_active);
     portEXIT_CRITICAL(&s_lock);
@@ -1772,6 +1850,7 @@ bool read_pico_transfer_try_stop_if_idle(void) {
 }
 
 bool read_pico_transfer_pause_for_sleep(void) {
+    if (!cancel_time_sync(false)) return false;
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
     if (status.state == READ_PICO_TRANSFER_STOPPED) return true;
@@ -1795,6 +1874,7 @@ void read_pico_transfer_resume_after_sleep(void) {
 }
 
 void read_pico_transfer_stop(void) {
+    if (!cancel_time_sync(false)) return;
     portENTER_CRITICAL(&s_lock); s_stopping = true; portEXIT_CRITICAL(&s_lock);
     if (s_http) { httpd_stop(s_http); s_http = NULL; }
     if (s_started) { esp_wifi_stop(); s_started = false; }
@@ -1818,10 +1898,12 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
         (!cfg->network_only && (!cfg->root_dir || !cfg->free_bytes_cb)) ||
         (cfg->root_dir && strlen(cfg->root_dir) >= sizeof(s_root)) ||
         (cfg->mode != READ_PICO_TRANSFER_MODE_AP && cfg->mode != READ_PICO_TRANSFER_MODE_STA)) return ESP_ERR_INVALID_ARG;
-    if (s_wifi || s_netif || s_http) return ESP_ERR_INVALID_STATE;
+    if (!cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
+    if (!claim_config()) return ESP_ERR_INVALID_STATE;
+    if (s_wifi || s_netif || s_http) { release_config(); return ESP_ERR_INVALID_STATE; }
     // 先回收 BLE 内存，再创建 WiFi/HTTP；失败不半途启动。/ Reclaim BLE before WiFi/HTTP allocation; never start partially on a failed stop.
     const esp_err_t reserve = ble_pt_network_acquire();
-    if (reserve != ESP_OK) return reserve;
+    if (reserve != ESP_OK) { release_config(); return reserve; }
     s_ble_network_reserved = true;
     s_cfg = *cfg;
     if (cfg->root_dir) strcpy(s_root, cfg->root_dir);
@@ -1953,9 +2035,10 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
         portENTER_CRITICAL(&s_lock); connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
         read_pico_transfer_service_poll();
     }
+    release_config();
     return ESP_OK;
 fail:
     clear_secret(&wifi, sizeof(wifi)); clear_secret(&saved, sizeof(saved));
-    read_pico_transfer_stop(); set_error(err); return err;
+    read_pico_transfer_stop(); release_config(); set_error(err); return err;
 }
 #endif

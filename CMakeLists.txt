@@ -11,7 +11,7 @@ idf_build_set_property(MINIMAL_BUILD ON)
 if(DEFINED ENV{PICO_PROJECT_VER} AND NOT "$ENV{PICO_PROJECT_VER}" STREQUAL "")
     set(PROJECT_VER "$ENV{PICO_PROJECT_VER}")
 else()
-    set(PROJECT_VER "0.3.3-rc90")
+    set(PROJECT_VER "0.3.3-rc97")
 endif()
 project(Read_Pico)
 
@@ -27,3 +27,8 @@ if(app_desc_launcher)
     list(APPEND app_desc_utc_launcher ${app_desc_launcher})
 endif()
 set_property(TARGET ${app_desc_lib} PROPERTY C_COMPILER_LAUNCHER "${app_desc_utc_launcher}")
+
+# panic 包装器的链接选项在 main/CMakeLists.txt 里挂到 main 组件上：写在 project() 之后
+# 用 idf_build_set_property 设全局链接选项已经太晚，链接器看不到 --wrap。
+# The panic wrapper's link option hangs off the main component in main/CMakeLists.txt: setting a
+# global link option after project() is too late for the linker to see --wrap.

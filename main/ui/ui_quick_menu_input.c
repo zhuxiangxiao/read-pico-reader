@@ -19,6 +19,10 @@ void ui_quick_menu_cancel_input(ui_quick_menu_t *menu) {
     menu->swallow = true;
 }
 
+int ui_quick_menu_pressed(const ui_quick_menu_t *menu) {
+    return menu->open && menu->tracking && !menu->moved ? menu->hit : -1;
+}
+
 static void dismiss(ui_quick_menu_t *menu, ui_quick_action_t *action) {
     menu->open = menu->tracking = false;
     menu->swallow = true;

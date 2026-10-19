@@ -83,6 +83,47 @@ static void qr_regression(app_ctx_t* ctx) {
     test_qr_encodes=0;
     ctx->now_ms=0;
 }
+// 页面标记可能因旧会话重连失败而丢失，确认遗忘仍须释放实际射频并取消排队连接。
+// A failed restart can lose the page's session flag; forgetting must still stop the radio and queued reconnect.
+static void wifi_recovery_regression(app_ctx_t* ctx) {
+    test_configured = s_saved_configured = true;
+    s_view = TRANSFER_NETWORKS;
+    s_wifi_settings_only = true;
+    s_session_started = false;
+    s_start_pending = s_network_connect_pending = s_scan_pending = false;
+    test_status = s_status = (read_pico_transfer_status_t){.mode=READ_PICO_TRANSFER_MODE_STA,
+        .state=READ_PICO_TRANSFER_ERROR,.wifi_configured=true};
+    test_wifi_running = true;
+    int stops = test_stop_count;
+    tap(ctx, network_control_rect(6));
+    assert(!test_wifi_running && test_stop_count > stops && s_network_connect_pending);
+    network_ui_tick(ctx);
+    assert(s_session_started && !s_network_connect_pending);
+    // 上传中不能遗忘；停止后可以重试。/ Forgetting waits for an active upload, then remains retryable.
+    test_wifi_running = true;
+    s_session_started = false;
+    s_network_connect_pending = true;
+    tap(ctx, network_control_rect(11));
+    test_busy = true;
+    stops = test_stop_count;
+    int forgets = test_forget_count;
+    tap(ctx, network_control_rect(11));
+    assert(s_forget_confirm && test_wifi_running && test_stop_count == stops && test_forget_count == forgets);
+    test_busy = false;
+    tap(ctx, network_control_rect(11));
+    assert(!s_forget_confirm && !test_wifi_running && !test_configured && !s_saved_configured);
+    assert(!s_start_pending && !s_network_connect_pending && !s_scan_pending);
+    network_ui_tick(ctx);
+    assert(!s_session_started && !s_network_connect_pending);
+    // 遗忘后重新选择同名网络会进入密码输入。/ Selecting the forgotten network asks for a password again.
+    s_network_page = 0;
+    tap(ctx, network_control_rect(0));
+    assert(s_view == TRANSFER_PASSWORD && !s_password[0]);
+    clear_password();
+    s_wifi_settings_only = false;
+    s_forget_confirm = false;
+    test_status = (read_pico_transfer_status_t){0};
+}
 static void password_caret_regression(app_ctx_t *ctx) {
     clear_password();ui_keyboard_begin(&s_password_input,true);
     assert(s_password_input.cursor==0);
@@ -357,5 +398,9 @@ int main(void) {
     assert(s_media_lost && !test_airdrop_active && !s_free);
     transfer_on_exit(&ctx);
     assert(test_store_changes == changes_before + 1 && !s_airdrop_entry);
+    enter_networks();
+    test_scan_count = 8; test_scan_error = ESP_OK;
+    network_ui_tick(&ctx);
+    wifi_recovery_regression(&ctx);
     puts("transfer_ui_host_test: PASS");
 }

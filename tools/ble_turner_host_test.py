@@ -52,10 +52,14 @@ unit = r'''
 #define CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE 4096
 #define CONFIG_BT_NIMBLE_PINNED_TO_CORE 0
 #define BLE_SM_IO_CAP_NO_IO 0
+#define BLE_SM_IO_CAP_DISP_YES_NO 1
+#define BLE_SM_PAIR_KEY_DIST_ENC 1
 #define BLE_HS_CONN_HANDLE_NONE 65535
 #define KEY_RING_LEN 16
 #define RAW_RING_LEN 17
 #define FRAME_MAX 16
+#define SAME_KEY_DEBOUNCE_MS 500
+#define RAW_RELEASE_GAP_MS 150
 #define YXT_CODE_PREV 0x01u
 #define YXT_CODE_NEXT 0x02u
 #define HID_SVC_UUID 0x1812u
@@ -85,10 +89,12 @@ static uint32_t s_stable_since;
 static void *s_host_task;
 static char s_failure[128];
 static bool s_has_keyboard_page=true,s_rest_known;
-static uint8_t s_preferred_byte=2,s_held_usage,s_held_mods;
-static uint32_t s_held_since,s_last_repeat,s_input_serial;
-static uint8_t s_rest[FRAME_MAX],s_last[FRAME_MAX];
-static size_t s_frame_len;
+static uint8_t s_preferred_byte=2,s_held_usage,s_held_mods,s_emit_usage;
+static uint32_t s_held_since,s_last_repeat,s_input_serial,s_emit_ms,s_last_rx_ms;
+static uint8_t s_repeat_count;
+static ble_pt_frame_t s_rest,s_raw_held,s_raw_prev,s_raw_base;
+static bool s_raw_down;
+static uint32_t s_raw_last_ms;
 static int s_ring_lock;
 static struct {ble_pt_event_t items[KEY_RING_LEN];uint8_t head,tail;}s_keys;
 static struct {ble_pt_raw_t items[RAW_RING_LEN];uint8_t head,tail;}s_raws;
@@ -114,12 +120,11 @@ void ble_pt_scan_stop(void){s_scanning=false;}
 void ble_pt_disconnect(void){s_connected=false;}
 static int s_ble_scroll,s_ble_learning;
 static char s_ble_feedback[64];
+void ble_pt_crumb(uint8_t id){(void)id;}
 bool ble_pt_connected(void){return s_connected;}
 static int binding_error;
-static uint32_t saved_code;
-static ble_pt_action_t saved_action;
-static struct {char addr[18];uint32_t codes[BLE_PT_MAX_BINDINGS];} s_bindings;
-static uint32_t persisted[BLE_PT_MAX_BINDINGS];
+static struct {char addr[18];ble_pt_frame_t frames[BLE_PT_MAX_BINDINGS];} s_bindings;
+static ble_pt_frame_t persisted[BLE_PT_MAX_BINDINGS];
 static int binding_handles;
 typedef int nvs_handle_t;
 #define NVS_NS_BINDINGS "bindings"
@@ -131,11 +136,12 @@ static esp_err_t nvs_commit(nvs_handle_t h){assert(h==1);return binding_error==3
 static void nvs_close(nvs_handle_t h){assert(h==1);binding_handles--;}
 
 '''
-for name in ('lifecycle_take','lifecycle_give','ble_pt_input_serial','key_push','raw_push','extract_primary_code',
+for name in ('lifecycle_take','lifecycle_give','ble_pt_input_serial','key_push','raw_push','frame_of','frame_same',
+             'frame_idle','raw_release','raw_frame','extract_primary_code',
              'usage_to_special','emit_usage','ingest_report','ble_pt_pop_key','ble_pt_pop_raw',
-             'ble_pt_raw_code','ble_pt_bind','start_locked','stop_locked','ble_pt_start','ble_pt_stop',
+             'ble_pt_learn_begin','ble_pt_bind','ble_pt_binding','start_locked','stop_locked','ble_pt_start','ble_pt_stop',
              'ble_pt_network_acquire','ble_pt_network_release','scan_cb','ble_pt_device_count',
-             'ble_pt_device','ble_pt_action_for_raw','ble_pt_action_for_usage'):
+             'ble_pt_device','ble_pt_action_for_frame','ble_pt_action_for_usage'):
     unit += '\n' + function(BLE, name)
 unit += '\n' + function(SETTINGS, 'ble_receive_feedback')
 unit += '\n' + function(SETTINGS, 'format_bound_key')
@@ -144,12 +150,19 @@ for name in ('ble_scan_visible','ble_scan_visible_count','ble_scan_visible_at'):
 unit += r'''
 static void reset_input(void){
  memset(&s_keys,0,sizeof(s_keys));memset(&s_raws,0,sizeof(s_raws));
- memset(s_rest,0,sizeof(s_rest));memset(s_last,0,sizeof(s_last));
- s_rest_known=false;s_held_usage=s_held_mods=0;s_frame_len=0;s_connected=true;
+ memset(&s_rest,0,sizeof(s_rest));memset(&s_raw_held,0,sizeof(s_raw_held));
+ memset(&s_raw_prev,0,sizeof(s_raw_prev));memset(&s_raw_base,0,sizeof(s_raw_base));
+ memset(&s_bindings,0,sizeof(s_bindings));memset(persisted,0,sizeof(persisted));
+ s_rest_known=false;s_raw_down=false;s_raw_last_ms=0;
+ s_held_usage=s_held_mods=s_emit_usage=0;s_emit_ms=0;s_connected=true;
  s_ble_feedback[0]=0;s_ble_learning=0;binding_error=0;s_ble_scroll=200;
- snprintf(s_bindings.addr,sizeof(s_bindings.addr),"AA:BB:CC:DD:EE:FF");memset(s_bindings.codes,0,sizeof(s_bindings.codes));
+ snprintf(s_bindings.addr,sizeof(s_bindings.addr),"AA:BB:CC:DD:EE:FF");
 }
-static void report(int len,int id,int key){uint8_t data[9]={0};data[len==9?0:8]=(uint8_t)id;data[len==9?3:2]=(uint8_t)key;ingest_report(data,(size_t)len);}
+// 8 字节帧的键码在第 2 字节；9 字节帧首字节是报告号，键码在第 3 字节。
+// The code sits in byte 2 of an 8-byte frame; byte 0 of a 9-byte frame is the report id and the
+// code sits in byte 3.
+static void report(int len,int id,int key){uint8_t data[9]={0};if(len==9)data[0]=(uint8_t)id;data[len==9?3:2]=(uint8_t)key;ingest_report(data,(size_t)len);}
+static void wait_ms(int ms){clock_us+=(int64_t)ms*1000;}
 int main(void){
  // 同地址的扫描响应补齐名字；过滤后的行仍选择正确设备。
  // A later scan response supplies a name; filtered rows still select the correct peer.
@@ -169,55 +182,122 @@ int main(void){
  for(unsigned i=3;i<BLE_PT_MAX_DEVICES+2;i++){event.disc.addr.val[0]=i;scan_cb(&event,NULL);}
  assert(s_device_count==BLE_PT_MAX_DEVICES);
  event.disc.addr.val[0]=1;scan_cb(&event,NULL);assert(s_devices[1].has_name);
- // 阅星瞳无需学习；手动绑定覆盖默认映射；键盘修饰键不能误翻页。
- // YueXingTong needs no learning; manual bindings override defaults, and keyboard modifiers cannot turn pages.
+ // 阅星瞳无需学习；手动绑定覆盖默认映射；键盘修饰键与报告号不能误翻页。
+ // YueXingTong needs no learning; manual bindings override defaults, and neither keyboard modifiers
+ // nor report ids turn pages.
  s_has_keyboard_page=false;
  assert(ble_pt_action_for_usage(1,0)==BLE_PT_ACTION_PREV&&ble_pt_action_for_usage(2,0)==BLE_PT_ACTION_NEXT);
- assert(ble_pt_action_for_raw(1)==BLE_PT_ACTION_PREV&&ble_pt_action_for_raw(2)==BLE_PT_ACTION_NEXT);
- assert(ble_pt_action_for_raw(0x101)==BLE_PT_ACTION_NONE&&ble_pt_action_for_raw(0)==BLE_PT_ACTION_NONE);
- s_bindings.codes[1]=1;assert(ble_pt_action_for_raw(1)==BLE_PT_ACTION_NEXT);s_bindings.codes[1]=0;
- s_has_keyboard_page=true;assert(ble_pt_action_for_raw(1)==BLE_PT_ACTION_NONE&&ble_pt_action_for_raw(2)==BLE_PT_ACTION_NONE);
- s_bindings.codes[0]=1;assert(ble_pt_action_for_raw(1)==BLE_PT_ACTION_PREV);s_bindings.codes[0]=0;
- // 原生一字节报告的首按、连发、松开及下一次按下；标准键盘继续独立识别。
- // Native one-byte reports cover first press, duplicates, release and next press; keyboards stay distinct.
+ const ble_pt_frame_t yxt_prev={.len=1,.bytes={0x01}},yxt_next={.len=1,.bytes={0x02}};
+ const ble_pt_frame_t unknown_frame={.len=2,.bytes={0x03,0x00}},empty_frame={0};
+ const ble_pt_frame_t report_id_frame={.len=9,.bytes={0x01,0,0,0,0,0,0,0,0}};
+ assert(ble_pt_action_for_frame(&yxt_prev)==BLE_PT_ACTION_PREV&&ble_pt_action_for_frame(&yxt_next)==BLE_PT_ACTION_NEXT);
+ assert(ble_pt_action_for_frame(&unknown_frame)==BLE_PT_ACTION_NONE&&ble_pt_action_for_frame(&empty_frame)==BLE_PT_ACTION_NONE);
+ assert(ble_pt_action_for_frame(NULL)==BLE_PT_ACTION_NONE&&ble_pt_action_for_frame(&report_id_frame)==BLE_PT_ACTION_NONE);
+ s_bindings.frames[1]=yxt_prev;assert(ble_pt_action_for_frame(&yxt_prev)==BLE_PT_ACTION_NEXT);
+ memset(&s_bindings.frames[1],0,sizeof(s_bindings.frames[1]));
+ s_has_keyboard_page=true;assert(ble_pt_action_for_frame(&yxt_prev)==BLE_PT_ACTION_NONE&&ble_pt_action_for_frame(&yxt_next)==BLE_PT_ACTION_NONE);
+ s_bindings.frames[0]=yxt_prev;assert(ble_pt_action_for_frame(&yxt_prev)==BLE_PT_ACTION_PREV);
+ memset(&s_bindings.frames[0],0,sizeof(s_bindings.frames[0]));
+ // 一字节报告：首按就是边沿，连发不算，松开会收尾。
+ // A one-byte report: the first press is already an edge, repeats do not count, and the release closes it.
  reset_input();s_has_keyboard_page=false;s_preferred_byte=0;
  uint8_t native=1;ble_pt_event_t key;ble_pt_raw_t raw;
  ingest_report(&native,1);assert(ble_pt_pop_key(&key)&&ble_pt_action_for_usage(key.usage,key.mods)==BLE_PT_ACTION_PREV);
- ingest_report(&native,1);assert(!ble_pt_pop_key(&key));
- native=0;ingest_report(&native,1);assert(s_rest_known);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed&&raw.frame.len==1&&raw.frame.bytes[0]==1);
+ ingest_report(&native,1);assert(!ble_pt_pop_key(&key)&&!ble_pt_pop_raw(&raw));
+ native=0;ingest_report(&native,1);assert(ble_pt_pop_raw(&raw)&&!raw.pressed&&raw.frame.bytes[0]==1);
  native=2;ingest_report(&native,1);
  assert(ble_pt_pop_key(&key)&&ble_pt_action_for_usage(key.usage,key.mods)==BLE_PT_ACTION_NEXT);
- assert(ble_pt_pop_raw(&raw)&&raw.pressed&&ble_pt_action_for_raw(ble_pt_raw_code(&raw))==BLE_PT_ACTION_NEXT);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed&&ble_pt_action_for_frame(&raw.frame)==BLE_PT_ACTION_NEXT);
+ // 标准键盘：byte 0 是修饰键，那里的 0x01 不是翻页。
+ // A standard keyboard: byte 0 is the modifier byte, where 0x01 is not a page turn.
  reset_input();s_has_keyboard_page=true;s_preferred_byte=2;
  uint8_t keyboard[8]={0};ingest_report(keyboard,8);keyboard[0]=1;ingest_report(keyboard,8);
- assert(!ble_pt_pop_key(&key)&&ble_pt_pop_raw(&raw)&&ble_pt_action_for_raw(ble_pt_raw_code(&raw))==BLE_PT_ACTION_NONE);
- char label[48];
- format_bound_key(0x88,label,sizeof(label));assert(!strcmp(label,"0x88"));
- format_bound_key(0x288,label,sizeof(label));assert(!strcmp(label,"0x88 b2"));
- format_bound_key(0x10288,label,sizeof(label));assert(!strcmp(label,"0x88 r1 b2"));
- format_bound_key(0xffffff,label,sizeof(label));assert(!strcmp(label,"0xFF r255 b255"));
- char tiny[3];format_bound_key(0x10288,tiny,sizeof(tiny));assert(tiny[2]==0);
- char sentinel='x';format_bound_key(0x88,&sentinel,0);assert(sentinel=='x');
- // 首次按下、重复帧、释放和报告 ID 不需要先点屏幕。/ First presses, duplicate frames, releases and report IDs need no touch.
+ assert(!ble_pt_pop_key(&key)&&ble_pt_pop_raw(&raw)&&ble_pt_action_for_frame(&raw.frame)==BLE_PT_ACTION_NONE);
+ // 非标遥控器：静止帧带非零常量，每次按下发的字节一模一样，整帧就是身份。
+ // A non-standard remote keeps a non-zero constant in its resting frame and sends identical bytes on
+ // every press, so the whole frame is the identity.
+ const uint8_t hw_rest[8]={0x06,0x00,0,0,0,0,0,0},hw_prev[8]={0x06,0xb1,0,0,0,0,0,0},hw_next[8]={0x06,0xb2,0,0,0,0,0,0};
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0;
+ ingest_report(hw_rest,8);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed&&raw.frame.len==8&&raw.frame.bytes[0]==0x06);
+ // 点「学习」：此刻那一帧成为基准，静止帧不再算一次按下。
+ // Tapping 学习 pins the frame present now as the baseline, so the resting frame stops being a press.
+ ble_pt_learn_begin();
+ wait_ms(200);ingest_report(hw_rest,8);
+ assert(ble_pt_pop_raw(&raw)&&!raw.pressed&&raw.frame.bytes[0]==0x06);
+ ingest_report(hw_rest,8);assert(!ble_pt_pop_raw(&raw));
+ // 第一次按下就学得会，不需要先来一条松开报告。
+ // The very first press learns, with no release report before it.
+ s_ble_learning=1;ingest_report(hw_prev,8);
+ assert(ble_receive_feedback()&&!s_ble_learning&&strstr(s_ble_feedback,"上一页"));
+ ble_pt_frame_t bound={0};
+ assert(ble_pt_binding(BLE_PT_ACTION_PREV,&bound)&&bound.len==8&&bound.bytes[1]==0xb1);
+ assert(ble_pt_action_for_frame(&bound)==BLE_PT_ACTION_PREV);
+ assert(persisted[0].len==8&&persisted[0].bytes[1]==0xb1);
+ const ble_pt_frame_t hw_next_frame={.len=8,.bytes={0x06,0xb2}};
+ assert(ble_pt_action_for_frame(&hw_next_frame)==BLE_PT_ACTION_NONE);
+ char label[48];format_bound_key(&bound,label,sizeof(label));assert(!strcmp(label,"06 B1"));
+ // 遥控器一直不发松开报告：静默之后同一个键再按一次，仍是新的一次按下。
+ // With no release report ever: after silence, the same key pressed again is a new press.
+ wait_ms(200);ingest_report(hw_prev,8);
+ assert(ble_pt_pop_raw(&raw)&&!raw.pressed);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed&&ble_pt_action_for_frame(&raw.frame)==BLE_PT_ACTION_PREV);
+ ingest_report(hw_prev,8);assert(!ble_pt_pop_raw(&raw));
+ // 两个不同的键紧接着按下，后一个不会丢。
+ // Two different keys in quick succession: the second one is not lost.
+ ingest_report(hw_next,8);
+ assert(ble_pt_pop_raw(&raw)&&!raw.pressed);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed&&raw.frame.len==8&&raw.frame.bytes[1]==0xb2);
+ // 松开帧是另一个非零常量：回到按下之前那一帧只算松开，不再冒一次按下。
+ // A non-zero release frame: returning to the frame before the press is only a release.
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0;
+ ingest_report(hw_rest,8);assert(ble_pt_pop_raw(&raw)&&raw.pressed);
+ ingest_report(hw_prev,8);
+ assert(ble_pt_pop_raw(&raw)&&!raw.pressed);
+ assert(ble_pt_pop_raw(&raw)&&raw.pressed);
+ ingest_report(hw_rest,8);
+ assert(ble_pt_pop_raw(&raw)&&!raw.pressed&&raw.frame.bytes[1]==0xb1);
+ assert(!ble_pt_pop_raw(&raw));
+ // 学到的标识：帧里非零的字节照原样列出，同一个键每次都一样。
+ // The learned identifier lists the frame's non-zero bytes and is identical on every press.
+ const ble_pt_frame_t empty_tag={0},one_byte={.len=1,.bytes={0x4b}},two_bytes={.len=2,.bytes={0xaa,0xbb}};
+ const ble_pt_frame_t four_bytes={.len=4,.bytes={1,2,3,4}};
+ format_bound_key(&empty_tag,label,sizeof(label));assert(!label[0]);
+ format_bound_key(&one_byte,label,sizeof(label));assert(!strcmp(label,"4B"));
+ format_bound_key(&two_bytes,label,sizeof(label));assert(!strcmp(label,"AA BB"));
+ format_bound_key(&four_bytes,label,sizeof(label));assert(!strcmp(label,"01 02 03 +"));
+ char tiny[3];format_bound_key(&two_bytes,tiny,sizeof(tiny));assert(tiny[2]==0);
+ char sentinel='x';format_bound_key(&two_bytes,&sentinel,0);assert(sentinel=='x');
+ // 首次按下、重复帧、松开与报告号都不需要先点屏幕，一次按下就够学。
+ // First presses, duplicate frames, releases and report ids need no touch, and one press is enough.
  for(int len=8;len<=9;len++){
-  reset_input();s_ble_learning=1;report(len,len==9?7:0,0x4b);
-  assert(s_rest_known);assert(ble_receive_feedback());
-  saved_code=s_bindings.codes[0];saved_action=BLE_PT_ACTION_PREV;
-  assert(!s_ble_learning && s_ble_scroll==0 && saved_action==BLE_PT_ACTION_PREV);
-  assert(saved_code==((uint32_t)0x4b | (uint32_t)(len==9?3:2)<<8 | (uint32_t)(len==9?7:0)<<16));
-  format_bound_key(saved_code,label,sizeof(label));assert(!strcmp(label,len==9?"0x4B r7 b3":"0x4B b2"));
+  reset_input();s_has_keyboard_page=false;s_preferred_byte=len==9?2:0xFF;s_ble_learning=1;
+  report(len,len==9?7:0,0x4b);
+  assert(ble_receive_feedback()&&!s_ble_learning&&s_ble_scroll==0);
+  ble_pt_frame_t learned={0};
+  assert(ble_pt_binding(BLE_PT_ACTION_PREV,&learned)&&learned.len==len);
+  assert(learned.bytes[len==9?3:2]==0x4b&&learned.bytes[0]==(len==9?7:0));
+  format_bound_key(&learned,label,sizeof(label));assert(!strcmp(label,len==9?"07 4B":"4B"));
   assert(strstr(s_ble_feedback,"识别成功")&&strstr(s_ble_feedback,"上一页"));
   report(len,len==9?7:0,0x4b);assert(!ble_receive_feedback());
-  report(len,len==9?7:0,0);assert(!s_held_usage && !ble_receive_feedback());
+  report(len,len==9?7:0,0);assert(!s_held_usage&&!ble_receive_feedback());
   s_ble_feedback[0]=0;s_ble_learning=2;report(len,len==9?7:0,0x4e);
-  assert(ble_receive_feedback() && s_bindings.codes[1] && strstr(s_ble_feedback,"下一页"));
+  assert(ble_receive_feedback()&&!s_ble_learning&&strstr(s_ble_feedback,"下一页"));
+  ble_pt_frame_t learned_next={0};
+  assert(ble_pt_binding(BLE_PT_ACTION_NEXT,&learned_next)&&learned_next.bytes[len==9?3:2]==0x4e);
  }
- reset_input();s_ble_learning=2;binding_error=3;report(8,0,0x4e);
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0xFF;
+ s_ble_learning=2;binding_error=3;report(8,0,0x4e);
  assert(ble_receive_feedback()&&strstr(s_ble_feedback,"保存失败")&&!s_ble_learning);
- reset_input();report(8,0,0x4b);assert(ble_receive_feedback()&&strstr(s_ble_feedback,"已收到"));
- // 有界队列、断连和释放不造成误绑定。/ Bound queues and ignore releases or disconnected input.
- reset_input();for(int n=0;n<100;n++){report(8,0,n%2?0:0x4b);}assert(ble_receive_feedback());
- reset_input();report(8,0,0x4b);s_connected=false;s_ble_learning=1;
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0xFF;
+ report(8,0,0x4b);assert(ble_receive_feedback()&&strstr(s_ble_feedback,"已收到"));
+ // 有界队列、断连和松开不造成误绑定。/ Bound queues and ignore releases or disconnected input.
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0xFF;
+ for(int n=0;n<100;n++){uint8_t burst[8]={0};burst[2]=(n%2)?0x4b:0;ingest_report(burst,8);}
+ assert(ble_receive_feedback());
+ reset_input();s_has_keyboard_page=false;s_preferred_byte=0xFF;
+ report(8,0,0x4b);s_connected=false;s_ble_learning=1;
  assert(!ble_receive_feedback()&&s_ble_learning==1);
  // 内存不够时不进入 NimBLE；任务失败完整回收。/ Reject before NimBLE on low memory; unwind a failed host task.
  for(int kind=0;kind<3;kind++){
@@ -238,15 +318,17 @@ int main(void){
  atomic_flag_test_and_set(&s_lifecycle);assert(ble_pt_start()==ESP_ERR_TIMEOUT && !s_running);lifecycle_give();
  for(int n=0;n<100;n++){assert(ble_pt_start()==ESP_OK);assert(ble_pt_network_acquire()==ESP_OK);ble_pt_network_release();}
  assert(!s_running && !atomic_load(&s_network_users));
- puts("PASS: named discovery, YueXingTong/manual/modifier mappings, BLE first key, report ID/release, learning feedback, bounded queues, memory/task failures and network resource leases");
+ puts("PASS: named discovery, YueXingTong/manual/modifier mappings, whole-frame raw identity, first-press learning, missing release reports, bounded queues, memory/task failures and network resource leases");
 }
 '''
 # Active tick dispatch must consume reports before a state-only redraw can return.
 assert 'ble_receive_feedback()' in function(SETTINGS, 'on_tick')
 assert 'while (ble_pt_pop_raw(&stale))' in function(SETTINGS, 'on_gesture')
 transfer = (ROOT / 'components/read_pico_transfer/read_pico_transfer.c').read_text()
-for name in ('read_pico_transfer_start', 'read_pico_transfer_scan_wifi', 'read_pico_transfer_sync_time'):
+for name in ('read_pico_transfer_start', 'read_pico_transfer_scan_wifi', 'sync_time_impl'):
     assert 'ble_pt_network_acquire()' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', name)
+assert 'sync_time_run(utc_seconds, false, false)' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', 'read_pico_transfer_sync_time')
+assert 'sync_time_impl(utc_seconds)' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', 'sync_time_run')
 assert transfer.count('ble_pt_network_acquire()') == 3
 with tempfile.TemporaryDirectory(prefix='pico-ble-test-') as directory:
     work = Path(directory)

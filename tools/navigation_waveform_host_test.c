@@ -103,6 +103,42 @@ int main(void) {
     for (int from=0;from<16;++from) for (int to=0;to<16;++to) for (int f=0;f<20;++f)
         assert(e0470_phase_action(first_table,f,to,from)==(from==to?0:e0470_phase_action(bw,f,to,from)));
     assert(!memcmp(saved_bw,bw->luts,sizeof(saved_bw)) && !memcmp(saved_gray,gray_table->luts,sizeof(saved_gray)));
+    const EpdWaveform *normal_wave=display_main_normal_waveform();
+    const EpdWaveformPhases *normal_table=e0470_waveform_phases(normal_wave,MODE_GL16);
+    assert(normal_table&&normal_table->phases==water_table->phases&&display_main_normal_waveform()==normal_wave);
+    int softened=0;
+    for(int from=0;from<16;++from)for(int to=0;to<16;++to){
+        int old_counts[4]={0},new_counts[4]={0},differences=0,first=-1,last=-1;
+        for(int phase=0;phase<water_table->phases;++phase){
+            int a=e0470_phase_action(water_table,phase,to,from),b=e0470_phase_action(normal_table,phase,to,from);
+            ++old_counts[a];++new_counts[b];differences+=a!=b;
+            if(a){if(first<0)first=phase;last=phase;}
+            if(to==from||to==0||to==15||a==0||a==3)assert(a==b);
+        }
+        assert(!memcmp(old_counts,new_counts,sizeof(old_counts))&&differences<=4);
+        if(first>=0){assert(e0470_phase_action(water_table,first,to,from)==e0470_phase_action(normal_table,first,to,from));
+            assert(e0470_phase_action(water_table,last,to,from)==e0470_phase_action(normal_table,last,to,from));}
+        softened+=differences>0;
+    }
+    assert(softened>0&&!memcmp(saved_gray,gray_table->luts,sizeof(saved_gray)));
+    printf("PASS: ordinary main %d softened gray-edge paths retain all37 phases, counts, holds, endpoints; ripple and vendor outputs preserved\n",softened);
+    // 普通书架留白从各级灰只向白；其余十五级完整保留原GL16/GC16与同时输出相数。
+    // Ordinary shelf whitespace drives only white from every gray; all other targets retain original GL16/GC16 actions and simultaneous phase counts.
+    for(int index=0;index<2;++index){
+        enum EpdDrawMode mode=index?MODE_GC16:MODE_GL16;
+        const EpdWaveform *shelf=display_main_shelf_waveform(mode);
+        const EpdWaveformPhases *source=e0470_waveform_phases(&E0470_WAVEFORM,mode);
+        const EpdWaveformPhases *table=e0470_waveform_phases(shelf,mode);
+        assert(shelf!=&E0470_WAVEFORM&&table&&table->phases==source->phases);
+        assert(display_main_shelf_waveform(mode)==shelf);
+        for(int f=0;f<table->phases;++f)for(int from=0;from<16;++from)for(int to=0;to<16;++to){
+            int action=e0470_phase_action(table,f,to,from);
+            if(to!=15)assert(action==e0470_phase_action(source,f,to,from));
+            else{assert(action==0||action==2);assert(action==e0470_phase_action(normal_table,f,to,from));}
+        }
+    }
+    assert(!memcmp(saved_gray,gray_table->luts,sizeof(saved_gray)));
+    puts("PASS: shelf white pixels never reverse-darken; all 15 art targets, GL16/GC16 counts and vendor LUTs preserved");
     // 点阵亮度随输入单调增加且稳定，不引入中灰；阅读插图原16灰输出仍保留。
     // Dot brightness increases monotonically and remains stable with no intermediate grays; existing 16-gray reader output is retained.
     int previous_white = 0, previous_cover_white = 0;

@@ -9,6 +9,8 @@
 typedef struct { int ns; char key[16]; nvs_type_t type; size_t len; uint8_t data[1024]; } record_t;
 static record_t records[2][32];
 static int counts[2], active;
+static unsigned progress_changes;
+void book_progress_notify_changed(void) { ++progress_changes; }
 struct nvs_iterator_opaque { int ns, index; };
 
 static int namespace_index(const char *name) {
@@ -124,7 +126,9 @@ int main(void) {
     // 旧备份不含移出状态，恢复时清除机器上后加的隐藏记录。/ Legacy restore clears later removals.
     snprintf(key,sizeof(key),"h_%08x",path_hash);
     assert(put(5,key,NVS_TYPE_STR,path,path_len)==ESP_OK);
+    unsigned before_restore = progress_changes;
     assert(book_history_backup_restore(f)==ESP_OK);
+    assert(progress_changes > before_restore);
     assert(counts[1]==counts[0]);
     assert(!find_record(3,"f_deadbeef"));
     assert(!find_record(5,key));

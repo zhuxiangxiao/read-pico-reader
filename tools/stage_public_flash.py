@@ -32,7 +32,7 @@ class LocalLinks(HTMLParser):
 
 def stage(output: Path, ota_origin: str | None = None) -> None:
     output.mkdir(parents=True, exist_ok=True)
-    for name in ("index.html", "notices.html", "manual.html", "site.css", "site.js", "installer-bridge.js",
+    for name in ("index.html", "notices.html", "manual.html", "site.css", "site.js", "installer-bridge.js", "flasher-integrity.js", "_headers",
                  "manifest.json", "toc-preview.png", "firmware.bin",
                  "bootloader.bin", "partitions.bin", "ota_data_initial.bin", "Pico-update.bin", "update.json"):
         if (FLASH / name).is_file(): shutil.copy2(FLASH / name, output / name)
@@ -42,6 +42,8 @@ def stage(output: Path, ota_origin: str | None = None) -> None:
     # 中文：只复制仓库中的公开说明书（正文、检索索引、图解、PDF）。
     # English: Copy the curated public manual, never its local rendering/debug workspace.
     shutil.copytree(FLASH / "manual", output / "manual", dirs_exist_ok=True)
+    if (FLASH / "new-features").is_dir():
+        shutil.copytree(FLASH / "new-features", output / "new-features", dirs_exist_ok=True)
     version = json.loads((FLASH / "manifest.json").read_text())["version"]
     versioned = FLASH / f"Pico-update-{version}.bin"
     if versioned.is_file(): shutil.copy2(versioned, output / versioned.name)
@@ -73,6 +75,8 @@ def stage(output: Path, ota_origin: str | None = None) -> None:
     shutil.copytree(FLASH / "vendor/web", output / "vendor/web", dirs_exist_ok=True)
     shutil.copy2(FLASH / "vendor/LICENSE", output / "vendor/LICENSE")
     licenses = {
+        ROOT / "licenses/Apache-2.0.txt": "Apache-2.0.txt",
+        ROOT / "licenses/kiikoread-Personal-Study-1.0.txt": "kiikoread-Personal-Study-1.0.txt",
         FLASH / "licenses/LUCIDE-ISC.txt": "LUCIDE-ISC.txt",
         ROOT / "components/jpegdec/LICENSE": "JPEGDEC-APACHE-2.0.txt",
         ROOT / "licenses/LGPL-3.0.txt": "LGPL-3.0.txt",
@@ -80,6 +84,7 @@ def stage(output: Path, ota_origin: str | None = None) -> None:
         ROOT / "components/read_pico_search/LICENSE.pypinyin": "PYPINYIN-MIT.txt",
         ROOT / "main/assets/OFL-Noto.txt": "OFL-Noto.txt",
         ROOT / "licenses/CrossMux-MIT.txt": "CROSSMUX-MIT.txt",
+        ROOT / "licenses/AnimateIcons-MIT.txt": "AnimateIcons-MIT.txt",
         ROOT / "licenses/FreeInk-SDK-MIT.txt": "FREEINK-SDK-MIT.txt",
     }
     (output / "licenses").mkdir(exist_ok=True)

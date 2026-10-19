@@ -48,12 +48,15 @@ idf_component_register(
         "ota_release.c"
         "display.c"
         "display_main_waveform.c"
+        "display_reader_waveform.c"
         "sleep.c"
+        "time_service.c"
         "lock_pin.c"
         "lock_pin_flow.c"
         "lock_screen.c"
         "settings.c"
         "app/app_loop.c"
+        "app/crash_note.c"
         "app/app_registry.c"
         "ui/ui_kit.c"
         "ui/ui_text_edit.c"
@@ -61,17 +64,23 @@ idf_component_register(
         "ui/ui_ime.c"
         "ui/ui_keyboard.c"
         "ui/ui_gesture.c"
+        "ui/ui_glass.c"
         "ui/ui_pinpad.c"
         "ui/ui_power_dialog.c"
         "ui/ui_quick_menu.c"
+        "ui/ui_lock_feedback.c"
         "ui/ui_quick_menu_input.c"
         "ui/ui_click_feedback.c"
         "ui/ui_wifi_qr.c"
         "ui/datamatrix.c"
         "ui/ui_menu.c"
         "ui/ui_nav.c"
+        "ui/ui_home_widget.c"
+        "ui/ui_home_clock.c"
         "ui/ui_image_dither.c"
         "ui/ui_wallpaper.c"
+        "ui/ui_avatar.c"
+        "ui/ui_reader_background.c"
         "apps/app_book.c"
         "apps/book_toc.c"
         "apps/app_dashboard.c"
@@ -86,12 +95,15 @@ idf_component_register(
         "book/book_history_backup.c"
         "book/book_title.c"
         "book/book_ticket.c"
+        "book/book_excerpt.c"
         "book/book_lock_collage.c"
+        "book/book_lock_bookmark.c"
         "book/book_source.c"
         "book/book_index_cache.c"
         "book/book_txt.c"
         "book/book_epub.c"
         "book/book_cover.c"
+        "book/book_cover_jobs.c"
         "book/book_image_header.c"
         "book/book_cover_auto.c"
         "book/zip_reader.c"
@@ -114,3 +126,15 @@ idf_component_register(
         "assets/reading.md"
         "assets/display-test.png"
 )
+
+# 包住 IDF 的 panic 处理器：崩溃现场在重启前落进 RTC，没有串口时那是唯一的现场。
+# 链接选项挂在 main 上，INTERFACE 会带到最终链接；写在 project() 之后的全局属性则太晚。
+# Wrap the IDF panic handler so the crash scene reaches RTC before a restart; without a console
+# that is the only place it survives. The option hangs off main, whose INTERFACE carries it into
+# the final link; a global property set after project() is too late for the linker to see it.
+target_link_options(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_panic_handler")
+
+# 本地 USB 测时入口，普通构建不包含。/ Local USB timing probe, omitted from ordinary product builds.
+if("$ENV{KIIKO_LOCAL_LATENCY}" STREQUAL "1")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_LOCAL_LATENCY=1)
+endif()

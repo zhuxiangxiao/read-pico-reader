@@ -1,98 +1,128 @@
 /* SPDX-License-Identifier: Apache-2.0
- * 中文：全宽浅顶部层，下圆角与四个无文字圆钮；三个主页模式统一灰阶和清晰边框。
- * English: A shallow full-width top layer with rounded bottom corners and four unlabeled circles; all main modes share grayscale and clear borders.
- * 冻结：不访问硬件、设置或刷新，不申请帧缓存；只在展开/状态变化后由主循环调用绘图。
- * Frozen: No hardware, settings, presentation or frame allocations; the loop draws only on opening or state changes.
+ * 中文：浮于清晰页面之上的液态玻璃快捷层，四个圆键沿用密码锁屏的折射与亮边。
+ * English: A liquid-glass quick layer over the sharp page, sharing PIN-key refraction and highlights.
+ * 用户修订：仅展开时生成玻璃；缓存四个小圆键直到关闭，输入只恢复原像素与圆内按压，避免重复模糊和顶部重刷。
+ * User revision: generate glass only on open; cache four small keys until close and restore original pixels for local interior feedback without reblurring or refreshing the top panel.
+ * 冻结：不访问硬件、设置或刷新，不留整帧缓存；输入零分配，关闭释放。
+ * Frozen: no hardware, settings, presentation or full-frame cache; input allocates nothing and close frees controls.
  */
 #include "ui_quick_menu.h"
-#include <stdlib.h>
-#include <string.h>
 #include "ui_kit.h"
 #include "ui_nav.h"
-#include "ui_image_dither.h"
+#include "ui_glass.h"
+#include "esp_heap_caps.h"
 
 static int center_x(int button) { return (button * 2 + 1) * UI_LOCK_WIDTH / 8; }
-
-// 根据当前旋转读取逻辑像素；和图形接口相同，画点保持半字节邻居。
-// Read logical pixels using the current rotation; drawing preserves the neighboring nibble like the graphics API.
-static uint8_t pixel(uint8_t *fb, int x, int y) {
-    int px, py;
-    switch (epd_get_rotation()) {
-        case EPD_ROT_PORTRAIT: px = epd_width() - y - 1; py = x; break;
-        case EPD_ROT_INVERTED_LANDSCAPE: px = epd_width() - x - 1; py = epd_height() - y - 1; break;
-        case EPD_ROT_INVERTED_PORTRAIT: px = y; py = epd_height() - x - 1; break;
-        default: px = x; py = y; break;
-    }
-    return (epd_get_pixel(px, py, epd_width(), epd_height(), fb) >> 4) * 17u;
+static EpdRect glass_rect(void) { return (EpdRect){18,88,648,168}; }
+enum { KEY_SIDE=2*UI_QUICK_RADIUS, KEY_BYTES=KEY_SIDE*KEY_SIDE/2 };
+static uint8_t *s_key_pixels, *s_key_frame;
+static int s_key_rotation;
+static const ui_icon_t s_icons[]={UI_ICON_WIFI,UI_ICON_BLUETOOTH,UI_ICON_REFRESH_CW,UI_ICON_LOCK};
+static EpdRect key_rect(int button) {
+    return (EpdRect){center_x(button)-UI_QUICK_RADIUS,UI_QUICK_CIRCLE_Y-UI_QUICK_RADIUS,KEY_SIDE,KEY_SIDE};
 }
-
-static bool layer_pixel(int x, int y, int width) {
-    const int r = 56;
-    if (y < UI_QUICK_HEIGHT - r || (x >= r && x < width - r)) return true;
-    int dx = x < r ? x - r : x - (width - r - 1);
-    int dy = y - (UI_QUICK_HEIGHT - r - 1);
-    return dx * dx + dy * dy < r * r;
+void ui_quick_menu_end(void) {
+    heap_caps_free(s_key_pixels);s_key_pixels=NULL;s_key_frame=NULL;
 }
-
-// 44px锁形沿用细线几何，圆角锁体与上半圆锁梁；不引入生成图标资产。
-// A 44px lock follows the thin-line geometry, with a rounded body and arched shackle; no new generated icon asset is needed.
-static void lock_icon(uint8_t *fb, int cx, int cy) {
-    for (int stroke = 0; stroke < 3; ++stroke) {
-        ui_draw_round_rect(fb, (EpdRect){cx - 14 + stroke, cy - 1 + stroke,
-                                      28 - stroke * 2, 23 - stroke * 2}, 4 - stroke, UI_GRAY_BLACK);
-        int radius = 9 - stroke;
-        for (int x = -radius; x <= radius; ++x) {
-            int y = 0;
-            while ((y + 1) * (y + 1) + x * x <= radius * radius) ++y;
-            epd_draw_pixel(cx + x, cy - 10 - y, UI_GRAY_BLACK, fb);
-            if (abs(x) == radius) epd_draw_line(cx + x, cy - 10, cx + x, cy - 1, UI_GRAY_BLACK, fb);
+static void draw_solid_key(uint8_t *fb,int button) {
+    int cx=center_x(button);
+    epd_fill_circle(cx,UI_QUICK_CIRCLE_Y,UI_QUICK_RADIUS-1,UI_GRAY_WHITE,fb);
+    epd_draw_circle(cx,UI_QUICK_CIRCLE_Y,UI_QUICK_RADIUS-1,0x60,fb);
+    epd_draw_circle(cx,UI_QUICK_CIRCLE_Y,UI_QUICK_RADIUS-2,0x60,fb);
+}
+static void draw_badge(uint8_t *fb,int button,bool active) {
+    if(button>1||!active)return;
+    int cx=center_x(button);
+    epd_fill_circle(cx+30,UI_QUICK_CIRCLE_Y-30,5,UI_GRAY_WHITE,fb);
+    epd_draw_circle(cx+30,UI_QUICK_CIRCLE_Y-30,5,0x50,fb);
+}
+bool ui_quick_menu_draw_button(uint8_t *fb,int button,bool active,bool pressed,EpdRect *dirty) {
+    if(!fb||!dirty||button<0||button>=4||epd_rotated_display_width()<UI_LOCK_WIDTH||epd_rotated_display_height()<UI_QUICK_HEIGHT)return false;
+    EpdRect r=key_rect(button);
+    if(s_key_pixels&&s_key_frame==fb&&s_key_rotation==epd_get_rotation()) {
+        const uint8_t *pixels=s_key_pixels+button*KEY_BYTES;
+        for(int y=0;y<r.height;++y)for(int x=0;x<r.width;++x){
+            size_t at=(size_t)y*r.width+x;
+            epd_draw_pixel(r.x+x,r.y+y,(uint8_t)(((pixels[at/2]>>((at&1)*4))&15)<<4),fb);
         }
+    } else {
+        // 内存不足时圆内实心回退，不重算玻璃，也不在圆外刷白方框。
+        // Low memory uses a solid circular fallback, never reblurring or whitening a square around it.
+        draw_solid_key(fb,button);
+        ui_draw_icon(fb,center_x(button),UI_QUICK_CIRCLE_Y,44,s_icons[button],UI_GRAY_BLACK);
     }
-    epd_fill_rect((EpdRect){cx - 1, cy + 8, 3, 7}, UI_GRAY_BLACK, fb);
+    draw_badge(fb,button,active);
+    if(pressed){
+        epd_draw_circle(center_x(button),UI_QUICK_CIRCLE_Y,UI_QUICK_RADIUS-7,UI_GRAY_BLACK,fb);
+        epd_draw_circle(center_x(button),UI_QUICK_CIRCLE_Y,UI_QUICK_RADIUS-8,UI_GRAY_BLACK,fb);
+    }
+    *dirty=r;return true;
+}
+void ui_quick_menu_draw_status(uint8_t *fb) {
+    ui_fill_rect_fast((EpdRect){0,0,epd_rotated_display_width(),76},UI_GRAY_WHITE,fb);
+    ui_nav_status(fb);
 }
 
-void ui_quick_menu_draw(uint8_t *fb, bool wifi, bool bluetooth) {
-    if (!fb) return;
-    const int width = epd_rotated_display_width();
-    const int height = epd_rotated_display_height();
-    // 每个像素只采一次原图，直接合成灰阶，不让主页快刷模式把菜单变成点阵。
-    // Sample each underlay pixel once and compose grays directly, independently of fast main-page rendering.
-    for (int y = 0; y < UI_QUICK_HEIGHT && y < height; ++y) for (int x = 0; x < width; ++x) {
-        if (!layer_pixel(x, y, width)) continue;
-        unsigned tint = 238;
-        for (int i = 0; i < 4; ++i) {
-            int dx = x - center_x(i), dy = y - UI_QUICK_CIRCLE_Y;
-            if (dx * dx + dy * dy <= UI_QUICK_RADIUS * UI_QUICK_RADIUS) {
-                tint = (i == 0 && wifi) || (i == 1 && bluetooth) ? 176 : 244;
-                break;
+// 暂存这条带的原画面，让每枚圆键都从清晰底图折射，不把外层玻璃再模糊一次。
+// Snapshot the original strip so each key refracts sharp art rather than reblurring the outer glass.
+static uint8_t *save_underlay(const uint8_t *fb) {
+    EpdRect r=glass_rect();
+    size_t count=(size_t)UI_LOCK_WIDTH*r.height;
+    uint8_t *saved=heap_caps_malloc((count+1)/2,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(!saved)return NULL;
+    for(int y=0;y<r.height;++y)for(int x=0;x<UI_LOCK_WIDTH;++x){
+        size_t at=(size_t)y*UI_LOCK_WIDTH+x;
+        uint8_t v=ui_read_pixel(fb,x,r.y+y);
+        if(at&1)saved[at/2]|=(uint8_t)(v<<4);else saved[at/2]=v;
+    }
+    return saved;
+}
+static void restore_circle(uint8_t *fb,const uint8_t *saved,int cx) {
+    const int cy=UI_QUICK_CIRCLE_Y,r=UI_QUICK_RADIUS;
+    for(int y=cy-r;y<cy+r;++y)for(int x=cx-r;x<cx+r;++x){
+        // 与玻璃圆角的半像素距离一致，圆外仍保留面板，不留下方形补丁。
+        // Match the glass circle's half-pixel boundary, retaining the outer panel without square patches.
+        int dx=2*(x-cx)+1,dy=2*(y-cy)+1;
+        if(dx*dx+dy*dy>4*r*r)continue;
+        size_t at=(size_t)(y-glass_rect().y)*UI_LOCK_WIDTH+x;
+        epd_draw_pixel(x,y,(uint8_t)(((saved[at/2]>>((at&1)*4))&15)<<4),fb);
+    }
+}
+void ui_quick_menu_draw(uint8_t *fb,bool wifi,bool bluetooth) {
+    ui_quick_menu_end();
+    if(!fb||epd_rotated_display_width()<UI_LOCK_WIDTH||epd_rotated_display_height()<UI_QUICK_HEIGHT)return;
+    EpdRect panel=glass_rect();
+    uint8_t *underlay=save_underlay(fb);
+    if(!underlay||!ui_glass_panel(fb,panel,56,25,160)){
+        ui_fill_round_rect(fb,panel,56,0xe0);
+        ui_draw_control_frame(fb,panel,56,0x60);
+    }
+    for(int i=0;i<4;++i){
+        int cx=center_x(i);
+        if(underlay)restore_circle(fb,underlay,cx);
+        EpdRect key=key_rect(i);
+        if(!underlay||!ui_glass_panel(fb,key,UI_QUICK_RADIUS,25,160)){
+            draw_solid_key(fb,i);
+        }
+        ui_draw_icon(fb,cx,UI_QUICK_CIRCLE_Y,44,s_icons[i],UI_GRAY_BLACK);
+    }
+    heap_caps_free(underlay);
+    // 玻璃工作区已释放，再保存四圆键，峰值不叠加；不包含可变化的状态点和按压环。
+    // Release glass workspaces before saving four keys, excluding mutable badges and press rings from the baseline.
+    s_key_pixels=heap_caps_malloc(4*KEY_BYTES,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if(s_key_pixels){
+        s_key_frame=fb;s_key_rotation=epd_get_rotation();
+        for(int i=0;i<4;++i){
+            EpdRect r=key_rect(i);uint8_t *pixels=s_key_pixels+i*KEY_BYTES;
+            for(int y=0;y<r.height;++y)for(int x=0;x<r.width;++x){
+                size_t at=(size_t)y*r.width+x;uint8_t v=ui_read_pixel(fb,r.x+x,r.y+y);
+                if(at&1)pixels[at/2]|=(uint8_t)(v<<4);else pixels[at/2]=v;
             }
         }
-        uint8_t tone = (uint8_t)((pixel(fb, x, y) * 40u + tint * 216u + 128u) / 256u);
-        epd_draw_pixel(x, y, tone, fb);
     }
-    // 状态栏留清晰白底，沿用系统时间/签名/电池；四图标与底栏共用Lucide细线44px。
-    // Keep the system time/signature/battery legible on white; share navigation's 44px Lucide line icons.
-    epd_fill_rect((EpdRect){0, 0, width, 76}, UI_GRAY_WHITE, fb);
-    ui_nav_status(fb);
-    static const ui_icon_t icons[] = {UI_ICON_WIFI, UI_ICON_BLUETOOTH, UI_ICON_REFRESH_CW};
-    for (int i = 0; i < 4; ++i) {
-        int cx = center_x(i);
-        epd_draw_circle(cx, UI_QUICK_CIRCLE_Y, UI_QUICK_RADIUS, 0x38, fb);
-        epd_draw_circle(cx, UI_QUICK_CIRCLE_Y, UI_QUICK_RADIUS - 1, 0x38, fb);
-        if (i < 3) ui_draw_icon(fb, cx, UI_QUICK_CIRCLE_Y, 44, icons[i], UI_GRAY_BLACK);
-        else lock_icon(fb, cx, UI_QUICK_CIRCLE_Y);
-        if ((i == 0 && wifi) || (i == 1 && bluetooth)) {
-            epd_fill_circle(cx + 30, UI_QUICK_CIRCLE_Y - 30, 5, UI_GRAY_WHITE, fb);
-            epd_draw_circle(cx + 30, UI_QUICK_CIRCLE_Y - 30, 5, 0x50, fb);
-        }
-    }
-    ui_fill_round_rect(fb, (EpdRect){width / 2 - 26, 240, 52, 6}, 3, 0x70);
-    // 只画遮罩内的双像素轮廓，顶部直角、底部圆角，不越过下层边界。
-    // Draw a two-pixel outline within the mask: square top, rounded bottom, no underlay leakage.
-    for (int y = 0; y < UI_QUICK_HEIGHT && y < height; ++y) for (int x = 0; x < width; ++x) {
-        if (layer_pixel(x, y, width) && (x < 2 || x >= width - 2 || y < 2 ||
-            y >= UI_QUICK_HEIGHT - 2 || !layer_pixel(x - 2, y, width) ||
-            !layer_pixel(x + 2, y, width) || !layer_pixel(x, y + 2, width)))
-            epd_draw_pixel(x, y, 0x38, fb);
-    }
+    draw_badge(fb,0,wifi);draw_badge(fb,1,bluetooth);
+    ui_fill_round_rect(fb,(EpdRect){UI_LOCK_WIDTH/2-26,240,52,6},3,0x70);
+    // 状态栏保持清晰；其余底图直接透出，不给整个页面加模糊或白色蒙层。
+    // Keep status crisp and the rest of the page exposed, without a full-page blur or white veil.
+    ui_quick_menu_draw_status(fb);
 }

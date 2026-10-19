@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "version": "0.3.3-rc90",
+  "version": "0.3.3-rc97",
   "project": "Read_Pico",
   "board": "RDP-G01-W",
   "layout": "pico-dual-4m-v1",
   "minimum_base_version": "0.3.3-rc72",
-  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc90.bin",
-  "size": 3950864,
-  "sha256": "805c1dac67d15fc413b1f6425e66d4ac6f18cfb6792b2e85bb5b6f0099222809",
-  "notes": "1. kiikoread 品牌与全新官网\n2. 资料卡简化、姓名排版优化\n3. 水波纹主页完整灰阶\n4. TF 卡兼容、缺失字体闪屏修复\n5. 拼贴及密码锁屏、列表书架、首行缩进微调\n6. 主站联网升级，保留 GitHub 更新途径"
+  "url": "https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc97.bin",
+  "size": 4173744,
+  "sha256": "163ef3e8b4138fc6b9641aef2f84b112b5b025cf0929a1554cbaa04bde785fca",
+  "notes": "1. 锁屏设置读取失败时直接进入系统，不拦截启动\n2. 修复字间距反复回跳至-11px，点按和拖动均支持±15px\n3. 修复段距按钮及目录章节名粗细不一、抗锯齿问题"
 }

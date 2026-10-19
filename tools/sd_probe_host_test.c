@@ -17,6 +17,11 @@ static bool detect_failure;
 static int mount_calls, unmount_calls, test_fail_above_khz;
 static esp_err_t test_mount_error = ESP_ERR_TIMEOUT;
 static int clock_history[64], delays;
+static uint64_t test_total=1024*512,test_free=768*512;
+static esp_err_t test_info_error=ESP_OK;
+static unsigned space_calls, invalidations;
+static bool fat_locked;
+
 static sdmmc_card_t test_card = {
     .cid.name = "TEST64G", .csd.capacity = 1024, .csd.sector_size = 512,
 };
@@ -25,6 +30,12 @@ static sdmmc_card_t test_card = {
 #include "../components/read_pico/read_pico_sd.c"
 #undef mkdir
 
+static FATFS test_fat={.free_clst=1};
+BYTE ff_diskio_get_pdrv_card(const sdmmc_card_t *c){assert(c==&test_card);return 0;}
+int f_opendir(FF_DIR *root,const char *path){assert(!strcmp(path,"0:"));root->obj.fs=&test_fat;return FR_OK;}
+int f_closedir(FF_DIR *root){assert(root->obj.fs==&test_fat);return FR_OK;}
+int ff_mutex_take(int drive){assert(drive==0&&!fat_locked);fat_locked=true;return 1;}
+void ff_mutex_give(int drive){assert(drive==0&&fat_locked&&test_fat.free_clst==UINT32_MAX);fat_locked=false;++invalidations;}
 esp_err_t test_host_init(void){return ESP_OK;}
 esp_err_t test_host_deinit(void){return ESP_OK;}
 esp_err_t sdmmc_host_init_slot(int slot,const sdmmc_slot_config_t *config){(void)slot;(void)config;return ESP_OK;}
@@ -70,9 +81,13 @@ esp_err_t esp_vfs_fat_sdcard_format(const char* path, sdmmc_card_t* mounted) {
 }
 esp_err_t esp_vfs_fat_info(const char* path, uint64_t* total, uint64_t* free_bytes) {
     (void)path;
-    *total = 1024 * 512;
-    *free_bytes = 768 * 512;
-    return ESP_OK;
+    ++space_calls;
+    assert(!fat_locked);
+    // 模拟真实 f_getfree：作废 FSInfo 后扫描，后续直接复用随写入变化的计数。
+    // Like f_getfree, unknown FSInfo scans once; later counts follow allocation changes.
+    if (test_fat.free_clst==UINT32_MAX) test_fat.free_clst=123;
+    *total=test_total;*free_bytes=test_free;
+    return test_info_error;
 }
 
 int main(void) {
@@ -146,6 +161,29 @@ int main(void) {
     assert(read_pico_sd_get_info(&info)==ESP_OK && info.mounted && info.present);
     detect_failure=false;
     assert(read_pico_sd_get_info(&info)==ESP_OK && info.mounted);
+    assert(info.space_valid && info.filesystem_bytes==test_total && info.free_bytes==test_free);
+    assert(invalidations>0);
+    // 多分区卡只统计挂载分区；256GiB卡不能截断，挂载状态与统计错误独立。
+    test_total=128ull*1024*1024*1024; test_free=100ull*1024*1024*1024;
+    unsigned before_space=space_calls;
+    assert(read_pico_sd_refresh_space()==ESP_OK && space_calls==before_space+1);
+    assert(read_pico_sd_get_info(&info)==ESP_OK && info.capacity_bytes==256ull*1024*1024*1024 &&
+           info.filesystem_bytes==test_total && info.filesystem_bytes-info.free_bytes==28ull*1024*1024*1024);
+    test_free-=512*1024;
+    assert(read_pico_sd_refresh_space()==ESP_OK);
+    assert(read_pico_sd_get_info(&info)==ESP_OK&&info.free_bytes==test_free);
+    test_info_error=ESP_FAIL;
+    assert(read_pico_sd_refresh_space()==ESP_FAIL);
+    assert(read_pico_sd_get_info(&info)==ESP_OK&&info.mounted&&!info.space_valid&&info.space_error==ESP_FAIL&&info.free_bytes==0);
+    test_info_error=ESP_OK;test_free=test_total+1;
+    assert(read_pico_sd_refresh_space()==ESP_FAIL);
+    assert(read_pico_sd_get_info(&info)==ESP_OK&&!info.space_valid);
+    test_free=0;
+    assert(read_pico_sd_refresh_space()==ESP_OK);
+    assert(read_pico_sd_get_info(&info)==ESP_OK&&info.space_valid&&info.free_bytes==0);
+    test_present=false;before_space=space_calls;
+    assert(read_pico_sd_refresh_space()==ESP_ERR_NOT_FOUND&&space_calls==before_space);
+    assert(read_pico_sd_get_info(&info)==ESP_ERR_NOT_FOUND&&!info.mounted&&!info.space_valid);
     puts("sd_probe: empty boot/insertion, checked CD, bounded settle/fallback, CMD6 busy, OOM, no format suggestion, 256 GiB passed");
     return 0;
 }

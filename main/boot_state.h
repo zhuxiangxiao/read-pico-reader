@@ -19,6 +19,11 @@ void pico_boot_init(bool abnormal_reset);
 /// 首个完整界面输出成功后标记启动完成。/ Mark startup complete after a successful first full presentation.
 void pico_boot_ready(void);
 bool pico_boot_recovery(void);
+/// 只观察恢复检查点，不消费也不改写Flash。/ Inspect the resume checkpoint without consuming it or writing Flash.
+bool pico_boot_has_resume(void);
+/// 仅刚刚保存成功的实际锁屏可用作下次深睡启动参考。/ Only a successfully persisted actual lock frame may seed the next deep-sleep boot reference.
+esp_err_t pico_boot_mark_frame_cached(void);
+bool pico_boot_resume_frame_cached(void);
 /// 自动封面/元数据不得重试上次中断的图书；显式开书仍允许。/ Automatic artwork/metadata must not retry interrupted books; explicit opening remains allowed.
 bool pico_boot_asset_allowed(const char *path);
 /// 开书开始先持久化，失败不得进入解析；结束清除事务。/ Persist before parsing; failure prevents admission. Clear the transaction on completion.

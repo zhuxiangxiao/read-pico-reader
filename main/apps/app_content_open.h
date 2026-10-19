@@ -23,3 +23,5 @@ bool app_book_reader_body_visible(void);
 /// 模式/对比度变化时释放旧格式封面；绘制前由主循环一次调用。/ Drop obsolete cover formats once on mode/contrast changes, before drawing.
 void app_book_cover_mode_changed(void);
 void app_home_cover_mode_changed(void);
+/// 开书前释放可重建的表盘底图，让解析器使用这部分 PSRAM。/ Release rebuildable clock bases before opening a book so parsing can use that PSRAM.
+void app_home_release_clock_cache(void);

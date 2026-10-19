@@ -110,6 +110,7 @@ typedef struct {
     pmu_event_t event;
     pmu_config_t config;
     uint32_t unix_sec;
+    uint16_t unix_millis; ///< TIME_GET 毫秒部分 / Millisecond fraction
     uint8_t time_synced;
     uint8_t alarm_mode;
     uint32_t alarm_remain;

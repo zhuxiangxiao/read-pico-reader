@@ -40,6 +40,19 @@ typedef struct {
     uint32_t day[30];
     uint32_t seconds[30];
 } ticket_heat_t;
+#define TICKET_MONTH_MAGIC UINT32_C(0x52504832)
+typedef struct { uint32_t magic, day[32], seconds[32]; } ticket_month_t;
+static void month_load(nvs_handle_t h, ticket_month_t *out) {
+    size_t len = sizeof(*out);
+    if (nvs_get_blob(h, "heat32", out, &len) == ESP_OK && len == sizeof(*out) && out->magic == TICKET_MONTH_MAGIC) return;
+    memset(out, 0, sizeof(*out)); out->magic = TICKET_MONTH_MAGIC;
+    ticket_heat_t old = {0}; len = sizeof(old);
+    if (nvs_get_blob(h, "heatmap", &old, &len) != ESP_OK || len != sizeof(old) || old.magic != TICKET_HEAT_MAGIC) return;
+    for (unsigned i = 0; i < 30; ++i) if (old.day[i] && old.day[i] % 30 == i) {
+        unsigned slot = old.day[i] % 32;
+        if (out->day[slot] < old.day[i]) { out->day[slot] = old.day[i]; out->seconds[slot] = old.seconds[i]; }
+    }
+}
 static uint32_t local_day(void) {
     time_t now = time(NULL);
     if (now < 1704067200) {
@@ -72,6 +85,13 @@ esp_err_t book_ticket_record(uint32_t seconds, uint32_t turns) {
     if (err != ESP_OK) return err;
     err = nvs_set_blob(h, "stats", &stats, sizeof(stats));
     if (err == ESP_OK && day && seconds) {
+        // 先迁移旧环，再同时维护两个环，保留降级兼容。/ Migrate before updating both rings, preserving downgrade compatibility.
+        ticket_month_t month; month_load(h, &month);
+        unsigned mslot = day % 32;
+        if (month.day[mslot] != day) { month.day[mslot] = day; month.seconds[mslot] = 0; }
+        uint32_t previous = month.seconds[mslot];
+        month.seconds[mslot] = UINT32_MAX - previous < seconds ? UINT32_MAX : previous + seconds;
+        err = nvs_set_blob(h, "heat32", &month, sizeof(month));
         ticket_heat_t heat = {0};
         size_t len = sizeof(heat);
         if (nvs_get_blob(h, "heatmap", &heat, &len) != ESP_OK ||
@@ -83,7 +103,7 @@ esp_err_t book_ticket_record(uint32_t seconds, uint32_t turns) {
         if (heat.day[slot] != day) { heat.day[slot] = day; heat.seconds[slot] = 0; }
         uint32_t old = heat.seconds[slot];
         heat.seconds[slot] = UINT32_MAX - old < seconds ? UINT32_MAX : old + seconds;
-        err = nvs_set_blob(h, "heatmap", &heat, sizeof(heat));
+        if (err == ESP_OK) err = nvs_set_blob(h, "heatmap", &heat, sizeof(heat));
     }
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
@@ -108,6 +128,24 @@ bool book_ticket_recent_days(uint32_t seconds[30]) {
     }
     return true;
 }
+bool book_ticket_month_days(int year, int month, uint32_t seconds[31]) {
+    if (!seconds) return false;
+    memset(seconds, 0, 31*sizeof(*seconds));
+    uint32_t today = local_day();
+    if (!today || year < 2024 || year > 9999 || month < 1 || month > 12) return false;
+    time_t timestamp = (time_t)today * 86400;
+    struct tm date = {0}; gmtime_r(&timestamp, &date);
+    if (date.tm_year+1900 != year || date.tm_mon+1 != month) return false;
+    nvs_handle_t h;
+    if (nvs_open("rp_ticket", NVS_READONLY, &h) != ESP_OK) return true;
+    ticket_month_t heat; month_load(h, &heat); nvs_close(h);
+    uint32_t first = today-(date.tm_mday-1);
+    for (int i=0; i<date.tm_mday; ++i) {
+        uint32_t day=first+i; unsigned slot=day%32;
+        if (heat.day[slot]==day) seconds[i]=heat.seconds[slot];
+    }
+    return true;
+}
 static void text_fit(char *text, int px, int width) {
     while (*text && ui_text_fixed_width_px(ui_text_effective_px(px), text) > width) {
         size_t n = strlen(text) - 1;
@@ -129,7 +167,7 @@ static uint8_t *cover_load(const char *path, const char *title, const char *auth
 }
 static void cover_background_draw(uint8_t *fb, const uint8_t *gray) {
     if (!gray) {
-        epd_fill_rect((EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT}, 0xb0, fb);
+        ui_fill_rect_fast((EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT}, 0xb0, fb);
         return;
     }
     int crop_x = 0, crop_y = 0, crop_w = BOOK_COVER_W, crop_h = BOOK_COVER_H;
@@ -162,24 +200,24 @@ static void ticket_paper_draw(uint8_t *fb) {
     for (int x = left; x < right; ++x) {
         int cut = notch_depth(x);
         int y0 = top + cut, y1 = bottom - cut;
-        epd_fill_rect((EpdRect){x, y0, 1, y1 - y0}, UI_GRAY_WHITE, fb);
+        ui_fill_rect_fast((EpdRect){x, y0, 1, y1 - y0}, UI_GRAY_WHITE, fb);
         epd_draw_pixel(x, y0, UI_GRAY_BLACK, fb);
         epd_draw_pixel(x, y1 - 1, UI_GRAY_BLACK, fb);
     }
-    epd_fill_rect((EpdRect){left, top + 20, 1, bottom - top - 40}, UI_GRAY_BLACK, fb);
-    epd_fill_rect((EpdRect){right - 1, top + 20, 1, bottom - top - 40}, UI_GRAY_BLACK, fb);
+    ui_fill_rect_fast((EpdRect){left, top + 20, 1, bottom - top - 40}, UI_GRAY_BLACK, fb);
+    ui_fill_rect_fast((EpdRect){right - 1, top + 20, 1, bottom - top - 40}, UI_GRAY_BLACK, fb);
 }
 static void ticket_shadow_draw(uint8_t *fb) {
     const int left = 48, right = 636, top = 58, bottom = 1158;
     for (int x = left; x < right; ++x) {
         int cut = notch_depth(x);
         int y0 = top + cut + 8, y1 = bottom - cut + 8;
-        epd_fill_rect((EpdRect){x + 5, y0, 1, y1 - y0}, 0x80, fb);
+        ui_fill_rect_fast((EpdRect){x + 5, y0, 1, y1 - y0}, 0x80, fb);
     }
 }
 static void cover_draw(uint8_t *fb, const uint8_t *gray, const char *title) {
     EpdRect box = {216, 378, 252, 344};
-    epd_fill_rect(box, UI_GRAY_LIGHT, fb);
+    ui_fill_rect_fast(box, UI_GRAY_LIGHT, fb);
     if (gray) {
         for (int y = 0; y < box.height; ++y)
             for (int x = 0; x < box.width; ++x) {
@@ -196,6 +234,34 @@ static void cover_draw(uint8_t *fb, const uint8_t *gray, const char *title) {
                    short_title, EPD_DRAW_ALIGN_CENTER, false);
     }
     ui_draw_round_rect(fb, box, 0, UI_GRAY_BLACK);
+}
+// Preserve exact counters, shrinking only when needed. Two lines fit long statistics.
+static void ticket_stat(uint8_t *fb, int y, int height, int px, const char *text) {
+    px = ui_text_effective_px(px);
+    if (px > height) px = height;
+    char line[128]; snprintf(line, sizeof(line), "%s", text);
+    while (px > 18 && ui_text_fixed_width_px(px, line) > 520) --px;
+    if (ui_text_fixed_width_px(px, line) <= 520) {
+        ui_text_fixed(fb, 82, y, px, line, EPD_DRAW_ALIGN_LEFT, false);
+        return;
+    }
+    char *sep = strstr(line, "  ·  ");
+    if (sep && height >= 44) {
+        *sep = 0; char *tail = sep + strlen("  ·  ");
+        text_fit(line, 18, 520); text_fit(tail, 18, 520);
+        ui_text_fixed(fb, 82, y, 18, line, EPD_DRAW_ALIGN_LEFT, false);
+        ui_text_fixed(fb, 82, y + height / 2, 18, tail, EPD_DRAW_ALIGN_LEFT, false);
+    } else {
+        text_fit(line, px, 520);
+        ui_text_fixed(fb, 82, y, px, line, EPD_DRAW_ALIGN_LEFT, false);
+    }
+}
+static void ticket_heading(uint8_t *fb,int top,int height,int px,char *text) {
+    // 锁屏入口已切系统字体；标题按原生轮廓输出，独立强制AA，测量与绘制用同一字库。
+    // Lock entry selects the system face; rasterize native outlines with explicit AA and measure using the same face.
+    px=ui_text_effective_px(px);if(px>height-2)px=height-2;
+    px=ui_text_title_fit(text,px,520,text);
+    ui_text_title_vc(fb,82,top+height/2,px,text,text,EPD_DRAW_ALIGN_LEFT);
 }
 bool book_ticket_draw(uint8_t *fb, bool reader_background) {
     (void)reader_background;
@@ -221,9 +287,8 @@ bool book_ticket_draw(uint8_t *fb, bool reader_background) {
     ticket_paper_draw(fb);
     ui_text(fb, 82, 98, 28, "kiikoread  /  阅读票根", EPD_DRAW_ALIGN_LEFT, false);
     ui_hairline(fb, 156, 82, 520, UI_GRAY_BLACK);
-    text_fit(title, 50, 520);
-    ui_text(fb, 82, 202, 50, title, EPD_DRAW_ALIGN_LEFT, false);
-    if (author[0]) { text_fit(author, 28, 520); ui_text(fb, 82, 274, 28, author, EPD_DRAW_ALIGN_LEFT, false); }
+    ticket_heading(fb,202,64,50,title);
+    if (author[0]) ticket_heading(fb,274,44,28,author);
     cover_draw(fb, gray, title);
     free(gray);
     ui_hairline(fb, 768, 82, 520, UI_GRAY_BLACK);
@@ -231,19 +296,19 @@ bool book_ticket_draw(uint8_t *fb, bool reader_background) {
     if (progress_valid) snprintf(line, sizeof(line), "已读 %u%%  ·  第 %u 章", progress.pct,
                                  (unsigned)progress.chapter + 1);
     else snprintf(line, sizeof(line), "已读 —  ·  章节 —");
-    ui_text(fb, 82, 802, 34, line, EPD_DRAW_ALIGN_LEFT, false);
+    ticket_stat(fb, 802, 54, 34, line);
     EpdRect track = {82, 868, 520, 10};
-    epd_fill_rect(track, UI_GRAY_LIGHT, fb);
+    ui_fill_rect_fast(track, UI_GRAY_LIGHT, fb);
     track.width = progress_valid ? track.width * progress.pct / 100 : 0;
-    if (track.width) epd_fill_rect(track, UI_GRAY_BLACK, fb);
+    if (track.width) ui_fill_rect_fast(track, UI_GRAY_BLACK, fb);
     if (day && stats.day == day) snprintf(line, sizeof(line), "今日阅读 %llu 分钟  ·  翻页 %u 次",
         (unsigned long long)(stats.today_seconds / 60), (unsigned)stats.today_turns);
     else snprintf(line, sizeof(line), "今日阅读 —  ·  日期未同步");
-    ui_text(fb, 82, 914, 28, line, EPD_DRAW_ALIGN_LEFT, false);
+    ticket_stat(fb, 914, 48, 28, line);
     snprintf(line, sizeof(line), "累计阅读 %llu 小时 %llu 分钟  ·  翻页 %u 次",
              (unsigned long long)(stats.total_seconds / 3600),
              (unsigned long long)((stats.total_seconds / 60) % 60), (unsigned)stats.total_turns);
-    ui_text(fb, 82, 969, 28, line, EPD_DRAW_ALIGN_LEFT, false);
+    ticket_stat(fb, 969, 74, 28, line);
     ui_hairline(fb, 1050, 82, 520, UI_GRAY_BLACK);
     ui_text(fb, 82, 1080, 26, "在每一页里，留下时间的凭证", EPD_DRAW_ALIGN_LEFT, false);
     return true;

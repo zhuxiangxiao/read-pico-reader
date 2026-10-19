@@ -91,6 +91,8 @@ def check(folder: Path) -> None:
         assert part.get("offset") == start, f"wrong offset for {name}"
         data = (folder / name).read_bytes()
         assert data and len(data) <= end - start, f"invalid size for {name}"
+        if 'size' in part or 'sha256' in part:
+            assert part.get('size') == len(data) and part.get('sha256') == hashlib.sha256(data).hexdigest(), f"manifest integrity mismatch: {name}"
         print(f"{name}: {len(data)} bytes, SHA256 {hashlib.sha256(data).hexdigest()}")
     assert seen == set(EXPECTED)
     # 升级兼容性门禁：实际双槽分区、应用描述、基础包能力及升级 SHA 必须一致。

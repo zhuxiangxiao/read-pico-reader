@@ -6,6 +6,9 @@
  * 冻结：固件和电脑绝不同时挂载 TF 卡；主机弹出时也不自动挂载到第二路径；不自动格式化。
  * Frozen: Firmware and host never mount SD together, including host eject; never auto-format.
  */
+#include "ui_avatar.h"
+#include "book_cover_jobs.h"
+#include "book_lock_collage.h"
 #include "usb_storage.h"
 #include <stdlib.h>
 #include "driver/sdmmc_host.h"
@@ -66,6 +69,8 @@ static void restore_local(void) {
 }
 
 esp_err_t usb_storage_start(void) {
+    book_lock_collage_invalidate();
+    if (!(book_cover_jobs_quiesce(2000) && ui_avatar_quiesce(2000))) return ESP_ERR_NOT_FINISHED;
     if (s_cleanup_pending) return ESP_ERR_INVALID_STATE;
     if (s_active) return ESP_OK;
     read_pico_sd_info_t info = {0};

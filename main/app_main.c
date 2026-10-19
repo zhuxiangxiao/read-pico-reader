@@ -18,6 +18,9 @@
 #include "app_loop.h"
 #include "app_content_open.h"
 #include "boot_state.h"
+#include "lock_screen.h"
+#include "lock_pin.h"
+#include "ttf_font.h"
 #include "book_store.h"
 #include "esp_system.h"
 #include "read_pico_sd.h"
@@ -33,6 +36,7 @@
 #include "pmu_selftest.h"
 #include "soc/rtc_cntl_reg.h"
 #include "read_pico_board.h"
+#include "read_pico_crashlog.h"
 #include "read_pico_init.h"
 #include "read_pico_pmu.h"
 #include "read_pico_pmu_protocol.h"
@@ -47,13 +51,17 @@
 static const char* TAG = "read_pico";
 extern const app_desc_t app_boot_recovery;
 
-// 主机上电会丢失系统时间；PMU 在主机断电后继续走时。先取实时值再恢复，
-// 不使用启动时缓存的快照，以免将已经经过的开机耗时丢掉。
+// 软复位保留有效的 S3 RTC；断电才用 PMU 的实时秒和毫秒恢复。
+// Retain a valid S3 RTC across soft reset; restore fresh PMU seconds and milliseconds after power loss.
 static void restore_time_from_pmu(void) {
+    struct timeval current;
+    if (gettimeofday(&current, NULL) == 0 && current.tv_sec >= 1704067200 &&
+        current.tv_sec <= 4102444799U) return;
     if (read_pico_pmu_cmd(PMU_CMD_TIME_GET, NULL, 0) != ESP_OK) return;
     const pmu_snapshot_t *pmu = read_pico_pmu_get();
-    if (!pmu || !pmu->time_synced || pmu->unix_sec < 1704067200 || pmu->unix_sec > 4102444799U) return;
-    struct timeval tv = {.tv_sec = (time_t)pmu->unix_sec, .tv_usec = 0};
+    if (!pmu || !pmu->time_ok || !pmu->time_synced || pmu->unix_millis >= 1000 ||
+        pmu->unix_sec < 1704067200 || pmu->unix_sec > 4102444799U) return;
+    struct timeval tv = {.tv_sec = (time_t)pmu->unix_sec, .tv_usec = pmu->unix_millis * 1000};
     if (settimeofday(&tv, NULL) == 0) ESP_LOGI(TAG, "system clock restored from PMU");
 }
 
@@ -93,6 +101,17 @@ static bool images_match_panel(void) {
     return false;
 }
 
+// 缓存验证失败时继续原开机路径，不假设未知屏幕已经全白。
+// A rejected cache keeps the original startup path; never assume an unknown panel is white.
+static bool restore_retained_lock(EpdiyHighlevelState *hl,uint8_t *framebuffer) {
+    read_pico_sd_info_t info;
+    for(unsigned wait=0;wait<150 && read_pico_sd_get_info(&info)==ESP_ERR_NOT_FINISHED;++wait)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    if(!lock_screen_restore(framebuffer))return false;
+    memcpy(hl->back_fb,framebuffer,(size_t)epd_width()*epd_height()/2);
+    return true;
+}
+
 void app_main(void) {
     // 共享 TF 卡期间复位后，先把内部 PHY 交回串口，再清理已用完的 BOOT 请求。
     // Reclaim Serial/JTAG after a reset during card sharing, then clear the served BOOT request.
@@ -102,28 +121,47 @@ void app_main(void) {
     const esp_reset_reason_t reset = esp_reset_reason();
     ESP_LOGI(TAG, "startup reset=%d stack=%u", (int)reset, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     app_settings_init();
+    // 在大缓冲和字体之前读取小型锁屏设置；读取失败不阻塞，之后的检查仍可重试。
+    // Read the tiny lock setting before large buffers/fonts; keep failures nonblocking and let subsequent checks retry.
+    (void)lock_pin_enabled();
     pico_boot_init(reset == ESP_RST_PANIC || reset == ESP_RST_INT_WDT ||
                    reset == ESP_RST_TASK_WDT || reset == ESP_RST_WDT);
 
     read_pico_handle_t hw;
     if (read_pico_init(&hw) != ESP_OK) return;
+    rp_boot_mark("hw");
     if (hw.pmu_ready) restore_time_from_pmu();
     const bool vcom_ok = resolve_vcom_at_boot();
+    rp_boot_mark("vcom");
     pmu_selftest_bind(hw.sensor);
+    app_sleep_bind(hw.touch, hw.sensor);
 
     if (!images_match_panel()) return;
 
     EpdiyHighlevelState hl = hw.hl;
     uint8_t* framebuffer = hw.framebuffer;
 
-    epd_poweron();
-    read_pico_i2c_census_take();
-    epd_clear();
-    epd_hl_set_all_white(&hl);
-    ui_draw_full_image(framebuffer, loading_4bpp_bin_start);
-    update_display_from_white(&hl);
-
-    app_font_activate_system();
+    // 深睡保留屏幕已有画面：验证缓存后同时恢复前后帧，省去清白和开机图两次推屏。
+    // Deep sleep retains the panel image: validate its cache and restore both references, skipping white erase and splash output.
+    const bool resuming = pico_boot_has_resume();
+    bool restored_lock = false;
+    if(resuming && vcom_ok && !lock_pin_enabled() && pico_boot_resume_frame_cached()) {
+        restored_lock=restore_retained_lock(&hl,framebuffer);
+    }
+    if(!restored_lock) {
+        epd_poweron();
+        if(!resuming)read_pico_i2c_census_take();
+        epd_clear();
+        epd_hl_set_all_white(&hl);
+        ui_draw_full_image(framebuffer,loading_4bpp_bin_start);
+        update_display_from_white(&hl);
+    }
+    rp_boot_mark("splash");
+    // 直接续读不先加载整份系统字体；密码验证仍先使用所选系统字体。
+    // Direct reader resume skips loading the whole system face first; PIN authentication still uses the selected UI face.
+    if(!resuming || lock_pin_enabled())app_font_activate_system();
+    else (void)ttf_font_open_builtin();
+    rp_boot_mark("font");
 
     if (!hw.touch_ready) {
         ESP_LOGE(TAG, "No touch controller, UI cannot run");
@@ -139,8 +177,9 @@ void app_main(void) {
     pico_ota_confirm_running();
 
     app_lock_boot_gate(&hl, hw.touch, hw.sensor);
+    rp_boot_mark("lock");
     const app_desc_t *first = app_home_page();
-    pico_resume_t resume;
+    pico_resume_t resume = {0};
     if (pico_boot_take_resume(&resume)) {
         if (!resume.reader) first = app_at(resume.tab);
         else {
@@ -162,6 +201,11 @@ void app_main(void) {
     }
     char interrupted[PICO_BOOT_PATH_MAX];
     if (pico_boot_interrupted_book(interrupted, sizeof(interrupted))) first = &app_boot_recovery;
+    if(resuming && !lock_pin_enabled()) {
+        if(first==app_at(1) && resume.reader)app_font_activate_reading();
+        else app_font_activate_system();
+    }
+    rp_boot_mark("resume");
     app_loop_run(&(app_loop_config_t){
         .hl = &hl,
         .fb = framebuffer,

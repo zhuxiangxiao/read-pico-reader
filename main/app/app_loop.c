@@ -10,13 +10,14 @@
  * the menu handle, on_exit/on_enter, present, lock, delayed SD font load.
  * Page state and refresh cadence stay in main/apps/; gesture recognition is shared.
  *
- * 冻结：主循环只产出手势、不解释含义；产品系统页接管三键，按用户要求
- * 左右返回、中键首页；阅读页保留翻页、页面设置和长按回书架。把手仍按下即触发。
- * 接管页可选长按键回调，保留按下行为；同键单指500ms仅触发一次，中断取消。
- * Frozen: Produce gestures without interpreting page actions. Product system pages
- * own Back/Home/Back keys; reading retains page turns, settings and hold-to-shelf.
- * Owners may opt into a single 500ms same-key hold callback after the press action; interruptions cancel it.
- * The menu handle still fires on press.
+ * 冻结（用户2026-10-16修订）：四个主页面左右键循环切换，中键长按全刷；书架中键短按切换左右键的分页控制。
+ * 主页面中键短按延后到抬手，长按不执行短按；离开主页面立即取消按住状态。
+ * 阅读和子页面沿用自己的映射与手势，把手按下即触发。
+ * Frozen (user revision 2026-10-16): main roots cycle via side keys; middle hold refreshes fully, and a shelf middle tap toggles paging control.
+ * Defer the root middle tap until release, suppress it after a hold, and cancel held input on root exit.
+ * Reader/subpages retain their mappings and gestures; the menu handle still fires on contact.
+ * 用户修订：四个主页面底栏作为统一导航路由在按下时报点即响应，模态和阅读手势保持原归属。
+ * User revision: root-tab routing commits on initial contact; modal controls and reader gestures retain their owners.
  * 用户修订：系统页面切换使用 GL16，不再每次 GC16 全刷；锁屏、手动强刷和周期清残影仍可全刷。
  * User revision: system page changes use GL16 instead of GC16; lock, manual refresh and periodic ghost cleanup may still use full refresh.
  * 用户修订：设置可选普通/快刷/水波纹，默认普通；普通保留原灰阶路线，快刷采用确认的黑白主页面和亚克力灰阶。用户反馈残影和黑带后，书架退出只同向擦白，主页水波纹改白底/24窄带且端点单向推动，中灰保留校准序列；五行横条局部移动、图标固定，没有异步补刷。
@@ -25,14 +26,19 @@
  * User revision: ordinary main screens also retain navigation and move only its marker locally; fast acrylic uses a regular one-pixel checkerboard in the same output as cached covers. Ordinary/water retain grays; initial entry and unlock still draw complete navigation.
  * 冻结：返回消费最近切页来源，恢复原页及菜单位置，不跳固定首页。
  * Frozen: Return consumes the latest page origin, restoring its page and menu position.
- * 用户采用顶部快捷层：仅顶部32px起手下滑72px才接管，覆盖时冻结页内输入/轮询，WiFi直接连接最近保存网络/再次断开，蓝牙切换开关，全刷和锁屏复用原路径。用户要求三个模式均真实灰阶并加深轮廓；关闭重绘当前页并局部整理，不修改底栏。
- * User adopts the top quick layer: capture only a 72px downward swipe starting within the top 32px; suspend page input/ticks while covered. WiFi connects saved credentials or disconnects on the next tap; Bluetooth toggles its setting. Reuse full refresh and lock. Per the user, all modes retain grays with clearer outlines. Closing redraws and locally settles the underlay, retaining navigation.
+ * 用户采用顶部快捷层：仅顶部32px起手下滑72px才接管，覆盖时冻结页内输入/轮询，WiFi直接连接最近保存网络/再次断开，蓝牙开启并异步连接最近成功的翻页器，全刷和锁屏复用原路径。用户要求三个模式均真实灰阶并加深轮廓；关闭重绘当前页并局部整理，不修改底栏。
+ * User adopts the top quick layer: capture only a 72px downward swipe starting within the top 32px; suspend page input/ticks while covered. WiFi connects saved credentials or disconnects on the next tap; Bluetooth enables and queues a connection to the most recently successful turner. Reuse full refresh and lock. Per the user, all modes retain grays with clearer outlines. Closing redraws and locally settles the underlay, retaining navigation.
+ * 用户修订：快捷层只在展开/收起重绘顶部；圆键按下立即局部DU反馈，状态变化不重排底页或生成玻璃。
+ * User revision: only opening/closing repaints the top; key presses receive immediate local DU feedback without underlay re-layout or glass regeneration.
  * 用户点击反馈：底栏及圆形返回键按下局部放大，释放复位；只暂存一个小控件，切页、全刷及锁屏丢弃缓存，不回放旧画面。
  * User click feedback: locally enlarge navigation/round backs on press and restore on release. Retain one small control only; navigation, full refresh and lock discard it without replaying old frames.
+ * 用户修订：确认主动锁屏后，拼贴样式先给局部圆锁反馈，再保存/等待阅读预渲染；自动休眠和直接关机/重启不加此反馈。
+ * User revision: acknowledge accepted manual collage locks before saves/reader joins; omit the badge for automatic sleep and direct shutdown/restart.
  */
 
 #include "app_loop.h"
 #include "auto_lock.h"
+#include "crash_note.h"
 
 #include <string.h>
 
@@ -50,20 +56,27 @@
 #include "freertos/task.h"
 #include "read_pico_airdrop.h"
 #include "read_pico_board.h"
+#include "read_pico_crashlog.h"
 #include "read_pico_pmu.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
 #include "settings.h"
 #include "sleep.h"
+#include "time_service.h"
+#include "ui_avatar.h"
+#include "book/book_cover_jobs.h"
+#include "book/book_lock_collage.h"
 #include "ttf_font.h"
 #include "app_font_context.h"
 #include "ui_kit.h"
 #include "ui_menu.h"
+#include "ui_nav.h"
 #include "ui_gesture.h"
 #include "ui_power_dialog.h"
 #include "ui_quick_menu.h"
 #include "ui_click_feedback.h"
 #include "usb_storage.h"
+#include "local_latency_probe.h"
 
 #define TAG "app_loop"
 
@@ -77,15 +90,23 @@
 
 static int64_t s_lock_ignore_until_ms;
 extern const app_desc_t app_transfer;
+extern const app_desc_t app_book;
 
 static const app_desc_t* s_presented_main;
 static ui_quick_menu_t s_quick;
 static unsigned s_quick_status;
+static int s_quick_pressed=-1;
+static void quick_reset(void) {
+    ui_quick_menu_reset(&s_quick);
+    ui_quick_menu_end();
+    s_quick_pressed=-1;
+}
+static bool s_nav_contact_down,s_nav_polled;
 // 锁屏占用整屏后旧主页面底栏不再是物理基准；解锁第一帧必须完整绘制。
 // A lock screen replaces the old navigation baseline; the first unlocked frame must render complete navigation.
 static void main_lock_boundary(void) {
     ui_click_feedback_reset();
-    ui_quick_menu_reset(&s_quick);
+    quick_reset();
     s_presented_main = NULL;
     display_main_transition_cancel();
 }
@@ -100,18 +121,69 @@ static unsigned quick_status(void) {
 // 同步输出完再接收下一条触摸，不安排旧层回放；错误时关闭层并可靠全刷当前页。
 // Complete presentation before accepting another contact, with no stale replay; close and full-refresh the current page on error.
 static void quick_present(app_ctx_t *ctx, const app_desc_t *current, bool full) {
+    EpdRect motion_area={0};
+    bool motion=ui_click_feedback_nav_finish(ctx->fb,&motion_area);
     ui_click_feedback_begin(ctx->fb);
     display_main_transition_cancel();
-    if (current->render) current->render(ctx, ctx->fb);
-    s_quick_status = quick_status();
-    if (s_quick.open) ui_quick_menu_draw(ctx->fb, s_quick_status & 1u, s_quick_status & 2u);
+    unsigned status=quick_status();
+    if(full&&s_quick.open){
+        // 已合成的页面直接全刷，只还原圆键按压，不重排底页或重算玻璃。
+        // Refresh the composed framebuffer directly, restoring only the pressed tile without underlay layout or glass regeneration.
+        for(int i=0;i<4;++i){
+            bool active=i<2&&(status&(1u<<i)),was_active=i<2&&(s_quick_status&(1u<<i));
+            if(i==s_quick_pressed||active!=was_active){
+                EpdRect dirty;(void)ui_quick_menu_draw_button(ctx->fb,i,active,false,&dirty);
+            }
+        }
+        if((status^s_quick_status)&6u)ui_quick_menu_draw_status(ctx->fb);
+    }else{
+        if (current->render) current->render(ctx, ctx->fb);
+        if(!s_quick.open)ui_quick_menu_end();
+        else ui_quick_menu_draw(ctx->fb,status&1u,status&2u);
+    }
+    s_quick_status=status;
+    s_quick_pressed=-1;
     enum EpdDrawError error = full ? update_display_full(ctx->hl)
         : update_display_area_full_with(ctx->hl, &E0470_WAVEFORM, MODE_GL16, ui_quick_menu_rect());
     guard_draw_result(ctx->hl, error);
+    if(motion&&!full&&error==EPD_DRAW_SUCCESS) {
+        error=update_display_area_diff_with(ctx->hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,motion_area);
+        guard_draw_result(ctx->hl,error);
+    }
     if (error != EPD_DRAW_SUCCESS) {
-        ui_quick_menu_reset(&s_quick);
+        quick_reset();
         app_present(ctx, current, APP_REDRAW_FULL);
     }
+}
+
+// 菜单打开期间只改圆键和必要的状态栏；按下不排字、不重画页面或重算玻璃。
+// While open, update only keys and the necessary status strip; pressing never shapes text, renders a page or regenerates glass.
+static void quick_buttons_present(app_ctx_t *ctx,const app_desc_t *current) {
+    if(!s_quick.open)return;
+    unsigned status=quick_status();
+    int pressed=ui_quick_menu_pressed(&s_quick);
+    enum EpdDrawError error=EPD_DRAW_SUCCESS;
+    for(int i=0;i<4;++i){
+        bool active=i<2&&(status&(1u<<i));
+        bool was_active=i<2&&(s_quick_status&(1u<<i));
+        if(active==was_active&&(pressed==i)==(s_quick_pressed==i))continue;
+        EpdRect dirty;
+        if(ui_quick_menu_draw_button(ctx->fb,i,active,pressed==i,&dirty)){
+            error=update_display_area_diff_with(ctx->hl,&E0470_FOLLOW_WAVEFORM,MODE_DU,dirty);
+            guard_draw_result(ctx->hl,error);
+            if(error!=EPD_DRAW_SUCCESS)break;
+        }
+    }
+    bool network_changed=(status&5u)==5u,was_network=(s_quick_status&5u)==5u;
+    if(error==EPD_DRAW_SUCCESS&&(((status^s_quick_status)&2u)||network_changed!=was_network)){
+        ui_quick_menu_draw_status(ctx->fb);
+        error=update_display_area_diff_with(ctx->hl,&E0470_WAVEFORM,MODE_GL16,(EpdRect){0,0,UI_LOCK_WIDTH,76});
+        guard_draw_result(ctx->hl,error);
+    }
+    if(error!=EPD_DRAW_SUCCESS){
+        quick_reset();app_present(ctx,current,APP_REDRAW_FULL);return;
+    }
+    s_quick_status=status;s_quick_pressed=pressed;
 }
 
 static void quick_toggle_wifi(void) {
@@ -145,8 +217,20 @@ void app_lock_ignore_for(int64_t ms) {
 }
 
 void app_present(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t redraw) {
+#ifdef KIIKO_LOCAL_LATENCY
+    const int64_t probe_start=esp_timer_get_time();
+    extern int64_t local_display_elapsed_us;
+    const int64_t probe_display=local_display_elapsed_us;
+#define LATENCY_PRESENT_DONE() do { if(redraw==APP_REDRAW_PAGE||redraw==APP_REDRAW_FULL) \
+    ESP_LOGI("latency","PRESENT page=%d redraw=%d total_us=%lld display_us=%lld paint_us=%lld", \
+    app_index_of(app),redraw,(long long)(esp_timer_get_time()-probe_start), \
+    (long long)(local_display_elapsed_us-probe_display), \
+    (long long)(esp_timer_get_time()-probe_start-(local_display_elapsed_us-probe_display))); } while(0)
+#else
+#define LATENCY_PRESENT_DONE() do {} while(0)
+#endif
     enum EpdDrawError result = EPD_DRAW_SUCCESS;
-    if (redraw == APP_REDRAW_PAGE && ui_click_feedback_active()) {
+    if (redraw == APP_REDRAW_PAGE && ui_click_feedback_active() && !ui_click_feedback_nav_pending()) {
         // 切页固定底栏之前先复位真实按压像素，避免把放大的图标当作长期基准。
         // Restore physical pressed pixels before freezing navigation, so an enlarged icon never becomes its baseline.
         EpdRect area;
@@ -157,6 +241,8 @@ void app_present(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t redraw) {
             if (result != EPD_DRAW_SUCCESS) redraw = APP_REDRAW_FULL;
         }
     }
+    if(redraw==APP_REDRAW_FULL || (redraw==APP_REDRAW_PAGE && !main_page_ready(ctx,app)))
+        ui_click_feedback_reset();
     if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL) ui_click_feedback_begin(ctx->fb);
     ui_text_set_system_scale(true);
     // 后台目录/封面完成及滚动仍属于当前主页面，不能借普通整页出口闪到底栏。
@@ -165,6 +251,7 @@ void app_present(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t redraw) {
         s_presented_main == app && main_page_ready(ctx, app)) display_main_transition_arm(app, false, false);
     if (app->present != NULL && app->present(ctx, redraw)) {
         main_present_finished(ctx, app, redraw);
+        LATENCY_PRESENT_DONE();
         return;
     }
     switch (redraw) {
@@ -197,13 +284,14 @@ void app_present(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t redraw) {
     }
     guard_draw_result(ctx->hl, result);
     main_present_finished(ctx, app, redraw);
+    LATENCY_PRESENT_DONE();
+#undef LATENCY_PRESENT_DONE
 }
 
 // 反馈只推控件附近，失败后重新绘制当前页面；不占用底栏切页许可。
 // Push feedback only near its control, repainting the current page on failure without consuming navigation permission.
 static void click_present(app_ctx_t *ctx, const app_desc_t *current, EpdRect area) {
-    display_main_transition_cancel();
-    enum EpdDrawError error = update_display_area_diff_with(ctx->hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, area);
+    enum EpdDrawError error = update_display_click_feedback(ctx->hl,area);
     guard_draw_result(ctx->hl, error);
     if (error != EPD_DRAW_SUCCESS) app_present(ctx, current, APP_REDRAW_FULL);
 }
@@ -272,20 +360,50 @@ static bool main_page_ready(app_ctx_t* ctx, const app_desc_t* app) {
            app->main_page_visible && app->main_page_visible(ctx);
 }
 
+// 主页面左右键循环切页；中键短按交给页面，长按统一全刷。阅读及子页继续使用原映射。
+// Main roots cycle with side keys, delegate a middle tap, and share middle-hold full refresh. Reader/subpage mappings stay page-owned.
+static app_redraw_t main_key_action(app_ctx_t *ctx,const app_desc_t *current,int key,bool held) {
+    if(held)return key==UI_KEY_2?APP_REDRAW_FULL:APP_REDRAW_NONE;
+    app_redraw_t redraw=APP_REDRAW_NONE;
+    if(current->on_main_key && current->on_main_key(ctx,key,&redraw))return redraw;
+    int tab=app_index_of(current);
+    if(tab>=0 && tab<4 && (key==UI_KEY_1||key==UI_KEY_3))
+        ui_nav_request(ctx,(tab+(key==UI_KEY_1?3:1))%4);
+    return APP_REDRAW_NONE;
+}
+
 static void switch_to(
     app_ctx_t* ctx, const app_desc_t** current, const app_desc_t* next
 ) {
     if (next == NULL || next == *current) return;
+#ifdef KIIKO_LOCAL_LATENCY
+    const int64_t probe_start=esp_timer_get_time();
+    const int probe_from=app_index_of(*current);
+#endif
     bool main_source = main_page_ready(ctx, *current);
     bool shelf_source = main_source && app_index_of(*current) == 1;
     display_main_transition_cancel();
     if ((*current)->on_exit != NULL) (*current)->on_exit(ctx);
+#ifdef KIIKO_LOCAL_LATENCY
+    const int64_t probe_exit=esp_timer_get_time();
+#endif
     *current = next;
     app_font_activate_system();
+#ifdef KIIKO_LOCAL_LATENCY
+    const int64_t probe_font=esp_timer_get_time();
+#endif
     if (next->on_enter != NULL) next->on_enter(ctx);
+#ifdef KIIKO_LOCAL_LATENCY
+    const int64_t probe_enter=esp_timer_get_time();
+#endif
     if (main_source && main_page_ready(ctx, next)) display_main_transition_arm(next, shelf_source, true);
     app_present(ctx, next, next->enter_full ? APP_REDRAW_FULL : APP_REDRAW_PAGE);
     display_main_transition_disarm();
+#ifdef KIIKO_LOCAL_LATENCY
+    ESP_LOGI("latency","SWITCH from=%d to=%d mode=%d exit_us=%lld font_us=%lld enter_us=%lld present_us=%lld total_us=%lld",probe_from,app_index_of(next),app_settings_main_refresh_mode(),
+        (long long)(probe_exit-probe_start),(long long)(probe_font-probe_exit),(long long)(probe_enter-probe_font),
+        (long long)(esp_timer_get_time()-probe_enter),(long long)(esp_timer_get_time()-probe_start));
+#endif
     ESP_LOGI(TAG, "page -> %s", next->title);
 }
 
@@ -350,6 +468,7 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
     bool gained = !*mounted && ready;
     *mounted = ready;
     if (ready) *invalidated = false;
+    if (gained || lost) { ui_avatar_invalidate(); (void)book_cover_jobs_quiesce(0); book_lock_collage_invalidate(); }
     if (gained && current->on_media_ready) current->on_media_ready(ctx);
     if (!lost) return false;
     *invalidated = true;
@@ -363,7 +482,8 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
 // Save the current page first, then settle a clock-free static frame so shutdown never leaves a misleading frozen time.
 // 锁屏前先由页面保存进度，再持久化一次恢复上下文；不在翻页或点击时写入。
 // Flush page progress before persisting one lock checkpoint; never write it on page turns or taps.
-static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current) {
+static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
+    if (feedback) app_lock_feedback(ctx->hl);
     if (current->on_before_lock) current->on_before_lock(ctx);
     int tab = app_index_of(current);
     pico_resume_t resume = {.tab = tab >= 0 && tab < 4 ? (uint8_t)tab : 0};
@@ -375,18 +495,44 @@ static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current) {
     (void)pico_boot_save_resume(&resume);
 }
 static void run_power_action(app_ctx_t *ctx, const app_desc_t *current, bool restart) {
-    prepare_lock(ctx, current);
+    prepare_lock(ctx, current, false);
     ui_power_final_draw(ctx->fb, restart);
     guard_draw_result(ctx->hl, update_display_full(ctx->hl));
     app_lock_wait_key_idle(800);
     epd_poweroff();
     pico_boot_clear_resume();
     if (restart) app_restart_host();
-    app_enter_host_sleep(APP_SLEEP_OFF);
+    esp_err_t error = app_enter_host_sleep(APP_SLEEP_OFF);
+    if (error != ESP_OK) ESP_LOGW(TAG, "power off failed: %s", esp_err_to_name(error));
+    // 关机交接失败时回到可操作原页；不关闭书籍后再重新自动开书。/ A failed shutdown returns to the operable current page without closing/reopening the book.
+    app_present(ctx, current, APP_REDRAW_PAGE);
+}
+
+bool app_poll_main_navigation(app_ctx_t *ctx) {
+    if(!ctx||!ctx->tp)return false;
+    if(ctx->request_app)return true;
+    cst836u_touch_t touch={0};
+    if(cst836u_read(ctx->tp,&touch)!=ESP_OK||!touch.touched||touch.count!=1) {
+        s_nav_contact_down=s_nav_polled=false;return false;
+    }
+    int index=ui_nav_hit(touch.x,touch.y);
+    if(index<0)return false;
+    if(!s_nav_contact_down) {
+        s_nav_contact_down=s_nav_polled=true;
+        if(index!=1)ui_nav_request(ctx,index);
+        ctx->user_activity=true;
+        if(ctx->fb&&ctx->hl) {
+            EpdRect area;ui_click_feedback_nav_request(index);
+            if(ui_click_feedback_nav_tick(ctx->fb,esp_timer_get_time()/1000,&area))
+                click_present(ctx,&app_book,area);
+        }
+    }
+    return ctx->request_app!=NULL;
 }
 
 void app_loop_run(const app_loop_config_t* config) {
     s_presented_main = NULL;
+    s_nav_contact_down=s_nav_polled=false;
     const app_desc_t* current = config->first_app != NULL
         ? config->first_app
         : app_home_page();
@@ -407,10 +553,10 @@ void app_loop_run(const app_loop_config_t* config) {
     };
 
     bool was_touched = false;
-    ui_quick_menu_reset(&s_quick);
+    quick_reset();
     bool menu_open = false;
     ui_gesture_t gesture = {0};
-    ui_gesture_t power_gesture = {0};
+    ui_power_dialog_t power_dialog = {0};
     bool power_dialog_open = false;
     int menu_pressed = UI_MENU_HIT_NONE;
     menu_feedback_t feedback = {0};
@@ -419,6 +565,7 @@ void app_loop_run(const app_loop_config_t* config) {
     int return_leaf = 0, return_menu_leaf = 0;
     bool return_to_menu = false;
     int held_key = -1;
+    bool held_main_key=false;
     int64_t held_since_ms = 0;
     int64_t last_lock_poll_ms = 0;
     int64_t last_font_retry_ms = 0;
@@ -437,13 +584,22 @@ void app_loop_run(const app_loop_config_t* config) {
     // The SD probe starts during board setup and is usually ready by the first product frame.
     // Retry here so the very first bookshelf paint already has a full CJK system face.
     try_load_saved_sd_font(false);
+    rp_boot_mark("sdfont");
     if (current->on_enter != NULL) current->on_enter(&ctx);
+    rp_boot_mark("enter");
     poll_media(&ctx, current, &media_mounted, &media_invalidated);
     // 首帧必须整屏 GC16：fb 里还是 app_main 画的开机图，DU 盖不掉。
     // First frame must be full GC16: fb still holds the splash; DU cannot cover it.
     app_present(&ctx, current, APP_REDRAW_FULL);
+    rp_boot_mark("frame");
     pico_boot_ready();
     ESP_LOGI(TAG, "UI ready on %s", current->title);
+    // 上次崩溃的现场（异常类型与触发地址）：有的话打一遍，串口和屏幕各有一份。
+    // The previous panic scene, when there was one: logged here, and shown on the home screen.
+    crash_note_log();
+#ifdef KIIKO_LOCAL_LATENCY
+    local_latency_init();
+#endif
 
     while (true) {
         unsigned requested_cover_policy = (unsigned)app_settings_main_refresh_mode() | ((unsigned)app_settings_system_contrast() << 8);
@@ -458,6 +614,7 @@ void app_loop_run(const app_loop_config_t* config) {
             memset(&touch, 0, sizeof(touch));
         }
 
+        if(err!=ESP_OK||!touch.touched)s_nav_contact_down=s_nav_polled=false;
         const bool pressed = touch.touched && !was_touched;
         const bool released = !touch.touched && was_touched;
         debounce_touch(&latest, &touch, released);
@@ -466,11 +623,14 @@ void app_loop_run(const app_loop_config_t* config) {
         if (ctx.now_ms - last_network_poll_ms >= 500) {
             last_network_poll_ms = ctx.now_ms;
             read_pico_transfer_service_poll();
+            app_time_service_poll(!touch.touched && ctx.now_ms - last_input_ms >= 10000 &&
+                !current->holds_pmu && !usb_storage_active() && !pico_online_busy() && !ble_pt_connected());
         }
         ctx.pressed = pressed;
         ctx.released = released;
         ctx.consumed = false;
-        ctx.request_app = NULL;
+        // A load may have captured navigation after the prior switch. Consume it at the normal boundary.
+
         ctx.request_menu = false;
         ctx.request_return = false;
         bool selected_from_menu = false;
@@ -481,7 +641,10 @@ void app_loop_run(const app_loop_config_t* config) {
         if (ctx.now_ms - last_media_poll_ms >= MEDIA_POLL_INTERVAL_MS) {
             last_media_poll_ms = ctx.now_ms;
             if (poll_media(&ctx, current, &media_mounted, &media_invalidated)) {
-                ui_quick_menu_reset(&s_quick);
+                power_dialog_open = false;
+                ui_power_dialog_end();
+                ui_power_dialog_reset(&power_dialog, touch.touched);
+                quick_reset();
                 held_key = -1;
                 cancel_gesture(&ctx, current, &gesture);
                 menu_pressed = UI_MENU_HIT_NONE;
@@ -498,7 +661,10 @@ void app_loop_run(const app_loop_config_t* config) {
         }
 
         if (!power_input_owned && !menu_open) {
-            if (err != ESP_OK) ui_quick_menu_cancel_input(&s_quick);
+            if (err != ESP_OK) {
+                ui_quick_menu_cancel_input(&s_quick);
+                quick_input_owned=s_quick.open;
+            }
             else {
                 ui_quick_action_t action;
                 quick_input_owned = ui_quick_menu_feed(&s_quick, &ctx,
@@ -511,37 +677,55 @@ void app_loop_run(const app_loop_config_t* config) {
                 if (action == UI_QUICK_OPEN || action == UI_QUICK_CLOSE) quick_present(&ctx, current, false);
                 else if (action == UI_QUICK_WIFI) {
                     quick_toggle_wifi();
-                    quick_present(&ctx, current, false);
                 } else if (action == UI_QUICK_BLUETOOTH) {
-                    app_settings_set_ble_turner(!app_settings_ble_turner());
-                    if (!app_settings_ble_turner()) ble_pt_reset_failure();
-                    quick_present(&ctx, current, false);
+                    bool enable=!app_settings_ble_turner();
+                    app_settings_set_ble_turner(enable);
+                    if(enable)ble_pt_reconnect_recent();
+                    else {ble_pt_cancel_recent();ble_pt_sync(false);}
                 } else if (action == UI_QUICK_FULL) quick_present(&ctx, current, true);
                 else if (action == UI_QUICK_LOCK) quick_lock_requested = true;
             }
+            quick_buttons_present(&ctx,current);
         }
 
         if (power_input_owned && err == ESP_OK) {
-            ui_gesture_event_t event;
             ctx.consumed = false;
-            if (ui_gesture_feed(&power_gesture, &ctx, &event)) {
-                ui_power_action_t action = ui_power_dialog_handle(&event);
+            EpdRect dirty;
+            ui_power_action_t action = ui_power_dialog_feed(&power_dialog, &ctx, &dirty);
+            if (action == UI_POWER_ACTION_NONE && dirty.height > 0) {
+                ui_power_dialog_draw_controls(ctx.fb, &power_dialog, dirty);
+                enum EpdDrawError result = update_display_area_diff_with(
+                    ctx.hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, dirty);
+                guard_draw_result(ctx.hl, result);
+                if (result != EPD_DRAW_SUCCESS) {
+                    power_dialog_open = false;
+                    ui_power_dialog_end();
+                    ui_power_dialog_reset(&power_dialog, touch.touched);
+                    app_present(&ctx, current, APP_REDRAW_FULL);
+                }
+            } else {
                 if (action == UI_POWER_ACTION_CANCEL) {
                     power_dialog_open = false;
-                    ui_gesture_reset(&power_gesture);
+                    ui_power_dialog_end();
+                    ui_power_dialog_reset(&power_dialog, false);
                     if (menu_open) present_menu(&ctx, current, menu_leaf, &feedback);
                     else app_present(&ctx, current, APP_REDRAW_PAGE);
                 } else if (action == UI_POWER_ACTION_SHUTDOWN) {
                     if (!app_settings_staged_shutdown()) {
+                        power_dialog_open = false;
+                        ui_power_dialog_end();
+                        ui_power_dialog_reset(&power_dialog, false);
                         run_power_action(&ctx, current, false);
                     } else {
                         power_dialog_open = false;
-                        ui_gesture_reset(&power_gesture);
-                        prepare_lock(&ctx, current);
+                        ui_power_dialog_end();
+                        ui_power_dialog_reset(&power_dialog, false);
+                        prepare_lock(&ctx, current, true);
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
                                              current == &app_book && app_book_reader_body_visible());
+                        display_request_full_refresh();
                         ctx.now_ms = esp_timer_get_time() / 1000;
                         last_input_ms = ctx.now_ms;
                         poll_media(&ctx, current, &media_mounted, &media_invalidated);
@@ -551,6 +735,9 @@ void app_loop_run(const app_loop_config_t* config) {
                         app_present(&ctx, current, APP_REDRAW_PAGE);
                     }
                 } else if (action == UI_POWER_ACTION_RESTART) {
+                    power_dialog_open = false;
+                    ui_power_dialog_end();
+                    ui_power_dialog_reset(&power_dialog, false);
                     run_power_action(&ctx, current, true);
                 }
             }
@@ -558,24 +745,54 @@ void app_loop_run(const app_loop_config_t* config) {
         }
 
         if (err != ESP_OK) {
+            EpdRect motion_area;
+            if(ui_click_feedback_nav_finish(ctx.fb,&motion_area))click_present(&ctx,current,motion_area);
             held_key = -1;
             cancel_gesture(&ctx, current, &gesture);
-            ui_gesture_reset(&power_gesture);
+            EpdRect dirty;
+            ui_power_dialog_cancel_input(&power_dialog, &dirty);
+            if (power_dialog_open && dirty.height > 0) {
+                ui_power_dialog_draw_controls(ctx.fb, &power_dialog, dirty);
+                guard_draw_result(ctx.hl, update_display_area_diff_with(
+                    ctx.hl, &E0470_FOLLOW_WAVEFORM, MODE_DU, dirty));
+            }
             ctx.consumed = true;
             if (menu_pressed >= 0) menu_feedback(&ctx, current, menu_leaf, menu_pressed, false, &feedback);
             menu_pressed = UI_MENU_HIT_NONE;
         }
         EpdRect click_area;
-        if (ui_click_feedback_active() && (err != ESP_OK || released || touch.count != 1 ||
+        if (ui_click_feedback_active() && (err != ESP_OK || touch.count > 1 ||
             quick_input_owned || power_input_owned || menu_open ||
-            ui_click_feedback_cancel_at(touch.x, touch.y))) {
+            (!ui_click_feedback_nav_pending() && (released || touch.count != 1 ||
+            ui_click_feedback_cancel_at(touch.x, touch.y))))) {
             if (ui_click_feedback_release(ctx.fb, &click_area)) click_present(&ctx, current, click_area);
         }
-        if (err == ESP_OK && pressed && touch.count == 1 && !power_input_owned &&
+        // 主页面底栏在首次单指报点就确认；抬手、轻滑和停留不再重复切页。
+        // Commit root navigation on the first single contact; lift, small motion and holds never repeat it.
+        bool nav_press_owned=s_nav_polled&&touch.touched&&touch.count==1&&main_page_ready(&ctx,current)&&ui_nav_hit(touch.x,touch.y)>=0;
+        if(nav_press_owned)ctx.consumed=true;
+        if (err == ESP_OK && pressed && !nav_press_owned && touch.count == 1 && !power_input_owned &&
+            !quick_input_owned && !menu_open && !usb_storage_active() &&
+            main_page_ready(&ctx, current)) {
+            const int tab = ui_nav_hit(touch.x, touch.y);
+            if (tab >= 0) {
+                held_key = -1;
+                cancel_gesture(&ctx, current, &gesture);
+                ctx.consumed = true;
+                ctx.user_activity = true;
+                nav_press_owned = true;
+                s_nav_contact_down=true;
+                if(tab!=app_index_of(current)||ctx.request_app)ui_nav_request(&ctx,tab);
+                ui_click_feedback_nav_request(tab);
+                if(ui_click_feedback_nav_tick(ctx.fb,esp_timer_get_time()/1000,&click_area))
+                    click_present(&ctx,current,click_area);
+            }
+        }
+        if (err == ESP_OK && pressed && touch.count == 1 && !nav_press_owned && !power_input_owned &&
             !quick_input_owned && !menu_open && !usb_storage_active() &&
             ui_click_feedback_press(ctx.fb, touch.x, touch.y, &click_area))
             click_present(&ctx, current, click_area);
-        if (!power_input_owned && !quick_input_owned && pressed && err == ESP_OK) {
+        if (!power_input_owned && !quick_input_owned && !nav_press_owned && pressed && err == ESP_OK) {
             held_key = -1;
             const int key = ui_key_hit_test(touch.x, touch.y);
             const bool handle_hit = ui_menu_handle_hit_test(touch.x, touch.y) &&
@@ -587,12 +804,14 @@ void app_loop_run(const app_loop_config_t* config) {
                 menu_pressed = UI_MENU_HIT_NONE;
             }
             if (key >= 0 && current->owns_keys && !menu_open) {
-                app_redraw_t redraw = current->on_key && !(key == UI_KEY_2 && current->defer_middle_short)
-                    ? current->on_key(&ctx, key) : APP_REDRAW_NONE;
-                present_page(&ctx, current, &gesture, redraw);
-                if (current->on_key_long && touch.count == 1) {
-                    held_key = key;
-                    held_since_ms = ctx.now_ms;
+                bool main_keys=main_page_ready(&ctx,current);
+                app_redraw_t redraw=main_keys
+                    ? (key==UI_KEY_2?APP_REDRAW_NONE:main_key_action(&ctx,current,key,false))
+                    : current->on_key && !(key==UI_KEY_2 && current->defer_middle_short)
+                        ? current->on_key(&ctx,key):APP_REDRAW_NONE;
+                present_page(&ctx,current,&gesture,redraw);
+                if(touch.count==1 && ((main_keys && key==UI_KEY_2)||(!main_keys && current->on_key_long))) {
+                    held_key=key;held_since_ms=ctx.now_ms;held_main_key=main_keys;
                 }
             } else if (key == UI_KEY_2) {
                 if (menu_open) {
@@ -678,7 +897,7 @@ void app_loop_run(const app_loop_config_t* config) {
                 last_input_ms = ctx.now_ms;
                 bool quick_was_open = s_quick.open;
                 if (quick_was_open && !quick_lock_requested) {
-                    ui_quick_menu_reset(&s_quick);
+                    quick_reset();
                     quick_present(&ctx, current, false);
                 }
                 if (!quick_lock_requested && ctx.now_ms < s_lock_ignore_until_ms) {
@@ -692,9 +911,10 @@ void app_loop_run(const app_loop_config_t* config) {
                     bool reader_power_lock = !menu_open && current == &app_book &&
                         app_book_reader_body_visible() && app_settings_reader_power_turn();
                     if (reader_power_lock) {
-                        prepare_lock(&ctx, current);
+                        prepare_lock(&ctx, current, true);
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp, true);
+                        display_request_full_refresh();
                         ctx.now_ms = esp_timer_get_time() / 1000;
                         last_input_ms = ctx.now_ms;
                         poll_media(&ctx, current, &media_mounted, &media_invalidated);
@@ -705,10 +925,21 @@ void app_loop_run(const app_loop_config_t* config) {
                         app_present(&ctx, current, APP_REDRAW_PAGE);
                     } else {
                         power_dialog_open = true;
-                        ui_gesture_reset(&power_gesture);
-                        ui_power_dialog_draw(ctx.fb);
-                        guard_draw_result(ctx.hl, update_display_area_with(
-                            ctx.hl, &E0470_WAVEFORM, MODE_GL16, ui_power_dialog_rect()));
+                        ui_power_dialog_reset(&power_dialog, touch.touched);
+                        ctx.request_app = NULL;
+                        ctx.request_return = ctx.request_menu = false;
+                        main_lock_boundary();
+                        ui_text_set_system_scale(true);
+                        ui_power_dialog_draw(ctx.fb, &power_dialog);
+                        enum EpdDrawError result = update_display_area_with(
+                            ctx.hl, &E0470_WAVEFORM, MODE_GL16, ui_power_dialog_rect());
+                        guard_draw_result(ctx.hl, result);
+                        if (result != EPD_DRAW_SUCCESS) {
+                            power_dialog_open = false;
+                            ui_power_dialog_end();
+                            ui_power_dialog_reset(&power_dialog, touch.touched);
+                            app_present(&ctx, current, APP_REDRAW_FULL);
+                        }
                     }
                 } else if (!power_dialog_open) {
                     held_key = -1;
@@ -721,11 +952,12 @@ void app_loop_run(const app_loop_config_t* config) {
                         present_page(&ctx, current, &gesture, power_redraw);
                         ctx.consumed = true;
                     } else {
-                        prepare_lock(&ctx, current);
+                        prepare_lock(&ctx, current, true);
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
                                              !menu_open && current == &app_book && app_book_reader_body_visible());
+                        display_request_full_refresh();
                         ctx.now_ms = esp_timer_get_time() / 1000;
                         last_input_ms = ctx.now_ms;
                         poll_media(&ctx, current, &media_mounted, &media_invalidated);
@@ -762,14 +994,18 @@ void app_loop_run(const app_loop_config_t* config) {
             }
         }
 
+        if(held_key>=0 && held_main_key && !main_page_ready(&ctx,current)) {
+            held_key=-1;held_main_key=false;
+        }
         if (!power_dialog_open && released && held_key == UI_KEY_2 && ui_key_hit_test(latest.x, latest.y) == UI_KEY_2 &&
-            current->defer_middle_short && !menu_open &&
+            (current->defer_middle_short || main_page_ready(&ctx,current)) && !menu_open &&
             !ctx.request_app && !ctx.request_menu && !ctx.request_return) {
             int key = held_key;
             held_key = -1;
             ctx.consumed = true;
-            app_redraw_t redraw = ctx.now_ms - held_since_ms >= UI_LONG_PRESS_MS
-                ? current->on_key_long(&ctx, key) : current->on_key(&ctx, key);
+            bool held=ctx.now_ms-held_since_ms>=UI_LONG_PRESS_MS;
+            app_redraw_t redraw=main_page_ready(&ctx,current)?main_key_action(&ctx,current,key,held):
+                held?current->on_key_long(&ctx,key):current->on_key(&ctx,key);
             present_page(&ctx, current, &gesture, redraw);
         }
         if (!power_dialog_open && held_key >= 0) {
@@ -781,7 +1017,8 @@ void app_loop_run(const app_loop_config_t* config) {
                 int key = held_key;
                 held_key = -1;
                 ctx.consumed = true;
-                present_page(&ctx, current, &gesture, current->on_key_long(&ctx, key));
+                present_page(&ctx,current,&gesture,main_page_ready(&ctx,current)?
+                    main_key_action(&ctx,current,key,true):current->on_key_long(&ctx,key));
             }
         }
         // 蓝牙翻页器：BLE 栈只在这里跟随设置启停。必须走 ble_pt_sync()——自己写
@@ -807,7 +1044,7 @@ void app_loop_run(const app_loop_config_t* config) {
             while (ble_pt_pop_key(&key_event)) {}
             while (ble_pt_pop_raw(&raw_event)) {}
         }
-        if (s_quick.open && quick_status() != s_quick_status) quick_present(&ctx, current, false);
+        if (s_quick.open && quick_status() != s_quick_status) quick_buttons_present(&ctx,current);
         if (!power_dialog_open && !s_quick.open && !quick_input_owned && !ui_click_feedback_active() && !menu_open && !ctx.request_app && !ctx.request_menu && !ctx.request_return && current->on_tick != NULL) {
             app_redraw_t redraw = current->on_tick(&ctx);
             if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL) held_key = -1;
@@ -828,11 +1065,12 @@ void app_loop_run(const app_loop_config_t* config) {
             cancel_gesture(&ctx, current, &gesture);
             if (menu_pressed >= 0) menu_feedback(&ctx, current, menu_leaf, menu_pressed, false, &feedback);
             menu_pressed = UI_MENU_HIT_NONE;
-            prepare_lock(&ctx, current);
+            prepare_lock(&ctx, current, false);
             extern const app_desc_t app_book;
             main_lock_boundary();
             enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
                                  !menu_open && current == &app_book && app_book_reader_body_visible());
+            display_request_full_refresh();
             ctx.now_ms = esp_timer_get_time() / 1000;
             last_input_ms = ctx.now_ms;
             poll_media(&ctx, current, &media_mounted, &media_invalidated);
@@ -848,6 +1086,14 @@ void app_loop_run(const app_loop_config_t* config) {
             feedback.updates = 0;
         }
         if (!menu_open) feedback.updates = 0;
+#ifdef KIIKO_LOCAL_LATENCY
+        static int64_t probe_heartbeat;
+        if(ctx.now_ms-probe_heartbeat>5000){probe_heartbeat=ctx.now_ms;ESP_LOGI("latency","STATE touch=%d menu=%d dialog=%d usb=%d",touch.touched,menu_open,power_dialog_open,usb_storage_active());}
+        if(!menu_open&&!power_dialog_open&&!usb_storage_active()&&!touch.touched) {
+            app_redraw_t probe=local_latency_poll(&ctx,current);
+            if(probe!=APP_REDRAW_NONE)app_present(&ctx,current,probe);
+        }
+#endif
         // 返回来源优先；普通请求仍按切页优先处理。
         // Return requests win; ordinary requests still prioritize page switches.
         // USB MSC 持有 TF 卡时禁止任何页面切换；必须先安全停止并重新挂载。
@@ -858,8 +1104,9 @@ void app_loop_run(const app_loop_config_t* config) {
             ctx.request_menu = false;
         }
         if (!power_dialog_open && (ctx.request_return || ctx.request_app || ctx.request_menu)) {
-            if (ui_click_feedback_release(ctx.fb, &click_area)) click_present(&ctx, current, click_area);
-            ui_quick_menu_reset(&s_quick);
+            if (!ui_click_feedback_nav_pending() && ui_click_feedback_release(ctx.fb, &click_area))
+                click_present(&ctx, current, click_area);
+            quick_reset();
             held_key = -1;
             const app_desc_t* next = ctx.request_app;
             const bool go_back = ctx.request_return;
@@ -907,6 +1154,16 @@ void app_loop_run(const app_loop_config_t* config) {
                 present_menu(&ctx, current, menu_leaf, &feedback);
             }
         }
+        // 按下效果已经显示，只定时复位；不把是否切页当作反馈触发条件。
+        // The pressed pose is already visible; settle by timer independently of navigation.
+        if(ui_click_feedback_nav_pending()) {
+            if(err!=ESP_OK || touch.count>1 || menu_open || power_dialog_open || s_quick.open ||
+                usb_storage_active() || !main_page_ready(&ctx,current))ui_click_feedback_reset();
+            else if(ui_click_feedback_nav_tick(ctx.fb,esp_timer_get_time()/1000,&click_area))
+                click_present(&ctx,current,click_area);
+        }
+        // 连续列表相位期间缩短等待；每次仍读触摸，并给其他任务让出一个调度周期。
+        // Reduce waits during continuous list phases; poll touch each time and yield one scheduling tick.
         vTaskDelay(pdMS_TO_TICKS(LOOP_TICK_MS));
     }
 }

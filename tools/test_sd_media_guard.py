@@ -13,6 +13,8 @@ for name in ('driver/sdmmc_host.h', 'esp_log.h', 'esp_vfs_fat.h',
     p = out / name
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text('#pragma once\n', encoding='utf-8')
+for name in ('ff.h','diskio_sdmmc.h'):
+    (out/name).write_text((root/'tools/sd_probe_stubs'/name).read_text())
 source = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -87,6 +89,13 @@ static int mock_mkdir(const char* p,int mode){
 }
 #define mkdir mock_mkdir
 #include "../../components/read_pico/read_pico_sd.c"
+// 此测试验证拔卡生命周期；空间计数由 sd_probe_host_test 独立覆盖。
+// This fixture checks media lifecycle; allocation counting is covered by sd_probe_host_test.
+BYTE ff_diskio_get_pdrv_card(const sdmmc_card_t *c){(void)c;return 0xff;}
+int f_opendir(FF_DIR *root,const char *path){(void)root;(void)path;return 1;}
+int f_closedir(FF_DIR *root){(void)root;return FR_OK;}
+int ff_mutex_take(int drive){(void)drive;return 1;}
+void ff_mutex_give(int drive){(void)drive;}
 // 测试实际板级检测函数；FCA 读错不应写出“无卡”。/ Exercise real board detect; failed FCA reads must not publish absence.
 #define IOE_SD_CD (1u << 6)
 static void* s_ioe=(void*)1;
