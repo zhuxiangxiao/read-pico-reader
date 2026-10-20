@@ -17,6 +17,7 @@ jobs:
           bash tools/run_water_turn_host_test.sh
           bash tools/run_display_host_test.sh
           bash tools/run_display_navigation_tests.sh
+          bash tools/run_airdrop_host_tests.sh
           python3 tools/pmic_gate_host_test.py
           python3 tools/boot_panel_actions_host_test.py
           python3 tools/lock_pin_host_test.py
@@ -47,6 +48,16 @@ jobs:
           . $IDF_PATH/export.sh
           idf.py -DSDKCONFIG_DEFAULTS=sdkconfig.ci set-target esp32s3
           idf.py -DSDKCONFIG_DEFAULTS=sdkconfig.ci build
+
+      # 应用镜像必须装进 ota_0，且 AES/AWDL 的链接包装必须真的被拉进镜像；
+      # 两者都是编译通过也可能悄悄丢掉的东西。
+      # The app image must fit ota_0, and the AES/AWDL linker wrappers must really be
+      # linked in; both can silently disappear while the build still succeeds.
+      - name: size and link gate
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          python3 tools/check_airdrop_build.py --build-dir build
 
       - name: size
         shell: bash

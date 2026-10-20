@@ -21,6 +21,13 @@
 
 #include "esp_err.h"
 
+// 中文：允许 C++ 组件（如 read_pico_airdrop）包含本头文件，否则链接期会找 C++ 修饰名。
+// English: let C++ components (e.g. read_pico_airdrop) include this C API without linker
+// looking for C++-mangled names.
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // 扫描结果上限；满了就不再收新的，覆盖会打乱列表。/ Scan capacity; later results are dropped.
 #define BLE_PT_MAX_DEVICES 24
 // 已配对设备上限。/ Maximum bonded peers.
@@ -267,3 +274,7 @@ ble_pt_action_t ble_pt_action_for_frame(const ble_pt_frame_t *frame);
 /// Resolve a HID usage to an action via the built-in map only; separate because a usage has
 /// no raw code. The built-in map covers the YueXingTong protocol: 0x01 previous, 0x02 next.
 ble_pt_action_t ble_pt_action_for_usage(uint8_t usage, uint8_t mods);
+
+#ifdef __cplusplus
+}
+#endif

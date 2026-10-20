@@ -1,0 +1,4 @@
+#pragma once
+#define MBEDTLS_VERSION_MAJOR 3
+#define MBEDTLS_VERSION_MINOR 6
+#define MBEDTLS_VERSION_PATCH 0

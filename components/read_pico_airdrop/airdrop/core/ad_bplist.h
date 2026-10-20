@@ -184,6 +184,15 @@ static uint32_t ad_bplist_dict(uint8_t *out, uint32_t cap,
 
   uint32_t table_off = (uint32_t)(p - out);
   if (end - p < (ptrdiff_t)(nobj + 32)) return 0;
+  /* 中文：对象的偏移在表里只占 1 字节；超过 255 会被 (uint8_t) 静默截断，写出一张指向
+     错误对象的坏 plist（R-16）。拒绝而不是截断——短 plist 不是小 plist，是坏的。
+     English: an object's offset is one byte in the table; anything past 255 would be
+     silently truncated by the (uint8_t) cast and produce a plist that points at the
+     wrong objects (R-16). Refuse instead of truncating -- a short plist is a broken
+     plist, and the trailer's three 64-bit fields cannot repair a wrong offset table.
+     Widths above one byte are what ad_bpw_finish() below computes; this flat writer
+     keeps the one-byte form its goldens are built on and refuses to outgrow it. */
+  for (uint32_t i = 0; i < nobj; i++) if (off[i] > 255) return 0;
   for (uint32_t i = 0; i < nobj; i++) *p++ = (uint8_t)off[i];   /* 1-byte offsets */
 
   memset(p, 0, 5); p += 5;      /* unused                                    */

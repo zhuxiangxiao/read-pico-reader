@@ -111,9 +111,16 @@ static inline bool airdrop_resolve_unique_path(
     if (n < 0 || (size_t)n >= out_path_cap) {
         return false;
     }
+    const size_t base_len = strlen(base);
+    if (out_name && out_name_cap > 0 && base_len >= out_name_cap) {
+        // 名字比调用方的输出缓冲还长：拒绝，不能截断成另一个文件名。
+        // The name no longer fits the caller's output buffer: refuse rather than truncate
+        // it into a different filename.
+        return false;
+    }
     if (!exists_fn(out_path, ctx)) {
         if (out_name && out_name_cap > 0) {
-            snprintf(out_name, out_name_cap, "%s", base);
+            memcpy(out_name, base, base_len + 1);
         }
         return true;
     }
@@ -133,8 +140,12 @@ static inline bool airdrop_resolve_unique_path(
             return false;
         }
         if (!exists_fn(out_path, ctx)) {
+            const size_t candidate_len = (size_t)cn;
             if (out_name && out_name_cap > 0) {
-                snprintf(out_name, out_name_cap, "%s", candidate_name);
+                if (candidate_len >= out_name_cap) {
+                    return false;
+                }
+                memcpy(out_name, candidate_name, candidate_len + 1);
             }
             return true;
         }

@@ -102,6 +102,17 @@ void ad_end(void);
    the sink falls behind. */
 void ad_poll(void);
 
+/* True when a whole-archive body (the gzip/bare-cpio shapes, which cannot stream) has
+ * already been acknowledged to the sender with 200 but has not reached the file sink yet.
+ * The scheduler must treat this as busy, and anything that stops the service (page exit,
+ * light-sleep pause) must call ad_poll() once before ad_end(): dropping the block here
+ * means the sender was told success and the file silently vanished.
+ *
+ * 整包归档（gzip/裸 cpio 等无法流式的形状）已向发送方回 200、但尚未交付文件回调时返回
+ * true。调度器须把它计入“忙”；任何停止（离页、浅睡暂停）都必须先 ad_poll() 再 ad_end()，
+ * 否则发送方看到成功而文件被静默丢弃。 */
+bool ad_arch_pending(void);
+
 /* True once ad_begin() has claimed this device for receiving. The sender refuses to start
  * on a device that has, and vice versa: the two cannot share the memory. */
 bool ad_role_is_receiver(void);

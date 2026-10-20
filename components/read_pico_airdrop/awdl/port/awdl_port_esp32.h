@@ -37,7 +37,16 @@
  * Returns ESP_OK or the first failure. It does NOT abort: every step used to be wrapped in
  * ESP_ERROR_CHECK, which panics the chip, and a library may not decide that a user's boot
  * is over. A caller that ignores the return gets a device that is simply not on the air --
- * which awdl_status_read() will say plainly. */
+ * which awdl_status_read() will say plainly.
+ *
+ * 契约：已经 begin（或上一次 awdl_end 未完成）时返回 ESP_ERR_INVALID_STATE，绝不在活着的
+ * 任务上重建静态栈/TCB。begin 失败会尽力回滚；若回滚也没能在 1 s 内等到任务退出，返回的
+ * 同样是 ESP_ERR_INVALID_STATE，此时调用方必须先 awdl_end() 再重试。
+ *
+ * Contract: a second begin, or any begin while an awdl_end() is still incomplete, returns
+ * ESP_ERR_INVALID_STATE -- a live static stack/TCB is never reused. A failing begin rolls
+ * back what it started; if that rollback also cannot get the tasks to exit within 1 s the
+ * same error means "awdl_end() first, then retry". */
 esp_err_t awdl_begin(void);
 
 /* Bring the link down and hand the memory back -- the inverse of awdl_begin(), and a
@@ -56,9 +65,23 @@ esp_err_t awdl_begin(void);
  * shrinking the frame to the MTU is what returned the difference; a stale figure here would
  * have hidden the saving that change was made for.
  *
- * Returns ESP_OK, or ESP_ERR_INVALID_STATE if the link was not up or a task did not
- * acknowledge within one second -- and in that case NOTHING is freed and the link keeps
- * running. Reporting a teardown that did not happen is worse than not tearing down.
+ * Returns ESP_OK; ESP_ERR_INVALID_STATE if the link was not up; or ESP_ERR_TIMEOUT if a task
+ * did not acknowledge within one second. On that timeout NOTHING is freed and the stop
+ * request is NOT withdrawn: the link stays halfway down and the caller must call awdl_end()
+ * again. Reporting a teardown that did not happen is worse than not tearing down.
+ *
+ * 契约：三个返回值含义不同。ESP_OK=已拆干净；ESP_ERR_INVALID_STATE=没有东西可拆（链路没
+ * 起来），可以忽略；ESP_ERR_TIMEOUT=超时且**可重试**——stop 请求保持有效（不会复位），
+ * 静态栈/TCB 一个都不释放，awdl_begin() 继续被拒绝；调用方必须重试 awdl_end()，已确认退出
+ * 的任务不会被再等一遍。只有全部任务确认退出、内存释放完毕并返回 ESP_OK 之后，begin() 才
+ * 可以再次运行。
+ *
+ * Contract: the three returns mean different things. ESP_OK = fully torn down;
+ * ESP_ERR_INVALID_STATE = nothing to tear down (the link was not up) and may be ignored;
+ * ESP_ERR_TIMEOUT = timed out AND RETRYABLE -- the stop request stays asserted, no static
+ * stack/TCB is freed, awdl_begin() keeps refusing, and the caller must retry awdl_end(); a
+ * task that already acked is not waited on twice. begin() becomes legal again only after a
+ * full teardown has returned ESP_OK.
  *
  * NOT undone: nvs_flash_init(), esp_netif_init() and esp_event_loop_create_default().
  * Those are process-wide and shared; begin() already tolerates finding them present. */

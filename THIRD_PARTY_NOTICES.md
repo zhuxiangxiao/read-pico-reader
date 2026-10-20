@@ -25,6 +25,7 @@ remain in the source. This project is not an official MindReset release.
 | Embedded Noto Sans SC Medium font subset and compressed common-Han bitmaps | SIL OFL-1.1 | [Font license](main/assets/OFL-Noto.txt) |
 | [ESP Web Tools](https://github.com/esphome/esp-web-tools) browser flasher | Apache-2.0 | [Bundled web tool license](flash/vendor/LICENSE) |
 | Espressif TinyUSB component | Apache-2.0 | [Component license](components/espressif__esp_tinyusb/LICENSE) |
+| [s-iwaki-d/ESP32Drop](https://github.com/s-iwaki-d/ESP32Drop) — AWDL/AirDrop receive port in `components/read_pico_airdrop/`, commit `92bdc1221924ca522f3ccbebbd9353612ce5b2d7` | ISC, Copyright (c) 2026 MIRO | [Component license](components/read_pico_airdrop/LICENSE), [Port notes](components/read_pico_airdrop/UPSTREAM.md) |
 
 License terms apply to their respective material. The repository's
 [license-scope statement](LICENSE) and new personal-study license do not

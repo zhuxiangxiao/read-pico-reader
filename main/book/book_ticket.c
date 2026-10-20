@@ -228,7 +228,10 @@ static void cover_draw(uint8_t *fb, const uint8_t *gray, const char *title) {
                                ui_image_dither_gray(tone, box.x + x, box.y + y), fb);
             }
     } else {
-        char short_title[96]; snprintf(short_title, sizeof(short_title), "%s", title);
+        // 中文：-Os 下 GCC 会报告 "%s" 可能截断；strlcpy 有界且语义相同。
+        // English: GCC reports possible "%s" truncation under -Os; strlcpy is bounded
+        // and has the same semantics.
+        char short_title[96]; strlcpy(short_title, title, sizeof(short_title));
         text_fit(short_title, 32, box.width - 20);
         ui_text_vc(fb, box.x + box.width / 2, box.y + box.height / 2, 32,
                    short_title, EPD_DRAW_ALIGN_CENTER, false);

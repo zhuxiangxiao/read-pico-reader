@@ -3,6 +3,12 @@
 按版本简述对用户可见的变化；使用方法见 [README](../README.zh-CN.md)。
 User-visible changes by release; see [README](../README.md) for usage.
 
+## 未发布 / Unreleased
+
+- 文件管理新增「隔空投送」入口：附近的 iPhone / iPad / Mac 可通过本机 AWDL 射频直接投送文件，仅写入 TF 卡；书籍、字体、图片按扩展名归入对应目录，同名文件自动加 `_1` 后缀，结束投送或拔卡时清理未完成文件。传输期间暂停蓝牙翻页器，锁屏/浅睡会先暂停接收并在唤醒后恢复。
+  File management adds an AirDrop entry: nearby iPhones, iPads and Macs can send files over the device's own AWDL radio, written only to the TF card. Books, fonts and pictures are routed to their folders by extension, collisions get a `_1` suffix, and unfinished files are cleaned up when stopping or removing the card. Bluetooth page turning is paused during a transfer; locking/light sleep pauses the receiver and resumes it after wake.
+- 构建配置与主机回归补齐：AES/WiFi 链接包装显式拉入最终镜像，CI 增加镜像分区容量与包装符号门禁；导入上游 ESP32Drop 的解析器/状态机主机测试并修复隔空投送路由测试。
+  Build and regression coverage: the AES/WiFi linker wrappers are pulled into the final image explicitly, CI now gates on the app partition size and wrapper symbols, and the upstream ESP32Drop parser/state-machine host suites are imported with the AirDrop routing test fixed.
 
 ## 0.3.3-rc97 / 2026-10-18
 

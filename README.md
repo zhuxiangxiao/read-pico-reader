@@ -10,7 +10,7 @@ Official firmware binaries are stored in [GitHub Releases](https://github.com/we
 
 An independent reading firmware with publicly available source for the **MindReset RDP-G01-W** ESP32-S3 e-paper board. It is based on [MindReset's official demo firmware](https://github.com/MindReset/read_pico_firmware), but is **not an official MindReset release**. Licenses apply by scope as described above.
 
-The current interface has Home, Bookshelf, Files, and Settings. It reads EPUB and TXT books from a TF card, remembers reading progress, and supports Wi-Fi, hotspot, or USB file transfer. The online flasher installs the same firmware image as the local `flash/` bundle.
+The current interface has Home, Bookshelf, Files, and Settings. It reads EPUB and TXT books from a TF card, remembers reading progress, and supports Wi-Fi, hotspot, AirDrop, or USB file transfer. The online flasher installs the same firmware image as the local `flash/` bundle.
 
 ## Current release: rc97
 
@@ -131,7 +131,7 @@ Please report firmware bugs in this repository, not in the MindReset upstream is
 
 ## File transfer
 
-File management shows **WiFi transfer**, **Hotspot transfer** and **USB transfer** directly. WiFi connects to a saved network or opens network setup; hotspot mode starts the device access point; USB exposes the TF card to the computer. AP/STA browser transfer keeps directory browsing, arbitrary-file uploads and status-signature editing.
+File management shows **WiFi transfer**, **Hotspot transfer**, **AirDrop** and **USB transfer** directly. WiFi connects to a saved network or opens network setup; hotspot mode starts the device access point; AirDrop receives files from a nearby iPhone, iPad or Mac over the device's own AWDL radio (set Apple's AirDrop to "Everyone for 10 minutes"; received books, fonts and pictures go to their folders by extension, collisions get a `_1` suffix, and stopping or removing the card cleans up unfinished files); USB exposes the TF card to the computer. AP/STA browser transfer keeps directory browsing, arbitrary-file uploads and status-signature editing.
 
 Shake-to-turn is off by default and enabled in reader Font Settings. A horizontal left/right impulse turns to the previous/next page. Slow tilts, other axes, touch and rebounds are filtered; wait through an 800 ms cooldown and rest before the next gesture. Direction and sensitivity still need device validation. The global refresh test option is removed and ignored in older configurations.
 

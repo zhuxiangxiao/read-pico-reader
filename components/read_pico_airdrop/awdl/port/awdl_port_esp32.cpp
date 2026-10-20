@@ -443,6 +443,31 @@ static volatile bool g_proc_stopped   = false;
 static volatile bool g_cad_stopped    = false;
 static int64_t         g_cadence_wake_us = 0;
 
+/* 生命周期状态机：阻止 begin() 在没拆干净的链路上重建任务。/
+ * Lifecycle state machine: it keeps begin() from building tasks over a link that is not
+ * fully torn down.
+ *
+ *   CLEAN    没有任务、没有 netif；begin() 可以运行，end() 报 ESP_ERR_INVALID_STATE。
+ *   UP       已 begin（可能只完成了一部分）；end() 是唯一清理入口。
+ *   STOPPING 已请求退出但仍有任务未确认；begin() 必须拒绝，end() 可重试，stop 保持有效。
+ *
+ *   CLEAN    no tasks and no netif: begin() may run, end() reports ESP_ERR_INVALID_STATE.
+ *   UP       begun, possibly only partly: end() is the only clean-up path.
+ *   STOPPING asked to stop, a task has not acked: begin() must refuse, end() is retryable,
+ *            and the stop request stays asserted.
+ *
+ * volatile, not atomic: the caller writes it, everyone reads it, and it is one byte. */
+enum { AWDL_LC_CLEAN = 0, AWDL_LC_UP = 1, AWDL_LC_STOPPING = 2 };
+static volatile uint8_t g_awdl_lc = AWDL_LC_CLEAN;
+
+/* 每个任务的“已创建、尚未确认退出”。ack 由任务在自删前落盘，所以句柄本身回答不了这个
+ * 问题：静态任务自删之后，句柄仍然指向那块 TCB 内存。/
+ * Per-task "created and not yet confirmed exited". The ack is stored immediately BEFORE the
+ * task deletes itself, so the handle alone cannot answer it: a self-deleted static task's
+ * handle still points at its TCB memory. */
+static volatile bool g_proc_live = false;
+static volatile bool g_cad_live  = false;
+
 static portMUX_TYPE g_win_mux = portMUX_INITIALIZER_UNLOCKED;
 static struct AwdlWinState g_win;            // NOT volatile: only ever touched under g_win_mux
 // ...and the election result, published with it and under the same lock.
@@ -1200,6 +1225,9 @@ static void proc_task(void *) {
   for (;;) {
     /* Checked at the TOP of the loop, outside the drain, so the task never leaves with a
        ring slot half-processed or g_mux held. */
+    /* ack 先落盘再自删：awdl_end() 看到 ack 之后还会等两个 tick，才释放静态栈/TCB。/
+       Store the ack, then self-delete: awdl_end() waits two more ticks after the ack before
+       it hands the static stack/TCB back. */
     if (g_awdl_stop) { g_proc_stopped = true; vTaskDelete(nullptr); }
     bool did = false;
     for (int slot; (slot = awdl_ring_peek(&g_ring_cur)) >= 0; ) {
@@ -2404,6 +2432,9 @@ void awdl_cadence_pass(void) {
 static void awdl_cadence_task_fn(void *) {
   for (;;) {
     /* BEFORE the pass, never during it: a pass is what puts a frame on the air. */
+    /* 同 proc_task：ack 落盘与自删之间还有一个很短的窗口，见 awdl_end() 的等待。/
+       As in proc_task: the ack and the self-delete are a few instructions apart; see the
+       wait in awdl_end(). */
     if (g_awdl_stop) { g_cad_stopped = true; vTaskDelete(nullptr); }
     awdl_cadence_pass();
     int64_t dt = g_cadence_wake_us - esp_timer_get_time();
@@ -2517,8 +2548,33 @@ uint32_t awdl_cadence_stack_free_words(void) {
  * Every step returns rather than aborting. ESP_ERROR_CHECK panics the chip: a defensible
  * choice for a project's own firmware and an indefensible one for a library, because a
  * user's boot is not ours to end. */
+
+/* awdl_begin() 失败时的统一收尾：能拆就拆干净，拆不动就留在 STOPPING 让调用方重试。
+ * 返回最初那个错误码；回滚自己也超时（极少见）时返回 ESP_ERR_INVALID_STATE，含义是
+ * “先调用 awdl_end()，再重试 begin()”。/
+ * Unified failure exit for awdl_begin(): clean up what was started, or stay STOPPING so the
+ * caller can retry. Returns the original error; if the rollback itself times out (rare) it
+ * reports ESP_ERR_INVALID_STATE, which means "call awdl_end() before retrying begin()". */
+static esp_err_t awdl_begin_fail(esp_err_t e) {
+  return (awdl_end() == ESP_OK) ? e : ESP_ERR_INVALID_STATE;
+}
+
 esp_err_t awdl_begin(void) {
   esp_err_t e;
+
+  /* “已启动”守卫：UP（重复 begin）与 STOPPING（上次拆机未完成）都必须拒绝，否则新任务会
+   * 建在同一块静态栈/TCB 上，而旧任务可能还活着。/
+   * The begun/clean guard: refuse both UP (a second begin) and STOPPING (an incomplete
+   * teardown), or a new task would be built on the same static stack/TCB while the old one
+   * may still be alive. */
+  if (g_awdl_lc != AWDL_LC_CLEAN) return ESP_ERR_INVALID_STATE;
+  /* CLEAN 意味着没有任务会读这个标志，所以在这里清零不会与谁竞争。/
+     CLEAN means no task can read the flag, so clearing it here races with nothing. */
+  g_awdl_stop = false;
+  /* 从这里开始 end() 就是清理路径：即使下面某一步失败，也必须拆得掉。/
+     From here on end() is the clean-up path: even if a later step fails, it must be able to
+     take the link down again. */
+  g_awdl_lc = AWDL_LC_UP;
 
   awdl_ring_init(&g_ring_cur, RING_SLOTS);
   awdl_winstate_init(&g_win);
@@ -2530,7 +2586,7 @@ esp_err_t awdl_begin(void) {
    * on the first pass with a window open -- the escape hatch would itself be a hang. */
   awdl_tick_init(&g_tick, nullptr);
 
-  if ((e = wifi_probe_init()) != ESP_OK) return e;
+  if ((e = wifi_probe_init()) != ESP_OK) return awdl_begin_fail(e);
 
   /* wifi_probe_init() derived the locally-administered AWDL identity and installed that
      exact address on WIFI_IF_AP before enabling it, so the hardware can ACK frames sent
@@ -2554,6 +2610,10 @@ esp_err_t awdl_begin(void) {
   awdl_ll_of_mac(g_awdl_mac, g_ll);
 
   /* Frame path on core 1 at priority 3; the WiFi RX callback stays undisturbed on core 0. */
+  /* 新任务从“未确认退出”开始：ack 必须先清零，否则上一轮拆机残留的 ack 会被当成这一轮的。/
+     A fresh task starts un-acked: clear the ack first, or an ack left over from the previous
+     teardown would be read as this task's. */
+  g_proc_stopped = false; g_proc_live = false;
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
   if (!s_proc_stack) {
     s_proc_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2566,16 +2626,18 @@ esp_err_t awdl_begin(void) {
                                                 s_proc_stack, s_proc_tcb, 1);
   }
   if (!s_proc_task && xTaskCreatePinnedToCore(proc_task, "awdl_proc", 8192, nullptr, 3, nullptr, 1) != pdPASS)
-    return ESP_ERR_NO_MEM;
+    return awdl_begin_fail(ESP_ERR_NO_MEM);
 #else
   if (xTaskCreatePinnedToCore(proc_task, "awdl_proc", 8192, nullptr, 3, nullptr, 1) != pdPASS)
-    return ESP_ERR_NO_MEM;
+    return awdl_begin_fail(ESP_ERR_NO_MEM);
 #endif
+  g_proc_live = true;
 
 #if AWDL_CADENCE_TASK
   /* BEFORE awdl_netif_init(), see the note above. Priority 2 from a priority-1 caller
    * yields immediately, so the first cadence pass runs before this function returns --
    * which closes the window in which the published state is still its zeroed self. */
+  g_cad_stopped = false; g_cad_live = false;   /* 同上：新任务从“未确认退出”开始。/ As above. */
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
   if (!s_cad_stack) {
     s_cad_stack = (StackType_t*)heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2589,15 +2651,18 @@ esp_err_t awdl_begin(void) {
   }
   if (!g_cadence_task && xTaskCreatePinnedToCore(awdl_cadence_task_fn, "awdl_cad", 8192, nullptr, 2,
                                                  &g_cadence_task, 1) != pdPASS)
-    return ESP_ERR_NO_MEM;
+    return awdl_begin_fail(ESP_ERR_NO_MEM);
 #else
   if (xTaskCreatePinnedToCore(awdl_cadence_task_fn, "awdl_cad", 8192, nullptr, 2,
                               &g_cadence_task, 1) != pdPASS)
-    return ESP_ERR_NO_MEM;
+    return awdl_begin_fail(ESP_ERR_NO_MEM);
 #endif
+  g_cad_live = true;
 #endif
 
-  return awdl_netif_init();
+  e = awdl_netif_init();
+  if (e != ESP_OK) return awdl_begin_fail(e);
+  return ESP_OK;
 }
 
 /* Bring the link down and hand the memory back. The inverse of awdl_begin(), and a
@@ -2619,34 +2684,60 @@ esp_err_t awdl_begin(void) {
  * one-time inits that other components share; tearing them down would break whoever else
  * initialised them, and begin() already tolerates finding them present.
  *
- * Returns ESP_ERR_INVALID_STATE if the link was not up, or if a task did not acknowledge
- * within the timeout -- in which case NOTHING is freed. A half-torn-down link that
- * reports success is the failure this whole function exists to avoid. */
+ * Returns ESP_OK; ESP_ERR_INVALID_STATE if the link was not up; or ESP_ERR_TIMEOUT if a task
+ * did not acknowledge within one second. On that timeout NOTHING is freed and the stop
+ * request is NOT withdrawn: the link stays halfway down, awdl_begin() keeps refusing, and
+ * the caller must call awdl_end() again -- a task that has already acked is not waited on
+ * twice. Reporting a teardown that did not happen is worse than not tearing down.
+ *
+ * 返回 ESP_OK；链路没起来时返回 ESP_ERR_INVALID_STATE；任务 1 s 内未确认退出时返回
+ * ESP_ERR_TIMEOUT。超时既不撤销 stop 请求，也不释放任何内存；此时 begin() 继续拒绝，调用方
+ * 必须重试 awdl_end()（已确认退出的任务不会被再次等待）。只有全部任务确认退出后，静态
+ * 栈/TCB 才释放。 */
 esp_err_t awdl_end(void) {
-  if (!g_awdl_netif) return ESP_ERR_INVALID_STATE;
+  /* 只有 CLEAN 才算“没起来”。部分 begin 之后 netif 可能为空而任务/射频仍在，那也必须能拆。/
+     Only CLEAN means "nothing is up": after a partly failed begin() the netif may be null
+     while tasks and the radio are still there, and that must still be cleanable. */
+  if (g_awdl_lc == AWDL_LC_CLEAN) return ESP_ERR_INVALID_STATE;
 
-  /* 1. Ask the tasks to leave, and wait for both. The cadence task sleeps on a
-   *    notification, so poke it rather than waiting out its timer. */
-  g_proc_stopped = g_cad_stopped = false;
+  /* 1. Ask the tasks to leave, and wait for the ones that have not acked yet. The cadence
+   *    task sleeps on a notification, so poke it rather than waiting out its timer.
+   *    重试语义：ack 只在 begin() 建新任务时清零，这里绝不清零，所以上一次超时里已经退出
+   *    的任务不会被再等一遍；g_awdl_stop 也保持 true，留给还活着的任务看。/
+   *    Retry semantics: the acks are cleared only when begin() creates a fresh task, never
+   *    here, so a retry after a timeout does not wait again for a task that is already gone;
+   *    the stop request stays asserted for whichever task is still alive. */
   g_awdl_stop = true;
+  g_awdl_lc = AWDL_LC_STOPPING;
   if (g_cadence_task) xTaskNotifyGive(g_cadence_task);
-#if AWDL_CADENCE_TASK
-  const bool want_cad = true;
-#else
-  const bool want_cad = false;
-#endif
   /* One availability window is 1,048,576 us and proc_task's own idle sleep is one tick,
      so a second is two orders of magnitude of slack. If they have not answered by then
      something is wrong that freeing memory would only make worse. */
   for (int i = 0; i < 1000; i++) {
-    if (g_proc_stopped && (!want_cad || g_cad_stopped)) break;
+    if (g_proc_live && g_proc_stopped) g_proc_live = false;
+    /* 已自删的任务句柄必须立刻作废，否则传输路径会 notify 一块已经没有任务的 TCB。/
+       Invalidate a self-deleted cadence handle at once, or the TX path would notify a TCB
+       that no longer holds a task. */
+    if (g_cad_live && g_cad_stopped) { g_cad_live = false; g_cadence_task = nullptr; }
+    if (!g_proc_live && !g_cad_live) break;
     vTaskDelay(1);
   }
-  if (!g_proc_stopped || (want_cad && !g_cad_stopped)) {
-    g_awdl_stop = false;                 /* leave the link running rather than half-dead */
-    return ESP_ERR_INVALID_STATE;
+  if (g_proc_live || g_cad_live) {
+    /* 半拆状态：保持 stop 与 STOPPING，下一次 awdl_end() 从“谁还没退出”继续。
+     * ESP_ERR_TIMEOUT 是“可重试”，与“没起来”的 ESP_ERR_INVALID_STATE 分开，调用方才能
+     * 区分“无需清理”和“必须接着清”。/
+       Half torn down: keep the stop request and STOPPING; the next awdl_end() resumes from
+       whichever task has still not acked. ESP_ERR_TIMEOUT is "retryable", distinct from the
+       "not up" ESP_ERR_INVALID_STATE, so the caller can tell "nothing to clean" from "keep
+       cleaning". */
+    return ESP_ERR_TIMEOUT;
   }
   g_cadence_task = nullptr;
+  /* 任务把 ack 写在 vTaskDelete(nullptr) 之前，两者只差几条指令；两个 tick 保证自删已经
+   * 完成，此后静态栈/TCB 才不会再被任何任务碰到。/
+     A task stores its ack immediately BEFORE vTaskDelete(nullptr), so the ack and the real
+     exit are a few instructions apart; two ticks make sure the self-delete has finished
+     before the static stack/TCB can be touched again. */
   vTaskDelay(pdMS_TO_TICKS(20));
 
   /* 2. The radio. Promiscuous off FIRST: sniffer_cb writes into the frame ring from the
@@ -2659,11 +2750,14 @@ esp_err_t awdl_end(void) {
   ignore_state(esp_wifi_deinit());
 
   /* 3. The netif, then its queue. NetifTxFrame is stored BY VALUE, so vQueueDelete frees
-   *    every queued frame with it -- there is nothing to drain. */
-  esp_netif_action_disconnected(g_awdl_netif, nullptr, 0, nullptr);
-  esp_netif_action_stop(g_awdl_netif, nullptr, 0, nullptr);
-  esp_netif_destroy(g_awdl_netif);
-  g_awdl_netif = nullptr;
+   *    every queued frame with it -- there is nothing to drain. 部分 begin 失败时 netif
+   *    可能压根没建起来。/ Guarded: a partly failed begin() may have left no netif. */
+  if (g_awdl_netif) {
+    esp_netif_action_disconnected(g_awdl_netif, nullptr, 0, nullptr);
+    esp_netif_action_stop(g_awdl_netif, nullptr, 0, nullptr);
+    esp_netif_destroy(g_awdl_netif);
+    g_awdl_netif = nullptr;
+  }
   if (g_netif_txq) { vQueueDelete(g_netif_txq); g_netif_txq = nullptr; }
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
   if (s_txq_storage) { heap_caps_free(s_txq_storage); s_txq_storage = nullptr; }
@@ -2681,6 +2775,9 @@ esp_err_t awdl_end(void) {
    *    re-initialised by begin() itself; what it does NOT reset is the ND6 seed table,
    *    whose entries name peers this link no longer has. */
   g_nseeded = 0;
-  g_awdl_stop = false;
+  g_awdl_stop = false;                 /* 只有完整拆完才撤销 stop 请求。/
+                                          The stop request is withdrawn only here, after a
+                                          complete teardown. */
+  g_awdl_lc = AWDL_LC_CLEAN;           /* begin() 现在可以重新运行。/ begin() may run again. */
   return ESP_OK;
 }

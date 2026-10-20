@@ -64,6 +64,7 @@ gcc "${flags[@]}" -Itools/transfer_ui_stubs -Icomponents/read_pico_transfer/incl
 python3 tools/test_usb_storage.py
 build/book-tests/transfer-ui
 bash tools/run_app_loop_host_tests.sh
+bash tools/run_airdrop_host_tests.sh
 bash tools/run_display_host_test.sh
 bash tools/run_display_navigation_tests.sh
 bash tools/run_water_turn_host_test.sh

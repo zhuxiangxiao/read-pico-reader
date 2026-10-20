@@ -62,19 +62,27 @@ void read_pico_airdrop_stop(void);
 /// 主循环周期性推进 AWDL 与流式解包消费。/ Advance AWDL cadence and streaming archive consumer.
 void read_pico_airdrop_poll(void);
 
-/// 读取当前隔空投送状态。/ Copy the current AirDrop status snapshot.
+/// 读取当前隔空投送状态快照（服务未运行时同样有效，用于展示最近一次错误）。
+/// Copy the current AirDrop status snapshot (valid while stopped too, for last-error display).
 void read_pico_airdrop_get_status(read_pico_airdrop_status_t *out);
 
 /// 服务是否处于运行态。/ Return true when the AirDrop service is running.
 bool read_pico_airdrop_active(void);
 
-/// 是否正处于活动接收过程（锁屏前用于避免打断接收）。/ Return true while a file transfer is actively in flight.
+/// 是否正处于活动接收过程（锁屏前用于避免打断接收）：正在收包、有打开中的文件，或已有
+/// 整包归档回了 200 但尚未交给文件回调。
+/// Return true while a file transfer is actively in flight: bytes arriving, an open file, or
+/// a whole archive already acknowledged with 200 but not yet handed to the file sink.
 bool read_pico_airdrop_busy(void);
 
 /// 浅睡前暂停隔空投送（若正在接收则拒绝浅睡）。/ Pause AirDrop before light sleep (refuses if actively receiving).
 bool read_pico_airdrop_pause_for_sleep(void);
 
-/// 浅睡唤醒后恢复隔空投送。/ Resume AirDrop after waking from light sleep.
+/// 浅睡唤醒后恢复隔空投送。失败时服务保持停止、状态置 ERROR 且保留 last_error；调用方
+/// 即使 active() 为 false 也应读取状态并刷新界面。
+/// Resume AirDrop after waking from light sleep. On failure the service stays stopped and
+/// the status is left at ERROR with last_error set, so the caller should read the status
+/// even when active() is false and repaint from it.
 void read_pico_airdrop_resume_after_sleep(void);
 
 #ifdef __cplusplus

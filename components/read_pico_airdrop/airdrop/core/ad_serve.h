@@ -77,6 +77,43 @@ static void http_send_response(struct HttpServe *sv, const char *status,
     char _l[192]; snprintf(_l, sizeof(_l), __VA_ARGS__); (sv)->log((sv), _l); \
   } while (0)
 
+/* ---------------------------------------------------------------------------
+ * 请求上限 / Request budgets (R-11)
+ * ---------------------------------------------------------------------------
+ * 中文：头部段按行数、总字节数设上限；/Discover 与 404 的请求体 drain 按字节数、
+ * 单调时钟时限设上限。没有它们，单个 peer 只要在每次读超时之前送来 1 个字节，就能把
+ * 唯一的 TLS 任务无限期占住（同步的 /Ask drain 早就有 30 s 上限，这里向它看齐）。
+ * 越界一律 poison 并关闭：请求体已不在自己的分隔符上，不能继续解析，也不作答。
+ * English: caps on the header section (lines and total bytes) and on the best-effort
+ * body drains of /Discover and the 404 path (bytes and monotonic time). Without them a
+ * peer trickling one byte just before each read timeout holds the single TLS task for
+ * ever; the synchronous /Ask drain has had a 30 s cap all along and these follow it.
+ * Breaching any cap poisons and closes: the body is no longer at its delimiter, so it
+ * must not be parsed further and must not be answered. */
+#define SV_HDR_MAX_LINES      48      /* headers before the blank line / headers        */
+#define SV_HDR_MAX_BYTES      8192    /* total header-section bytes                */
+#define SV_DISC_DRAIN_BYTES   (64u * 1024)   /* 200 already sent: graceful close only */
+#define SV_DISC_DRAIN_MS      1500u
+#define SV_404_DRAIN_BYTES    (256u * 1024)  /* nobody reads a 404's body             */
+#define SV_404_DRAIN_MS       3000u
+
+/* 中文：整个请求阶段（请求行 + 头部）的单调时限。合法请求的行/头部都在一两个 RTT 内
+   到齐；单行读超时是 3000ms，20 s 对正常发送方是两倍以上的余量，而对“每次读超时之前
+   送 1 字节”的对端是硬上限——没有它，行没换行符时 hr_line 可以永远不超时。
+   English: monotonic deadline for the whole request phase (request line + headers).
+   Legit request lines/headers arrive within an RTT or two, the per-line read timeout is
+   3000 ms, so 20 s is more than twice the legitimate worst case while being a hard stop
+   for a peer trickling one byte just before each timeout -- without it, hr_line on a
+   line that never terminates never sees a timeout at all. */
+#define SV_REQ_PHASE_MS 20000u
+
+/* ad_http.h's HttpDrainBudget wants a plain (void*) clock; sv->now takes the serve
+   struct. One trampoline beats duplicating the clock in two places. */
+static uint32_t sv_now_ms_fn(void *ctx) {
+  struct HttpServe *s = (struct HttpServe *)ctx;
+  return s->now(s);
+}
+
 static void serve_http_run(struct HttpServe *sv) {
   struct HttpRdr *r = sv->r;
   char line[512], reqline[128];
@@ -90,6 +127,9 @@ static void serve_http_run(struct HttpServe *sv) {
       (*sv->desync)++;
       break;
     }
+    // 中文：本阶段的单调时限，见 SV_REQ_PHASE_MS。每个请求重新起算。
+    // English: arm the request-phase deadline; it restarts per request.
+    http_deadline_set(r, SV_REQ_PHASE_MS, sv_now_ms_fn, sv);
     // Budget for waiting on a request line. Two very different states share this
     // read:
     //  - FIRST request on a freshly adopted connection: waiting is FREE (every
@@ -132,15 +172,33 @@ static void serve_http_run(struct HttpServe *sv) {
 
     int clen = 0; bool chunked = false, expect100 = false;
     bool hdr_ok = true;
+    // 中文：头部段上限（R-11）。行数、总字节数任一越界即 poison 并关闭；超长行本身
+    // 已经在 hr_line 里 poisoning。
+    // English: header-section caps (R-11). Exceeding either the line count or the total
+    // byte count poisons and closes; an overlong single line is already poisoned by
+    // hr_line. Without these, a peer can keep the single TLS task in header parsing for
+    // ever with 400 ms of trickle per line.
+    uint32_t hdr_bytes = 0; int hdr_lines = 0; bool hdr_over = false;
     for (;;) {                                         // headers up to the blank line
       int hl = hr_line(r, line, sizeof(line));
       if (hl == 0) break;                              // the blank line: headers done
       if (hl < 0) { hdr_ok = false; break; }           // timeout/EOF mid-headers: the
                                                        // rest of the headers and the
                                                        // body are still out there
+      if (r->poisoned) { hdr_ok = false; break; }      // 超长行/失步 / overlong line
+      hdr_lines++;
+      hdr_bytes += (uint32_t)hl + 2;                   // + CRLF not counted by hl
+      if (hdr_lines > SV_HDR_MAX_LINES || hdr_bytes > SV_HDR_MAX_BYTES) { hdr_over = true; break; }
       if      (strncasecmp(line, "Content-Length:", 15) == 0)  { clen = atoi(line + 15); }
       else if (strncasecmp(line, "Transfer-Encoding:", 18) == 0 && strstr(line, "chunked")) chunked = true;
       else if (strncasecmp(line, "Expect:", 7) == 0 && strstr(line, "100")) expect100 = true;
+    }
+    if (hdr_over) {
+      r->poisoned = true;                              // 头部超限 / header budget spent
+      SV_LOG(sv, "http_hdr_budget req=\"%.24s\" lines=%d bytes=%lu -- closing", reqline,
+             hdr_lines, (unsigned long)hdr_bytes);
+      (*sv->desync)++;
+      break;
     }
     if (!hdr_ok || r->poisoned) {
       SV_LOG(sv, "http_hdr_incomplete req=\"%.24s\" eof=%d to=%d -- closing", reqline,
@@ -149,6 +207,12 @@ static void serve_http_run(struct HttpServe *sv) {
       break;
     }
     if (clen < 0) clen = 0;
+    // 中文：头部已完整，请求阶段的时限到此为止；请求体各有自己的预算（/Upload 的
+    // stall patience、各 drain 的 HttpDrainBudget）。
+    // English: the header section is complete, so the request-phase deadline ends here;
+    // each body phase carries its own budget (the /Upload stall patience, the drains'
+    // HttpDrainBudget).
+    http_deadline_off(r);
     const uint32_t t_req = sv->now(sv);
     served++;
     SV_LOG(sv, "req %s clen=%d chunk=%d exp100=%d", reqline, clen, chunked, expect100);
@@ -186,7 +250,10 @@ static void serve_http_run(struct HttpServe *sv) {
     if (is_disc || is_ask) {
       sv->set_timeout(r, AD_G2_BODY_MS);
       SV_LOG(sv, "G2: reading the body before answering (clen=%d chunk=%d)", clen, chunked);
-      http_drain_body(r, chunked, clen);
+      { // 中文：测量构型同样按预算读取，不能成为第二条无上限路径。
+        struct HttpDrainBudget bd = { (1u << 20), AD_G2_BODY_MS, sv_now_ms_fn, sv };
+        http_drain_body_bounded(r, chunked, clen, &bd);
+      }
       SV_LOG(sv, "G2: body read done poisoned=%d eof=%d to=%d",
              r->poisoned, r->eof, r->timed_out);
     }
@@ -208,7 +275,12 @@ static void serve_http_run(struct HttpServe *sv) {
       SV_LOG(sv, "disc_sent n=%lu ms_since_req=%lu -- tile should appear now",
              (unsigned long)*sv->disc_ok, (unsigned long)(sv->now(sv) - t_req));
       sv->set_timeout(r, 400);
-      http_drain_body(r, chunked, clen);
+      { // 中文：响应已发出，drain 只为避免 RST；给它字节/时限上限，超限即关闭。
+        // English: the 200 is already out and this drain only avoids a RST, so it is
+        // bounded; a peer that spends the budget is simply closed.
+        struct HttpDrainBudget bd = { SV_DISC_DRAIN_BYTES, SV_DISC_DRAIN_MS, sv_now_ms_fn, sv };
+        http_drain_body_bounded(r, chunked, clen, &bd);
+      }
       break;                            // one-shot: close and get back to accept()
     }
 
@@ -298,7 +370,20 @@ static void serve_http_run(struct HttpServe *sv) {
       break;                            // /Upload arrives on a fresh connection
     }
 
-    http_drain_body(r, chunked, clen);  // consume the request body (chunked or CL)
+    /* 中文：404 前把这个请求体读掉（避免 RST 冲掉响应）。读不完/超预算就不作答，
+       直接关闭——不能在半读的请求上给出响应（R-11）。
+       English: consume the request body before answering 404 (so the close is not a RST
+       into data the peer has not flushed). If it does not end at its own delimiter --
+       including the bounded budgets -- close instead of answering a half-read request. */
+    {
+      struct HttpDrainBudget bd = { SV_404_DRAIN_BYTES, SV_404_DRAIN_MS, sv_now_ms_fn, sv };
+      if (!http_drain_body_bounded(r, chunked, clen, &bd)) {
+        SV_LOG(sv, "http_drain_stop %s poisoned=%d consumed=%lu -- closing", reqline,
+               r->poisoned, (unsigned long)r->consumed);
+        (*sv->desync)++;
+        break;
+      }
+    }
 
     {
       SV_LOG(sv, "http_404 %s", reqline);

@@ -92,20 +92,36 @@ struct AwdlStatus {
  *
  * Counted as instants per cycle rather than assumed, because a mask is not one block: 0x3b00
  * is two ch6 runs, slots 8-9 and 11-13, each with its own lead and guard, and treating it as
- * one gives 8 where the answer is 21. */
+ * one gives 8 where the answer is 21.
+ *
+ * 每个 run 只在它的第一个槽上计一次；否则跨 15→0 的 run 会在周期接缝处被数两遍
+ * （0x8001 报 15.26/s，正确 7.63/s）。全 ch6 掩码没有 run 起点，按一个不闭合的 run 处理。/
+ * Each run is counted once, at its FIRST slot; otherwise a run wrapping 15 -> 0 is counted
+ * twice at the cycle seam (0x8001 reports 15.26/s where the answer is 7.63/s). The full ch6
+ * mask has no run start at all and is treated as one run that never closes. */
 static float awdl_status_mif_ceiling(uint16_t mask, uint32_t mif_period_us) {
   if (!mask || !mif_period_us) return 0.0f;
+  /* 全 ch6 是一整个不闭合的 run，没有 lead/guard，到周期末尾才结束（见
+     awdl_window_remaining_at）。/ Full ch6 is one run that never closes: no lead, no guard,
+     it only ends with the cycle -- see awdl_window_remaining_at(). */
+  if (mask == 0xFFFFu) {
+    int n = 0;
+    while ((int64_t)n * mif_period_us < AWC_US) n++;
+    return (float)n * 1000000.0f / (float)AWC_US;
+  }
   struct AwdlWindow w; awdl_window_init(&w, mask);
   int total = 0;
-  int64_t p = 0;
-  for (int guard = 0; guard < AWDL_SLOTS && p < AWC_US; guard++) {
-    int64_t open_rel, len;
-    if (!awdl_window_run_at(&w, p, &open_rel, &len)) break;
-    if (p + open_rel >= AWC_US) break;                 /* that run belongs to the next cycle */
+  for (int k = 0; k < AWDL_SLOTS; k++) {
+    if (!(mask & (uint16_t)(1u << k))) continue;
+    /* 前一个槽也是 ch6，说明这个槽在 run 中间：run 已经在它自己的起点数过了。/
+       Its predecessor is ch6 too, so this slot is mid-run: the run was already counted at
+       its own start. */
+    if (mask & (uint16_t)(1u << ((k + AWDL_SLOTS - 1) & (AWDL_SLOTS - 1)))) continue;
+    int64_t open_rel = 0, len = 0;
+    if (!awdl_window_run_at(&w, (int64_t)k * AWDL_SLOT_US, &open_rel, &len)) continue;
     int n = 0;
     while ((int64_t)n * mif_period_us < len) n++;
     total += n;
-    p = p + open_rel + len + 1;
   }
   return (float)total * 1000000.0f / (float)AWC_US;
 }

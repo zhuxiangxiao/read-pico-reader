@@ -127,6 +127,51 @@ idf_component_register(
         "assets/display-test.png"
 )
 
+# 中文：媒体/页面/备份等冷路径源文件用 -Os；阅读排版、绘制、触摸、锁屏、休眠、OTA
+# 写入等热路径与关键路径保持 -O2。与根 CMakeLists 的 PICO_SIZE_OPT_COMPONENTS 配套。
+# English: cold-path sources (other pages, media, backups) get -Os; reading/layout,
+# drawing, touch, lock, sleep and OTA-write hot/critical paths keep -O2. Works together
+# with PICO_SIZE_OPT_COMPONENTS in the root CMakeLists.
+set(PICO_SIZE_OPT_MAIN_SOURCES
+    "apps/app_device_settings.c"
+    "apps/app_dashboard.c"
+    "apps/app_files.c"
+    "apps/app_image.c"
+    "apps/app_transfer.c"
+    "apps/book_toc.c"
+    "apps/file_tree.c"
+    "apps/usb_storage.c"
+    "book/book_cover.c"
+    "book/book_cover_auto.c"
+    "book/book_cover_jobs.c"
+    "book/book_image_header.c"
+    "book/book_index_cache.c"
+    "book/book_lock_bookmark.c"
+    "book/book_lock_collage.c"
+    "book/book_excerpt.c"
+    "book/book_history_backup.c"
+    "book/book_progress.c"
+    "book/book_source.c"
+    "book/book_store.c"
+    "book/book_ticket.c"
+    "book/book_title.c"
+    "book/book_txt.c"
+    "book/book_epub.c"
+    "book/zip_reader.c"
+    "settings.c"
+    "boot_state.c"
+    "ota_online.c"
+    "ota_release.c"
+    "factory/pmu_selftest.c"
+    "factory/vcom_setup.c"
+    "ui/ui_wifi_qr.c"
+    "ui/datamatrix.c"
+    "ui/ui_wallpaper.c"
+    "ui/ui_avatar.c"
+    "ui/ui_reader_background.c"
+)
+set_source_files_properties(${PICO_SIZE_OPT_MAIN_SOURCES} PROPERTIES COMPILE_OPTIONS "-Os")
+
 # 包住 IDF 的 panic 处理器：崩溃现场在重启前落进 RTC，没有串口时那是唯一的现场。
 # 链接选项挂在 main 上，INTERFACE 会带到最终链接；写在 project() 之后的全局属性则太晚。
 # Wrap the IDF panic handler so the crash scene reaches RTC before a restart; without a console

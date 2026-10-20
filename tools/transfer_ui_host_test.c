@@ -352,12 +352,26 @@ int main(void) {
     // AirDrop missing-card gate, normal start, static panel while receiving, immediate cancel and media-loss stop.
     ctx.request_return = false;
     test_sd_mounted = false;
+    // 上一会话的计数与文件名不得带进缺卡门禁。/ Previous session counts and file name must not leak into the missing-card gate.
+    test_airdrop_status.completed_files = 5;
+    test_airdrop_status.books_received = 3;
+    test_airdrop_status.fonts_received = 2;
+    strcpy(test_airdrop_status.current_file, "old-session.epub");
+    test_airdrop_status.current_bytes = 4096;
+    test_airdrop_status.current_total = 8192;
     app_transfer_request_airdrop_start();
     on_enter(&ctx);
     assert(s_direct_entry && s_airdrop_entry && !s_airdrop_start_pending);
     assert(s_airdrop_status.state == READ_PICO_AIRDROP_ERROR && !strcmp(s_airdrop_status.last_error, "请插入 TF 卡"));
+    assert(!s_airdrop_status.completed_files && !s_airdrop_status.books_received &&
+           !s_airdrop_status.fonts_received && !s_airdrop_status.current_file[0]);
+    assert(!s_airdrop_status.current_bytes && !s_airdrop_status.current_total);
+    // 门禁错误不能被组件空闲状态覆盖。/ The gate error must survive the component's idle state.
+    assert(on_tick(&ctx) == APP_REDRAW_NONE);
+    assert(s_airdrop_status.state == READ_PICO_AIRDROP_ERROR && !strcmp(s_airdrop_status.last_error, "请插入 TF 卡"));
     tap(&ctx, control_rect(2));
     assert(ctx.request_return && test_airdrop_starts == 0);
+    test_airdrop_status = (read_pico_airdrop_status_t){0};
 
     ctx.request_return = false;
     test_sd_mounted = true;
@@ -378,8 +392,35 @@ int main(void) {
     assert(on_tick(&ctx) == APP_REDRAW_AREA && !s_settle);
     test_airdrop_status.current_bytes = 32768;
     assert(on_tick(&ctx) == APP_REDRAW_NONE);
+    // 字体完成且同一轮内下一文件已开始接收：只重扫一次，接收画面保持静止。
+    // A font completing as the next file starts rescans once while the receiving screen stays static.
+    int font_scans = test_font_scans;
+    test_airdrop_status.fonts_received = 1;
+    strcpy(test_airdrop_status.current_file, "next.epub");
+    test_airdrop_status.current_bytes = 0;
+    test_airdrop_status.current_total = 1048576;
+    assert(on_tick(&ctx) == APP_REDRAW_NONE && test_font_scans == font_scans + 1);
+    test_airdrop_status.current_bytes = 512;
+    assert(on_tick(&ctx) == APP_REDRAW_NONE && test_font_scans == font_scans + 1);
     tap(&ctx, control_rect(2));
     assert(ctx.request_return && !test_airdrop_active && test_airdrop_stops == 1);
+
+    // 浅睡唤醒恢复失败：服务已停但页面仍须同步组件错误并刷新状态卡。
+    // A failed resume leaves the service stopped; the page still mirrors the component error.
+    ctx.request_return = false;
+    app_transfer_request_airdrop_start();
+    on_enter(&ctx);
+    assert(on_tick(&ctx) == APP_REDRAW_PAGE);
+    assert(test_airdrop_active && s_airdrop_status.state == READ_PICO_AIRDROP_READY);
+    test_airdrop_active = false;
+    test_airdrop_status.state = READ_PICO_AIRDROP_ERROR;
+    strcpy(test_airdrop_status.last_error, "隔空投送服务启动失败 (-1)");
+    assert(on_tick(&ctx) == APP_REDRAW_AREA);
+    assert(s_airdrop_status.state == READ_PICO_AIRDROP_ERROR);
+    assert(!strcmp(s_airdrop_status.last_error, "隔空投送服务启动失败 (-1)"));
+    assert(on_tick(&ctx) == APP_REDRAW_NONE);
+    transfer_on_exit(&ctx);
+    test_airdrop_status = (read_pico_airdrop_status_t){0};
 
     // 完成书籍和字体投送后触发书架通知与字体重扫；拔卡立即停止服务。
     // Completed book/font transfers notify the shelf and rescan fonts; media loss stops the service immediately.

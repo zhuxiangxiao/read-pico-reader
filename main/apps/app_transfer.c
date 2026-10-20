@@ -986,6 +986,14 @@ static void on_enter(app_ctx_t* ctx) {
     } else if (s_airdrop_requested) {
         s_airdrop_requested = false;
         s_view = TRANSFER_HOME;
+        // 新会话从零计数开始；门禁失败时也不能显示上一次会话的数据。
+        // A new session starts from zero; a failed gate never shows the previous session's data.
+        s_airdrop_status.completed_files = 0;
+        s_airdrop_status.books_received = 0;
+        s_airdrop_status.fonts_received = 0;
+        s_airdrop_status.current_file[0] = 0;
+        s_airdrop_status.current_bytes = 0;
+        s_airdrop_status.current_total = 0;
         if (!refresh_airdrop_sd_free()) {
             s_airdrop_status.state = READ_PICO_AIRDROP_ERROR;
             snprintf(s_airdrop_status.last_error, sizeof(s_airdrop_status.last_error), "请插入 TF 卡");
@@ -1159,9 +1167,24 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             }
             return APP_REDRAW_PAGE;
         }
-        if (!read_pico_airdrop_active()) return APP_REDRAW_NONE;
-        read_pico_airdrop_poll();
         read_pico_airdrop_status_t next = {0};
+        if (!read_pico_airdrop_active()) {
+            // 服务未运行时也同步组件状态；启动或唤醒恢复失败不能让状态卡停在旧画面。
+            // Mirror the component status while inactive so failed start/resume cannot leave a stale card.
+            read_pico_airdrop_get_status(&next);
+            // 缺卡/忙碌门禁的页面错误优先于组件侧“已停止”，保持门禁提示可见。
+            // Page gate errors outrank the component's stopped state and stay visible.
+            if (next.state == READ_PICO_AIRDROP_STOPPED &&
+                s_airdrop_status.state == READ_PICO_AIRDROP_ERROR) return APP_REDRAW_NONE;
+            if (next.state == s_airdrop_status.state &&
+                !strcmp(next.last_error, s_airdrop_status.last_error)) return APP_REDRAW_NONE;
+            s_airdrop_status = next;
+            refresh_airdrop_sd_free();
+            draw_airdrop_status(ctx->fb);
+            s_area = airdrop_status_rect();
+            return APP_REDRAW_AREA;
+        }
+        read_pico_airdrop_poll();
         read_pico_airdrop_get_status(&next);
         if (next.books_received > 0) s_any_changed = true;
         if (next.fonts_received > s_airdrop_status.fonts_received) ttf_font_scan();
@@ -1171,6 +1194,9 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
             s_airdrop_status.state == READ_PICO_AIRDROP_RECEIVING) {
             s_airdrop_status.current_bytes = next.current_bytes;
             s_airdrop_status.current_total = next.current_total;
+            // 已扫描的字体计数也要跟上，否则同一文件随后每轮都会重复扫描。
+            // Track the seen font count too, or the rest of the same file rescans every tick.
+            s_airdrop_status.fonts_received = next.fonts_received;
             return APP_REDRAW_NONE;
         }
         bool changed = next.state != s_airdrop_status.state ||

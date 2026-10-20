@@ -20,9 +20,17 @@ target_compile_options(${COMPONENT_LIB} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-Wno-volatile>
 )
 
+# 包住的符号只在别的静态库里被引用，必须用 -u 先把 wrapper 目标文件拉进链接，
+# 否则链接器扫过本库后不会再回来取定义。
+# The wrapped symbols are only referenced from another archive, so -u must pull the
+# wrapper objects in before the linker passes this library.
 target_link_libraries(${COMPONENT_LIB} INTERFACE
     "-Wl,--wrap=esp_aes_crypt_cbc"
+    "-Wl,-u,__wrap_esp_aes_crypt_cbc"
     "-Wl,--wrap=esp_aes_crypt_ctr"
+    "-Wl,-u,__wrap_esp_aes_crypt_ctr"
     "-Wl,--wrap=esp_aes_crypt_ecb"
+    "-Wl,-u,__wrap_esp_aes_crypt_ecb"
     "-Wl,--wrap=esp_wifi_init"
+    "-Wl,-u,__wrap_esp_wifi_init"
 )

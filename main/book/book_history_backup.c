@@ -69,7 +69,10 @@ static bool valid_record(unsigned ns, uint8_t type, const char *key, const uint8
 static esp_err_t read_value(nvs_handle_t h, const nvs_entry_info_t *info, uint8_t **value, size_t *len) {
     *value = NULL;
     *len = 0;
-    esp_err_t err;
+    // 中文：-Os 下 GCC 的路径分析会把 nvs_get_* 的赋值看成可能未执行；
+    // 显式初始化，既消警又不改变控制流。English: -Os path analysis can see the
+    // nvs_get_* assignments as possibly skipped; initialize explicitly.
+    esp_err_t err = ESP_OK;
     if (info->type == NVS_TYPE_U8) *len = 1;
     else if (info->type == NVS_TYPE_U32) *len = 4;
     else if (info->type == NVS_TYPE_STR) err = nvs_get_str(h, info->key, NULL, len);

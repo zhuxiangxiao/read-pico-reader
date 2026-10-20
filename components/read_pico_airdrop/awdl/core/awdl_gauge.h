@@ -158,6 +158,11 @@ static void ga_shift(ga_t *g, int32_t d) {
     if (g->src[i].used && g->src[i].b_ok)
       g->src[i].B = ((uint32_t)((int32_t)g->src[i].B + d)) & GA_MASK;
 }
+/* 整表旋转 d：正数把样本搬到更大的 bin。锁定后直方图存的是相对 C 的相位，所以 C 前移 d
+   时必须配 ga_rotate(g, -d)，同一个绝对相位才会留在原处。/
+   Rotate the whole histogram by d; positive moves samples to higher bins. While locked the
+   histogram holds C-relative phase, so a gauge move of +d must be paired with
+   ga_rotate(g, -d) for a given ABSOLUTE phase to stay where it was. */
 static void ga_rotate(ga_t *g, int32_t d) {
   static uint16_t tmp[GA_NB];
   int shift = (int)((((uint32_t)d) & GA_MASK) >> GA_BSH);
@@ -255,7 +260,12 @@ static void ga_eval(ga_t *g, uint32_t rx) {
   int cool_ok = (!g->t_fix_valid) || ((uint32_t)(rx - g->t_fix) >= GA_FIX_COOL_US);
   if (naw != 0 && cool_ok) {
     int32_t mv = (int32_t)naw * (int32_t)GA_AW;
-    ga_shift(g, mv); ga_rotate(g, mv);
+    /* 直方图是相对 C 的：C 移动 +mv，样本就要反向旋转 -mv，主峰才会落在它自己要求的 0 处；
+       旋转 +mv 会让主峰停在约两倍修正量处（+1 AW 修正后主峰 +32768 us，虚增 veto/sick）。/
+       The histogram is C-relative: C moves by +mv, so the samples must rotate by -mv and the
+       peak ends up at the 0 it itself asked for. Rotating by +mv leaves the peak at about
+       twice the correction (+32768 us after a +1 AW fix, inflating veto/sick). */
+    ga_shift(g, mv); ga_rotate(g, -mv);
     g->t_fix = rx; g->t_fix_valid = 1; g->n_awfix++; g->n_suff++;
     g->march = 0; g->s_prev_valid = 0; g->disc = 0;
     for (int i = 0; i < GA_SRC; i++) g->src[i].av_c = 0;

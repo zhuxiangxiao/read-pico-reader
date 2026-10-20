@@ -269,9 +269,12 @@ static int awdl_peer_live(const struct AwdlPeerTable *t, uint32_t now_ms, uint32
  * n is bounded by the caller's fixed 16-wide offset row; u[] is sized to match.
  */
 static inline void phase_stats_raw(const int64_t *off, int n, float *mean, float *stdev) {
-  if (n == 0) { *mean = 0; *stdev = 0; return; }
+  if (n <= 0) { *mean = 0; *stdev = 0; return; }
+  /* 中文：u[] 只有 16 项，先钳住 n，避免未来调用方越界写。
+     English: u[] is 16 wide, so clamp n rather than trusting the caller. */
+  if (n > 16) n = 16;
   int64_t base = off[0];
-  double u[16];
+  double u[16] = {0};
   for (int i = 0; i < n; i++) {
     int64_t d = ((off[i] - base) % AWC_US + AWC_US) % AWC_US;
     if (d > AWC_US / 2) d -= AWC_US;

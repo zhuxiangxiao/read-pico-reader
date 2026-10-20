@@ -1040,6 +1040,10 @@ static bool                  g_scur_held = false;
 static volatile bool         g_stream_started = false;  /* a stream transfer ever opened  */
 static volatile bool         g_stream_open    = false;  /* producer is between open/end   */
 static volatile bool         g_stream_done    = false;  /* consumer ate the end marker    */
+/* 生产者没能投递结束标记（环已停或 sink 已判失败）时置位，消费者据此收尾。
+ * Set when the producer cannot post its end marker (ring stopping, sink already failed);
+ * the consumer finalizes from this flag then, instead of waiting for ever. */
+static volatile bool         g_stream_abort   = false;
 static volatile bool         g_stream_sink_failed = false;
 static volatile uint32_t     g_stream_files_seen = 0;
 
@@ -1133,7 +1137,34 @@ static void stream_infra_free(void) {
   g_scur_held = false;
 }
 
+/* RETURN ONE BLOCK TO THE FREE QUEUE EXACTLY ONCE.
+ *
+ * The ring's invariant, and the reason this helper exists: every one of the four blocks
+ * is in exactly one place at any moment -- g_sfree_q, g_sready_q, g_scur while
+ * g_scur_held, or in the consumer's hands between xQueueReceive and its recycle. The free
+ * queue's capacity IS the block count, so a send back can only fail if a block is
+ * released twice; the log line makes that bug visible instead of silent. Abort paths used
+ * to return with g_scur still held, which permanently removed a block per aborted
+ * transfer: four aborts and every later transfer waited AD_STREAM_WAIT_MS and failed.
+ *
+ * 每个 ring 块任一时刻只属于一处：空闲队列、就绪队列、生产者持有的 g_scur，或消费者
+ * 收到与回收之间的手中。空闲队列容量等于块数，回收失败只可能是重复回收。中断路径必须
+ * 把持有的块还回去，否则每次中断永久少一块，四次后后续投送全部超时失败。 */
+static void stream_block_recycle(struct AdStreamBlk *b) {
+  if (!g_sfree_q) return;
+  if (xQueueSend(g_sfree_q, b, 0) != pdTRUE) {
+    AD_LOG("RX-STREAM: free queue full recycling a block -- double release\n");
+  }
+  b->p = nullptr;
+  b->n = 0;
+}
+
 static bool stream_send_ready(const struct AdStreamBlk *blk) {
+  /* stream_infra_free() can run while the TLS task is still alive (ad_end waits 4 s for it,
+     then frees anyway). Nothing can be delivered then: fail the transfer instead of
+     dereferencing a deleted queue.
+   * ad_end 等任务 4 秒后仍会释放队列，此时 TLS 任务可能还活着；直接判失败，不解引用空队列。 */
+  if (!g_sready_q) return false;
   uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
   while (!g_stream_sink_failed && !g_tcp_listen_stop &&
          (uint32_t)(esp_timer_get_time() / 1000) - t0 < AD_STREAM_WAIT_MS) {
@@ -1147,6 +1178,8 @@ static bool stream_send_ready(const struct AdStreamBlk *blk) {
 /* Produce decoded archive bytes into the ring (TLS task). Blocks when the sink is
    behind -- that pause IS the backpressure. false = fail the transfer. */
 static bool stream_produce(const uint8_t *data, uint32_t n) {
+  /* 环已随 teardown 释放：直接失败，不解引用空队列。/ Ring freed by teardown: fail, do not deref. */
+  if (!g_sfree_q || !g_sready_q) return false;
   /* Keep the producer-side completeness watcher fed first: it must see every byte the
      consumer will see, and this is the one funnel both sinks pass through. */
   if (g_prod_cpio.phase < AD_CPIO_PH_DONE) {
@@ -1154,7 +1187,12 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
     (void)ad_cpio_stream_feed(&g_prod_cpio, data, n, &eaten);
   }
   while (n) {
-    if (g_stream_sink_failed || g_tcp_listen_stop) return false;
+    if (g_stream_sink_failed || g_tcp_listen_stop) {
+      /* 中止前把手里这块还回去：旧代码直接 return，块既不在空闲也不在就绪队列。 */
+      /* Recycle the held block before aborting: the old return dropped it out of both queues. */
+      if (g_scur_held) { stream_block_recycle(&g_scur); g_scur_held = false; }
+      return false;
+    }
     if (!g_scur_held) {
       uint32_t t0 = (uint32_t)(esp_timer_get_time() / 1000);
       bool got_blk = false;
@@ -1167,7 +1205,7 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
       }
       if (!got_blk) {
         AD_LOG("RX-STREAM: sink stalled or stopped -> abort\n");
-        return false;
+        return false;   /* 此处没有持有的块。/ No block is held on this path. */
       }
       g_scur_held = true;
       g_scur.n = 0;
@@ -1181,6 +1219,9 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
     if (g_scur.n == AD_STREAM_BLOCK_SZ) {
       g_scur_held = false;
       if (!stream_send_ready(&g_scur)) {
+        /* 满块没进就绪队列，消费者永远不会回收它；这里归还，保证恰好一次。 */
+        /* A full block the consumer never saw: return it here, exactly once. */
+        stream_block_recycle(&g_scur);
         return false;
       }
     }
@@ -1193,12 +1234,18 @@ static bool stream_produce(const uint8_t *data, uint32_t n) {
    back whatever file the failure cut). */
 static void stream_producer_end(void) {
   if (g_scur_held) {
-    (void)stream_send_ready(&g_scur);
     g_scur_held = false;
+    if (!stream_send_ready(&g_scur)) {
+      /* 块没送达消费者：归还，并标记流产，让消费者在没有结束标记时也能收尾。 */
+      /* The block never reached the consumer: recycle it and mark the stream aborted so
+         the consumer can finalize without the end marker we are about to fail to post. */
+      stream_block_recycle(&g_scur);
+      g_stream_abort = true;
+    }
   }
   struct AdStreamBlk end = {nullptr, 0};
-  (void)stream_send_ready(&end);
-  g_stream_open = false;
+  if (!stream_send_ready(&end)) g_stream_abort = true;
+  g_stream_open = false;   /* release flag: the consumer may finalize from g_stream_abort */
 }
 
 /* Wait for the sink to finish the archive so the HTTP response can speak about it.
@@ -1219,6 +1266,29 @@ static bool stream_wait_finalized(uint32_t timeout_ms) {
   return g_stream_sink_failed;
 }
 
+/* 消费者收尾：截断、sink 写失败、空归档三种判决，与结束标记路径一致。
+ * Finalize the consumer's parser with the same verdict ladder the end marker used: a cut
+ * archive, a failed sink, or an archive that held no files. */
+static void stream_finalize(void) {
+  int rc = ad_cpio_stream_finish(&g_cpio);
+  if (rc == AD_CPIO_STREAM_BAD) {
+    g_img_err++;
+    strlcpy(g_img_errmsg, "archive truncated", sizeof(g_img_errmsg));
+    AD_LOG("CPIO-CUT: stream cut after %lu regular files\n",
+           (unsigned long)g_stream_files_seen);
+  } else if (rc == AD_CPIO_STREAM_WRITE) {
+    if (!g_stream_sink_failed) {
+      g_stream_sink_failed = true;
+      g_img_err++;
+      strlcpy(g_img_errmsg, "storage write failed", sizeof(g_img_errmsg));
+    }
+  } else if (g_stream_files_seen == 0) {
+    g_img_err++;
+    strlcpy(g_img_errmsg, "archive held no files", sizeof(g_img_errmsg));
+  }
+  g_stream_done = true;                        /* release flag: set LAST */
+}
+
 /* The consumer half (ad_poll's task): drain blocks, run the cpio state machine, write
    the files out through the sink. Blocks are recycled to the producer as soon as their
    bytes are consumed, so a stalled sink is visible to the producer as a free-block wait. */
@@ -1227,23 +1297,7 @@ static void stream_consumer_poll(void) {
   struct AdStreamBlk blk;
   while (xQueueReceive(g_sready_q, &blk, 0) == pdTRUE) {
     if (blk.p == nullptr) {                        /* end marker */
-      int rc = ad_cpio_stream_finish(&g_cpio);
-      if (rc == AD_CPIO_STREAM_BAD) {
-        g_img_err++;
-        strlcpy(g_img_errmsg, "archive truncated", sizeof(g_img_errmsg));
-        AD_LOG("CPIO-CUT: stream cut after %lu regular files\n",
-               (unsigned long)g_stream_files_seen);
-      } else if (rc == AD_CPIO_STREAM_WRITE) {
-        if (!g_stream_sink_failed) {
-          g_stream_sink_failed = true;
-          g_img_err++;
-          strlcpy(g_img_errmsg, "storage write failed", sizeof(g_img_errmsg));
-        }
-      } else if (g_stream_files_seen == 0) {
-        g_img_err++;
-        strlcpy(g_img_errmsg, "archive held no files", sizeof(g_img_errmsg));
-      }
-      g_stream_done = true;                        /* release flag: set LAST */
+      stream_finalize();
       continue;
     }
     uint32_t used = 0;
@@ -1263,6 +1317,17 @@ static void stream_consumer_poll(void) {
          already condemned; the marker's finish() reports it. */
       continue;
     }
+  }
+  /* 结束标记可能永远不会到：生产者投递失败时置 g_stream_abort 再清 g_stream_open，
+     所以看到 open 清空且就绪队列已排空，就说明不会再有任何块到达，可以收尾。
+   * No end marker will ever arrive when the producer's posts failed: it sets g_stream_abort
+     before clearing g_stream_open, so open==false plus a drained ready queue means every
+     block that will ever arrive is in. Finalize here, or the parser and the stream flags
+     would stay open for the rest of the session. */
+  if (g_stream_abort && !g_stream_open && !g_stream_done &&
+      uxQueueMessagesWaiting(g_sready_q) == 0) {
+    g_stream_abort = false;
+    stream_finalize();
   }
 }
 
@@ -1345,10 +1410,20 @@ static bool rx_stream_open(struct RxPump *p) {
   }
   ad_cpio_stream_init(&g_cpio, kCpioBridge);
   ad_cpio_stream_init(&g_prod_cpio, AdCpioStreamOps{nullptr, nullptr, nullptr, nullptr});
+  /* 开新传输前环必须是满的：消费者已收尾，所有块都应回到空闲队列。不是就说明有块没
+     归还；只记日志，不盲目补齐（补齐可能把消费者手里的块重复入队）。
+   * A new transfer opens with the ring whole -- the consumer has finalized, so every block
+     must be back in the free queue. If it is not, a block was not recycled; log it rather
+     than repair blindly, since a repair could double-release a block the consumer holds. */
+  if (uxQueueMessagesWaiting(g_sfree_q) != AD_STREAM_BLOCKS) {
+    AD_LOG("RX-STREAM: ring not whole at open: %u of %u blocks free\n",
+           (unsigned)uxQueueMessagesWaiting(g_sfree_q), (unsigned)AD_STREAM_BLOCKS);
+  }
   g_stream_files_seen = 0;
   g_stream_sink_failed = false;
   g_stream_done = false;
   g_stream_started = true;
+  g_stream_abort = false;                           /* 上一轮的流产标记不得带入本轮 / no stale abort */
   g_stream_open = true;
   g_scur_held = false;
   p->streaming = true;
@@ -2326,6 +2401,12 @@ void ad_poll(void) {
   raw_archive_poll();
 }
 
+/* 整包归档已回 200 但尚未交付文件回调：调用调度器必须把它计入“忙”，teardown 前先排空。
+ * A whole-archive body was acknowledged (200) but the file sink has not seen it yet. The
+ * scheduler must count it as busy, and teardown must drain it through ad_poll() first --
+ * otherwise the sender was told success and the archive is freed before delivery. */
+bool ad_arch_pending(void) { return g_arch_ready; }
+
 /* --- lifecycle ------------------------------------------------------------ */
 
 static bool g_ad_role_receiver = false;
@@ -2425,6 +2506,7 @@ void ad_end(void) {
   g_stream_open = false;
   g_stream_started = false;
   g_stream_done = false;
+  g_stream_abort = false;
   g_stream_sink_failed = false;
   g_rx_active = false;
   g_ad_role_receiver = false;
@@ -2473,5 +2555,7 @@ void ad_stats_read(struct AdStatus *out) {
    ad_role_is_receiver() is the single exception, because ad_sender_begin() asks it. */
 #include "ad_port_esp32.h"
 bool ad_role_is_receiver(void) { return false; }
+/* 发送端构建没有接收侧交接，因此永远没有待交付归档。/ A sender build never has an archive pending. */
+bool ad_arch_pending(void) { return false; }
 
 #endif /* !ESP32DROP_SENDER */
