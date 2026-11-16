@@ -93,6 +93,11 @@ esp_err_t html_to_blocks(const char* html, size_t len, html_text_t* out);
 /// 先应用书内 CSS，再应用页面内样式；两段输入均只借用。/ Apply in-book CSS before page styles; both inputs are borrowed.
 esp_err_t html_to_blocks_with_css(const char* html, size_t len,
                                    const char* css, size_t css_len, html_text_t* out);
+/// 可选只读观察器：已排版 UTF8 字节位置与原 HTML 字节位置；不改变解析输出。
+/// Optional read-only observer for normalized UTF8 and original HTML byte positions, without changing output.
+typedef void (*html_source_observer_fn)(void *ctx, size_t text_offset, size_t html_offset);
+esp_err_t html_to_blocks_mapped(const char *html, size_t len, const char *css, size_t css_len,
+    html_source_observer_fn observer, void *ctx, html_text_t *out);
 /// 同一次解析记录 EPUB #fragment 在规范化正文中的字节位置；找不到时为零。
 /// Record a fragment's normalized text offset during parsing; missing anchors map to zero.
 esp_err_t html_to_blocks_with_css_anchor(const char* html, size_t len,

@@ -52,6 +52,9 @@
 #include "book_progress.h"
 #include "book_store.h"
 #include "book_file_path.h"
+#include "book_source_weread.h"
+#include "weread_runtime.h"
+#include "app_weread.h"
 #include "book_title.h"
 #include "book_ticket.h"
 #include "book_excerpt.h"
@@ -195,6 +198,7 @@ static void copy_title(char *dst, size_t cap, const char *src) {
 }
 
 static void title_for(home_book_t *item) {
+    if (book_weread_metadata(item->path,item->title,sizeof(item->title),item->author,sizeof(item->author))) return;
     if (!book_name_from_path(item->path, item->title, sizeof(item->title),item->author,sizeof(item->author)))
         copy_title(item->title, sizeof(item->title), "未命名");
     (void)book_weread_cover_metadata(item->path, item->title, sizeof(item->title),
@@ -240,17 +244,18 @@ static void scan_root(const char *root) {
 static bool recent_visit(const char *path,const book_progress_t *progress,void *ctx) {
     (void)ctx;
     struct stat st;
-    if (is_book(path) && !stat(path,&st) && S_ISREG(st.st_mode) && st.st_size>=0 && (uint64_t)st.st_size==progress->file_size)
+    if (book_path_is_supported_target(path) && !book_target_stat(path,&st) && S_ISREG(st.st_mode) && st.st_size>=0 && (uint64_t)st.st_size==progress->file_size)
         consider_book(path,&st);
     return true;
 }
 static void scan_books(void) {
+    weread_runtime_load_local();
     char last[BOOK_STORE_PATH_MAX];
     // 不支持的恢复记录只跳过，不删除其他固件的缓存和阅读位置。
     // Ignore unsupported resume records without deleting another firmware's cache or progress.
-    if (book_progress_last_path(last, sizeof(last)) && book_file_path_supported(last)) {
+    if (book_progress_last_path(last, sizeof(last)) && book_path_is_supported_target(last)) {
         struct stat st;
-        if (!stat(last, &st) && S_ISREG(st.st_mode) && st.st_size >= 0 && (uint64_t)st.st_size <= UINT32_MAX) {
+        if (!book_target_stat(last, &st) && S_ISREG(st.st_mode) && st.st_size >= 0 && (uint64_t)st.st_size <= UINT32_MAX) {
             snprintf(s_current.path, sizeof(s_current.path), "%s", last);
             s_current.has_progress = book_progress_load(last, (uint32_t)st.st_size, &s_current.progress);
             title_for(&s_current);
@@ -294,7 +299,7 @@ static void refresh_progress(void) {
     for (int i = 0; i < 7; ++i) {
         home_book_t *item = book_at(i);
         struct stat st;
-        if (!item->path[0] || stat(item->path, &st) || !S_ISREG(st.st_mode) ||
+        if (!item->path[0] || book_target_stat(item->path, &st) || !S_ISREG(st.st_mode) ||
             st.st_size < 0 || (uint64_t)st.st_size > UINT32_MAX) continue;
         item->has_progress = book_progress_load(item->path, (uint32_t)st.st_size, &item->progress);
     }
@@ -333,7 +338,7 @@ static void restore_cover_cache(void) {
         struct stat st;
         book->cover = NULL;
         match[i] = -1;
-        if (!book->path[0] || stat(book->path, &st) || !S_ISREG(st.st_mode)) continue;
+        if (!book->path[0] || book_target_stat(book->path, &st) || !S_ISREG(st.st_mode)) continue;
         for (int j = 0; j < 7; ++j) {
             home_cover_cache_t *cached = &s_cover_cache[j];
             if (used[j] || !cached->pixels || strcmp(book->path, cached->path) ||
@@ -374,6 +379,24 @@ static bool s_cover_waiting;
 static bool load_cover(home_book_t *item,int slot) {
     s_cover_waiting=false;
     if(!pico_boot_asset_allowed(item->path))return false;
+    if (book_path_is_weread(item->path)) {
+        uint8_t *pixels=heap_caps_malloc(176u*240u,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT); struct stat st;
+        if (!pixels || !book_weread_cover(item->path,pixels,176u*240u) || book_target_stat(item->path,&st)) { free(pixels); return false; }
+        bool fast=app_settings_main_fast_refresh();
+        if (fast) {
+            uint8_t *bits=heap_caps_calloc(22u*240u,1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);if(!bits){free(pixels);return false;}
+            for(unsigned y=0;y<240;++y)for(unsigned x=0;x<176;++x)
+                if(ui_image_dither_bw(ui_contrast_gray(pixels[y*176+x]),x,y))bits[y*22+x/8]|=1u<<(x&7);
+            free(pixels);pixels=bits;
+        }
+        home_cover_cache_t *cached=&s_cover_cache[slot]; free(cached->pixels); memset(cached,0,sizeof(*cached));
+        snprintf(cached->path,sizeof(cached->path),"%s",item->path);
+        snprintf(cached->title,sizeof(cached->title),"%s",item->title);
+        snprintf(cached->author,sizeof(cached->author),"%s",item->author);
+        cached->size=st.st_size; cached->modified=st.st_mtime; cached->pixels=pixels;
+        cached->width=176;cached->height=240;cached->fast=fast;
+        item->cover=pixels;item->cover_fast=fast;item->cover_width=176;item->cover_height=240;return true;
+    }
     book_cover_job_t request={.list=true,.natural=true,.fast=app_settings_main_fast_refresh(),
         .contrast=app_settings_system_contrast(),.phase=17};
     snprintf(request.path,sizeof(request.path),"%s",item->path);
@@ -562,7 +585,7 @@ static uint32_t folder_key(void) {
     for(unsigned i=0;i<n;++i) {
         for(const char *p=books[i]->path;*p;++p)hash=(hash^(uint8_t)*p)*16777619u;
         struct stat st;
-        if(!stat(books[i]->path,&st)) { hash=(hash^(uint32_t)st.st_size)*16777619u;hash=(hash^(uint32_t)st.st_mtime)*16777619u; }
+        if(!book_target_stat(books[i]->path,&st)) { hash=(hash^(uint32_t)st.st_size)*16777619u;hash=(hash^(uint32_t)st.st_mtime)*16777619u; }
     }
     hash=(hash^n)*16777619u;hash=(hash^app_settings_main_fast_refresh())*16777619u;
     return (hash^app_settings_system_contrast())*16777619u;
@@ -859,6 +882,8 @@ static void refresh_excerpt(void) {
     if(book->has_progress)book_excerpt_load(book->path,book->progress.chapter,s_excerpt);
 }
 static void on_enter(app_ctx_t *ctx) {
+    weread_runtime_load_local();
+    for (int i=0;i<7;++i) if (book_path_is_weread(book_at(i)->path)) {s_books_cache_valid=false;break;}
     const unsigned cover_revision = book_weread_cover_revision();
     if (cover_revision != s_weread_cover_revision) {
         s_weread_cover_revision = cover_revision;
@@ -902,6 +927,7 @@ static void on_enter(app_ctx_t *ctx) {
     rp_boot_mark("excerpt");
 }
 static void on_media_lost(app_ctx_t *ctx) {
+    weread_runtime_media_lost();
     app_home_release_clock_cache();
     (void)ctx;clear_cover_cache();memset(&s_current,0,sizeof(s_current));memset(s_recent,0,sizeof(s_recent));
     s_books_cache_valid=false;s_excerpt[0]=0;s_avatar_ready=s_avatar_pending=false;
@@ -1067,6 +1093,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
         }
         if(hit(continue_card_hit_rect(),x,y)) {
             home_book_t *b=featured();
+            if(book_path_is_weread(b->path) && app_weread_request_open(b->path)) {ctx->request_app=app_at(6);return APP_REDRAW_NONE;}
             if(b->path[0] && app_book_request_open_from_home(b->path)){ui_nav_request(ctx,1);return APP_REDRAW_NONE;}
             if(restore){s_area=control_feedback_area(s_pressed);return APP_REDRAW_AREA;}
             return APP_REDRAW_NONE;

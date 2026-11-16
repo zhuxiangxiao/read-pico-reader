@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0
  * 中文：有界内存与紧凑校验的 NVS 启动记录，兼容旧定长格式。开书中断保留原进度，不把不支持的缓存当图书。
  * English: Bounded-memory compact checked NVS startup state, compatible with the legacy fixed record. Interrupted opening preserves progress and unsupported caches are never treated as books.
+ * 微信读书授权：合法虚拟URI复用原恢复保护，不触发本地目录扫描。
+ * WeRead scope: valid virtual URIs share existing resume guards without entering local scans.
  * 冻结：不擦除分区、不动态分配、不逐页写 Flash；恢复入口须先成功消费，资源失败回可操作页面。
  * Frozen: No partition erasure, allocations or per-page Flash writes. Consume resume successfully before using it; failed resources fall back to an operable page.
  */
@@ -11,6 +13,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "book/book_file_path.h"
+#include "book/book_weread_uri.h"
 
 #define BOOT_MAGIC UINT32_C(0x50425331)
 #define BOOT_PACKED_MAGIC UINT32_C(0x50425332)
@@ -54,6 +57,7 @@ static uint32_t checksum(const boot_record_t *r) {
 static bool path_valid(const char *path, bool empty) {
     size_t n = strnlen(path, PICO_BOOT_PATH_MAX);
     if (!n) return empty;
+    if (n < PICO_BOOT_PATH_MAX && book_path_is_weread(path)) return true;
     if (n == PICO_BOOT_PATH_MAX || (strncmp(path, "/sdcard/", 8) && strncmp(path, "/flash/books/", 13))) return false;
     for (const char *p = path + 1; *p;) {
         const char *end = strchr(p, '/');
@@ -175,13 +179,13 @@ void pico_boot_init(bool abnormal_reset) {
         s_recovery = true;
         s_recovery_reasons |= BOOT_RECOVERY_RECORD;
     }
-    // 其他版本的缓存清单仍留在卡上，只移除不被本地阅读器支持的恢复/隔离入口。
-    // Retain other editions' cache files; remove only resume/quarantine entries unsupported by the local reader.
-    if(s_record.resume.reader&&!book_file_path_supported(s_record.resume.path)){
+    // 缓存清单仍留在卡上，只移除不受支持的本地或虚拟恢复入口。
+    // Retain cache files; remove only unsupported local/virtual resume and quarantine targets.
+    if(s_record.resume.reader&&!book_path_is_supported_target(s_record.resume.path)){
         memset(&s_record.resume,0,sizeof(s_record.resume));s_record.resume_valid=0;s_record.reserved[0]=0;
     }
-    if(s_record.opening[0]&&!book_file_path_supported(s_record.opening))s_record.opening[0]=0;
-    if(s_record.blocked[0]&&!book_file_path_supported(s_record.blocked))s_record.blocked[0]=0;
+    if(s_record.opening[0]&&!book_path_is_supported_target(s_record.opening))s_record.opening[0]=0;
+    if(s_record.blocked[0]&&!book_path_is_supported_target(s_record.blocked))s_record.blocked[0]=0;
     if (s_record.starting) s_recovery_reasons |= BOOT_RECOVERY_STARTING;
     if (s_record.opening[0]) s_recovery_reasons |= BOOT_RECOVERY_OPENING;
     if (s_record.starting || s_record.opening[0]) s_recovery = true;
@@ -225,7 +229,7 @@ bool pico_boot_asset_allowed(const char *path) {
     return path && !s_recovery && (!s_record.blocked[0] || strcmp(path, s_record.blocked));
 }
 esp_err_t pico_boot_book_begin(const char *path) {
-    if (!path || !path_valid(path, false)||!book_file_path_supported(path)) return ESP_ERR_INVALID_ARG;
+    if (!path || !path_valid(path, false)||!book_path_is_supported_target(path)) return ESP_ERR_INVALID_ARG;
     memset(s_record.opening, 0, sizeof(s_record.opening));
     memcpy(s_record.opening, path, strlen(path));
     s_record.resume_valid = 0;
@@ -237,7 +241,7 @@ void pico_boot_book_end(bool success) {
     (void)store();
 }
 esp_err_t pico_boot_save_resume(const pico_resume_t *resume) {
-    if (!resume_valid(resume) || (resume->reader && !book_file_path_supported(resume->path))) return ESP_ERR_INVALID_ARG;
+    if (!resume_valid(resume) || (resume->reader && !book_path_is_supported_target(resume->path))) return ESP_ERR_INVALID_ARG;
     memset(&s_record.resume, 0, sizeof(s_record.resume));
     s_record.resume.tab = resume->tab;
     s_record.resume.reader = resume->reader;

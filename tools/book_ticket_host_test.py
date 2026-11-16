@@ -25,6 +25,10 @@ enum {UI_GRAY_BLACK=0,UI_GRAY_WHITE=255,UI_GRAY_LIGHT=192,EPD_DRAW_ALIGN_LEFT,EP
 #define MALLOC_CAP_8BIT 2
 static bool oom;static unsigned allocations,reads,list_reads,grid_reads,source_case,generated;
 static bool generate_ok=true;
+static bool virtual_cached=true;
+static bool book_path_is_weread(const char *path){return !strncmp(path,"weread://",9);}
+static bool book_weread_cover(const char *path,uint8_t *out,size_t cap){assert(book_path_is_weread(path)&&cap==176u*240);if(!virtual_cached)return false;memset(out,91,cap);return true;}
+
 static unsigned system_scale=100,advance_factor=1;
 static void *heap_caps_malloc(size_t n,int caps){assert(n==176*240&&caps==3);if(oom)return NULL;void *p=malloc(n);if(p)++allocations;return p;}
 static bool book_cover_load_gray(const char*p,const char*t,const char*a,uint8_t*out,bool decode,bool*pending){
@@ -127,6 +131,11 @@ int main(void){
  assert(!cover_load("book.txt","自定义书名","作者",&w,&h));
  assert(!pico_cover_load("book.txt","自定义书名","作者")&&generated==4);
  assert(!pico_cover_load("book.epub",title,"余华")&&generated==4);
+ reads=0;
+ txt=cover_load("weread://test_book_101",title,"author",&w,&h);assert(txt&&w==176&&h==240&&txt[0]==91&&!reads);free(txt);
+ txt=pico_cover_load("weread://test_book_101",title,"author");assert(txt&&txt[0]==91&&!reads);free(txt);
+ virtual_cached=false;assert(!cover_load("weread://test_book_101",title,"author",&w,&h)&&!reads);
+ assert(!pico_cover_load("weread://test_book_101",title,"author")&&!reads);
  cover_background_draw(pixels,NULL,0,0);cover_draw(pixels,NULL,0,0,title);
  app_ctx_t ctx={.now_ms=799};warm_reader_ticket_cover(&ctx);assert(!submits);
  ctx.now_ms=800;media_ready=false;warm_reader_ticket_cover(&ctx);assert(!submits);media_ready=true;

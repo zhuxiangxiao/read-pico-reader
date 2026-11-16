@@ -103,6 +103,7 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "apps/app_image.c"
         "apps/app_transfer.c"
         "apps/app_cloud_sync.c"
+        "apps/app_weread.c"
         "apps/usb_storage.c"
         "book/book_store.c"
         "book/book_xteink_sync.c"
@@ -110,12 +111,23 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "book/book_history_backup.c"
         "book/book_title.c"
         "book/book_weread_cover.c"
+        "book/book_weread_crypto.c"
+        "weread/weread_auth.c"
+        "weread/weread_client.c"
+        "weread/weread_store.c"
+        "weread/weread_shelf.c"
+        "weread/weread_toc.c"
+        "weread/weread_chapter.c"
+        "weread/weread_progress.c"
+        "weread/weread_position.c"
+        "weread/weread_runtime.c"
         "book/book_added.c"
         "book/book_ticket.c"
         "book/book_excerpt.c"
         "book/book_lock_collage.c"
         "book/book_lock_bookmark.c"
         "book/book_source.c"
+        "book/book_source_weread.c"
         "book/book_index_cache.c"
         "book/book_txt.c"
         "book/book_epub.c"
@@ -145,7 +157,7 @@ idf_component_register(
     LDFRAGMENTS "metalio_crash.lf"
     SRCS ${kiiko_selected_sources}
     REQUIRES ${main_requires}
-    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book"
+    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book" "weread"
     EMBED_FILES
         "assets/builtin.ttf"
         "assets/ui-hanzi.bin"
@@ -294,6 +306,7 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "apps/app_image.c"
         "apps/app_transfer.c"
         "apps/app_cloud_sync.c"
+        "apps/app_weread.c"
         "apps/usb_storage.c"
         "book/book_store.c"
         "book/book_xteink_sync.c"
@@ -301,12 +314,23 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "book/book_history_backup.c"
         "book/book_title.c"
         "book/book_weread_cover.c"
+        "book/book_weread_crypto.c"
+        "weread/weread_auth.c"
+        "weread/weread_client.c"
+        "weread/weread_store.c"
+        "weread/weread_shelf.c"
+        "weread/weread_toc.c"
+        "weread/weread_chapter.c"
+        "weread/weread_progress.c"
+        "weread/weread_position.c"
+        "weread/weread_runtime.c"
         "book/book_added.c"
         "book/book_ticket.c"
         "book/book_excerpt.c"
         "book/book_lock_collage.c"
         "book/book_lock_bookmark.c"
         "book/book_source.c"
+        "book/book_source_weread.c"
         "book/book_index_cache.c"
         "book/book_txt.c"
         "book/book_epub.c"
@@ -332,7 +356,7 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
 idf_component_register(
     SRCS ${kiiko_selected_sources}
     REQUIRES ${main_requires}
-    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book"
+    INCLUDE_DIRS "." "app" "apps" "font" "ui" "factory" "book" "weread"
     EMBED_FILES
         "assets/loading_4bpp.bin"
         "assets/builtin.ttf"
@@ -362,3 +386,18 @@ if(NOT KIIKO_BOARD_METALIO47)
 endif()
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_UI_LOCALIZATION=1)
+
+# 解析、设置与页面调度按体积编译，为在线书源保留原分区；覆盖层也使用真正参与构建的路径。
+# Size-optimize parsing/settings/page dispatch within original slots, including the actual selected overlay paths.
+set(weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_reader.c
+    book_index_cache.c settings.c app_device_settings.c app_files.c app_transfer.c
+    app_cloud_sync.c ui_keyboard.c book_title.c app_book.c)
+foreach(weread_source IN LISTS kiiko_selected_sources)
+    get_filename_component(weread_source_name "${weread_source}" NAME)
+    if(weread_source_name IN_LIST weread_size_sources)
+        set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
+    endif()
+    if(weread_source MATCHES "(^|/)weread/" OR weread_source_name MATCHES "^(app_weread|book_weread_crypto|book_source_weread)\\.c$")
+        set_property(SOURCE "${weread_source}" APPEND PROPERTY COMPILE_OPTIONS "-fstack-usage")
+    endif()
+endforeach()

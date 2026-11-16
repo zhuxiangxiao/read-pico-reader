@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0
  * 中文：启动中断的图书提示及明确确认后的单文件删除；不解析故障书、不自动删除。
  * English: Show interrupted book opening and offer confirmed single-file deletion; never parse the failed book or delete automatically.
+ * 微信读书授权：虚拟书籍只清恢复记录，保留内容缓存和进度。
+ * WeRead scope: virtual books clear only the recovery record, retaining content and progress.
  * 冻结：只处理启动记录中确切的普通 TXT/EPUB；无卡/删除失败可重试；绘制无文件操作。
  * Frozen: Handle only the exact regular TXT/EPUB in the startup record; allow retries after absent media or failed deletion. Rendering has no file operations.
  */
@@ -12,6 +14,7 @@
 #include "boot_state.h"
 #include "book_progress.h"
 #include "book_store.h"
+#include "book_weread_uri.h"
 #include "read_pico_sd.h"
 #include "ui_gesture.h"
 #include "ui_kit.h"
@@ -34,6 +37,7 @@ static void fit(char *text, int width) {
 }
 static void render(app_ctx_t *ctx, uint8_t *fb) {
     (void)ctx;
+    const bool virtual_book=book_path_is_weread(s_path);
     ui_clear_page(fb);
     ui_nav_status(fb);
     ui_nav_back(fb, 58, 117);
@@ -42,12 +46,12 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     EpdRect card = {36, 244, 612, 320};
     ui_fill_round_rect(fb, card, 24, 0xf0);
     ui_draw_round_rect(fb, card, 24, 0x38);
-    ui_text(fb, 58, 270, 30, s_removed ? "书籍已删除" : s_confirm ? "确认删除这本书？" : "上次打开此书时中断", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 58, 270, 30, s_removed ? (virtual_book?"恢复记录已清除":"书籍已删除") : s_confirm ? (virtual_book?"确认清除恢复记录？":"确认删除这本书？") : "上次打开此书时中断", EPD_DRAW_ALIGN_LEFT, false);
     const char *name = strrchr(s_path, '/');
     char label[288]; snprintf(label, sizeof(label), "%s", name ? name + 1 : s_path);
     fit(label, 560);
     ui_text(fb, 58, 345, 27, label, EPD_DRAW_ALIGN_LEFT, false);
-    ui_text(fb, 58, 423, 24, s_confirm ? "删除后需要重新导入这本书。" : "可能是开书时断电或解析异常。", EPD_DRAW_ALIGN_LEFT, false);
+    ui_text(fb, 58, 423, 24, s_confirm ? (virtual_book?"书籍缓存和阅读进度会保留。":"删除后需要重新导入这本书。") : "可能是开书时断电或解析异常。", EPD_DRAW_ALIGN_LEFT, false);
     ui_text(fb, 58, 482, 24, s_confirm ? "其他书籍和设置会保留。" : "已停止自动重试，可先返回首页。", EPD_DRAW_ALIGN_LEFT, false);
     if (s_message[0]) ui_text(fb, 58, 609, 24, s_message, EPD_DRAW_ALIGN_LEFT, false);
     EpdRect back = {36, 710, 612, 82}, remove = {36, 820, 612, 82};
@@ -55,13 +59,14 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     ui_text_vc(fb, 342, 751, 28, s_confirm ? "取消删除" : "返回首页", EPD_DRAW_ALIGN_CENTER, false);
     if (!s_removed) {
         ui_fill_round_rect(fb, remove, 20, UI_GRAY_BLACK);
-        ui_text_vc(fb, 342, 861, 28, s_confirm ? "确认删除" : "删除这本书", EPD_DRAW_ALIGN_CENTER, true);
+        ui_text_vc(fb, 342, 861, 28, virtual_book?(s_confirm?"确认清除":"清除恢复记录"):(s_confirm ? "确认删除" : "删除这本书"), EPD_DRAW_ALIGN_CENTER, true);
     }
     ui_nav_draw(fb, 0);
 }
 static esp_err_t delete_book(void) {
     char recorded[PICO_BOOT_PATH_MAX];
     if (!pico_boot_interrupted_book(recorded, sizeof(recorded)) || strcmp(recorded, s_path)) return ESP_ERR_INVALID_STATE;
+    if (book_path_is_weread(s_path)) {pico_boot_forget_interrupted_book();s_removed=true;return ESP_OK;}
     const char *name = strrchr(s_path, '/'), *ext = strrchr(s_path, '.');
     if (!name || !ext || (strcasecmp(ext, ".epub") && strcasecmp(ext, ".txt"))) return ESP_ERR_INVALID_ARG;
     if (!strncmp(s_path, "/sdcard/", 8)) {
@@ -117,7 +122,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
     if (!s_removed && ui_rect_hit((EpdRect){36, 820, 612, 82}, ev->x0, ev->y0)) {
         if (!s_confirm) { s_confirm = true; return APP_REDRAW_PAGE; }
         esp_err_t err = delete_book();
-        snprintf(s_message, sizeof(s_message), "%s", err == ESP_OK ? "已删除，可返回首页" :
+        snprintf(s_message, sizeof(s_message), "%s", err == ESP_OK ? (book_path_is_weread(s_path)?"恢复记录已清除，可返回首页":"已删除，可返回首页") :
             s_removed ? "已删除，阅读记录清理失败" : err == ESP_ERR_INVALID_STATE ? "存储未就绪，请插卡后重试" : "删除失败，请重试或用文件管理处理");
         if (s_removed) s_confirm = false;
         return APP_REDRAW_PAGE;

@@ -91,6 +91,9 @@ typedef struct {
     char note_href[160];
     const html_ext_note_t* ext_notes;
     size_t ext_note_count;
+    html_source_observer_fn observer;
+    void *observer_ctx;
+    size_t source_pos;
 } writer_t;
 
 static unsigned char lower(unsigned char c) {
@@ -552,6 +555,7 @@ static esp_err_t emit(writer_t* w, uint32_t cp) {
         w->run_start = w->text.len - w->start;
         w->run_slot = w->family;
     }
+    if (w->observer) w->observer(w->observer_ctx, w->text.len, w->source_pos);
     memcpy(w->text.utf8 + w->text.len, bytes, n);
     w->text.len += n;
     return ESP_OK;
@@ -726,18 +730,20 @@ static int ext_note_lookup(const writer_t* w, const char* href, size_t href_len)
     return -1;
 }
 
-esp_err_t html_to_blocks_with_css_notes(const char* html, size_t len,
+static esp_err_t parse_notes(const char* html, size_t len,
                                          const char* css, size_t css_len,
                                          const html_font_map_t* fonts,
                                          const char* anchor, size_t source_offset,
                                          const html_ext_note_t* ext, size_t ext_count,
-                                         size_t* text_offset, html_text_t* out) {
+                                         size_t* text_offset, html_text_t* out,
+                                         html_source_observer_fn observer, void *observer_ctx) {
     if (!out) return ESP_ERR_INVALID_ARG;
     *out = (html_text_t){0};
     if (text_offset) *text_offset = 0;
     if ((!html && len) || (!css && css_len)) return ESP_ERR_INVALID_ARG;
     if (len > HTML_TEXT_MAX_BYTES) return ESP_ERR_INVALID_SIZE;
     writer_t w = {0};
+    w.observer = observer; w.observer_ctx = observer_ctx;
     w.fonts = fonts;
     w.ext_notes = ext;
     w.ext_note_count = ext_count;
@@ -754,6 +760,7 @@ esp_err_t html_to_blocks_with_css_notes(const char* html, size_t len,
     bool resume_head = false;
     size_t pos = len >= 3 && memcmp(html, "\xef\xbb\xbf", 3) == 0 ? 3 : 0;
     while (pos < len) {
+        w.source_pos = pos;
         if ((!skip[0] || name_equal(skip, "head")) && len - pos >= 4 && memcmp(html + pos, "<!--", 4) == 0) {
             pos += 4;
             while (len - pos >= 3 && memcmp(html + pos, "-->", 3)) pos++;
@@ -1010,6 +1017,17 @@ fail:
     return err;
 }
 
+esp_err_t html_to_blocks_with_css_notes(const char* html, size_t len,
+    const char* css, size_t css_len, const html_font_map_t* fonts,
+    const char* anchor, size_t source_offset, const html_ext_note_t* ext, size_t ext_count,
+    size_t* text_offset, html_text_t* out) {
+    return parse_notes(html, len, css, css_len, fonts, anchor, source_offset,
+        ext, ext_count, text_offset, out, NULL, NULL);
+}
+esp_err_t html_to_blocks_mapped(const char *html, size_t len, const char *css, size_t css_len,
+    html_source_observer_fn observer, void *ctx, html_text_t *out) {
+    return parse_notes(html, len, css, css_len, NULL, NULL, SIZE_MAX, NULL, 0, NULL, out, observer, ctx);
+}
 esp_err_t html_to_blocks_with_css_target(const char* html, size_t len,
                                           const char* css, size_t css_len,
                                           const html_font_map_t* fonts,

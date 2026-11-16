@@ -16,6 +16,7 @@ unit = r'''
 #include <strings.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include "book_weread_uri.h"
 #define PICO_BOOT_PATH_MAX 288
 #define BOOK_STORE_ROOT_MAX 3
 #define ESP_OK 0
@@ -73,11 +74,14 @@ int main(void){
     reset(&ctx);progress_fail=true;assert(delete_book()==ESP_FAIL&&s_removed&&deletes==1);
     reset(&ctx);strcpy(recorded_path,"/flash/books/bad.epub");on_enter(&ctx);flash_ready=false;assert(delete_book()==ESP_ERR_INVALID_STATE&&!deletes);flash_ready=true;assert(delete_book()==ESP_OK&&s_removed);
     reset(&ctx);ui_gesture_event_t ev={UI_GESTURE_MOVE,340,850};assert(on_gesture(&ctx,&ev)==APP_REDRAW_NONE&&!s_confirm&&!deletes);
+    reset(&ctx);strcpy(recorded_path,"weread://test_book_101");on_enter(&ctx);
+    tap(&ctx,340,850);assert(s_confirm&&recorded&&!deletes);
+    tap(&ctx,340,850);assert(s_removed&&!recorded&&!deletes&&!backup_deletes&&!forgets);
     puts("PASS: recovery page never deletes on first tap; cancellation/Home remain usable; exact-file guard; absent card retry; directory/backup refusal; I/O failure; missing file; progress cleanup; internal-flash gate");
 }
 '''
 with tempfile.TemporaryDirectory(dir=ROOT/'build') as directory:
     c,exe=Path(directory)/'test.c',Path(directory)/'test'
     c.write_text(unit)
-    subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(exe)],check=True)
+    subprocess.run(['cc','-I'+str(ROOT/'main/book'),'-std=gnu11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(c),'-o',str(exe)],check=True)
     subprocess.run([str(exe)],check=True)

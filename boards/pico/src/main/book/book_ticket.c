@@ -1,4 +1,6 @@
 /*
+ * 微信读书授权：虚拟票根只读本地元数据与点阵。
+ * WeRead scope: virtual tickets read only local metadata and rasters.
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
@@ -22,6 +24,7 @@
 #include "book_epub.h"
 #include "book_progress.h"
 #include "book_title.h"
+#include "book_source_weread.h"
 #include "epdiy.h"
 #include "esp_heap_caps.h"
 #include "nvs.h"
@@ -44,6 +47,10 @@ static uint8_t *cover_load(const char *path, const char *title, const char *auth
     // The lock screen must not decode a potentially large EPUB while the
     // power key is being handled; use the shelf's cover cache when available.
     // 处理电源键时只读书架封面缓存，不在锁屏路径解码大 EPUB。
+    if (book_path_is_weread(path)) {
+        if (gray && book_weread_cover(path,gray,BOOK_COVER_W*BOOK_COVER_H)) return gray;
+        free(gray); return NULL;
+    }
     if (!gray || book_cover_load_gray(path, title, author, gray, false, NULL)) return gray;
     const char *ext = strrchr(path, '.');
     if (ext && !strcasecmp(ext, ".txt") &&
@@ -156,7 +163,7 @@ bool book_ticket_draw(uint8_t *fb, bool reader_background) {
     if (reader_background && s_position.magic == TICKET_POSITION_MAGIC) strcpy(path, s_position.path);
     else if (!book_progress_last_path(path, sizeof(path))) return false;
     struct stat st;
-    bool file_valid = stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
+    bool file_valid = book_target_stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&
                       (uint64_t)st.st_size <= UINT32_MAX;
     book_progress_t progress = {0};
     const bool saved = file_valid && book_progress_load(path, st.st_size, &progress);
@@ -166,6 +173,7 @@ bool book_ticket_draw(uint8_t *fb, bool reader_background) {
     char title[256] = {0}, author[128] = {0};
     if (!book_display_name_from_path(path, title, sizeof(title), author, sizeof(author)))
         snprintf(title, sizeof(title), "未命名");
+    (void)book_weread_metadata(path,title,sizeof(title),author,sizeof(author));
     const char *ext = strrchr(path, '.');
     if (ext && !strcasecmp(ext, ".epub")) {
         char meta_title[256] = {0},meta_author[128]={0};

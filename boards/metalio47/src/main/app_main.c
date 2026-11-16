@@ -11,6 +11,8 @@
  * is unset, the factory page blocks first. Then control goes to app_loop.
  */
 
+#include "book_source_weread.h"
+#include "weread_runtime.h"
 #include <stdint.h>
 #include <string.h>
 #include <sys/time.h>
@@ -161,6 +163,8 @@ void app_main(void) {
     usb_storage_phy_init();
     metalio_clear_download_request();
 
+    weread_runtime_init();
+
     const esp_reset_reason_t reset = esp_reset_reason();
     ESP_LOGI(TAG, "startup reset=%d stack=%u", (int)reset, (unsigned)uxTaskGetStackHighWaterMark(NULL));
     app_settings_init();
@@ -234,7 +238,7 @@ void app_main(void) {
         else {
             // 挂载等待有界；恢复入口已消费，无卡或资源失败不会反复自动开书。
             // Bound mount waiting after consuming the checkpoint; absent media or failed resources cannot auto-open in a loop.
-            if (!strncmp(resume.path, "/sdcard/", 8)) {
+            if (book_path_is_weread(resume.path) || !strncmp(resume.path, "/sdcard/", 8)) {
                 read_pico_sd_info_t info;
                 for (unsigned wait = 0; wait < 150 && read_pico_sd_get_info(&info) == ESP_ERR_NOT_FINISHED; ++wait)
                     vTaskDelay(pdMS_TO_TICKS(20));
@@ -243,8 +247,9 @@ void app_main(void) {
                 book_store_root_t roots[BOOK_STORE_ROOT_MAX]; int count;
                 (void)book_store_roots(roots, &count);
             }
+            if (book_path_is_weread(resume.path)) weread_runtime_load_local();
             struct stat st;
-            if (!stat(resume.path, &st) && S_ISREG(st.st_mode) &&
+            if (!book_target_stat(resume.path, &st) && S_ISREG(st.st_mode) &&
                 app_book_request_resume(resume.path, resume.fullscreen)) first = app_at(1);
         }
     }

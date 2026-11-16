@@ -69,6 +69,11 @@ bool book_cover_load_list_gray(const char *p,const char *t,const char *a,uint8_t
 static int missing=-1, modified=-1;
 static int test_stat(const char *path,struct stat *st){int id=-1;assert(sscanf(path,"/book%d.epub",&id)==1);if(id==missing)return -1;memset(st,0,sizeof(*st));st->st_mode=S_IFREG;st->st_size=100+id;st->st_mtime=200+id+(id==modified);return 0;}
 #define stat(path,out) test_stat(path,out)
+static bool virtual_art=true;
+static bool book_path_is_weread(const char *path){return !strncmp(path,"weread://",9);}
+static int book_target_stat(const char *path,struct stat *st){if(!book_path_is_weread(path))return test_stat(path,st);memset(st,0,sizeof(*st));st->st_mode=S_IFREG;st->st_size=77;return 0;}
+static bool book_weread_cover(const char *path,uint8_t *out,size_t cap){assert(book_path_is_weread(path)&&cap==176u*240);if(!virtual_art)return false;for(unsigned i=0;i<cap;++i)out[i]=sample(i);return true;}
+
 '''+types+'\nstatic int s_cover_next;\n'
     unit+=r"""
 static unsigned s_cover_generation;static bool s_cover_waiting;
@@ -131,6 +136,16 @@ int main(void){
     clear_cover_cache();book(0,0);
     assert(load_cover(book_at(0),0)&&job_requests[0].artwork_only);
     clear_cover_cache();
+    book(0,0);strcpy(book_at(0)->path,"weread://test_book_101");
+    for(unsigned mode=0;mode<2;++mode){
+        fast=mode;assert(load_cover(book_at(0),0)&&book_at(0)->cover_fast==fast);
+        assert(live_bytes==(fast?5280u:42240u));
+        if(fast)for(unsigned y=0;y<240;++y)for(unsigned x=0;x<176;++x)
+            assert(!!(book_at(0)->cover[y*22+x/8]&(1u<<(x&7)))==!!ui_image_dither_bw(ui_contrast_gray(sample(y*176+x)),x,y));
+        restore_cover_cache();assert(book_at(0)->cover&&live_bytes==(fast?5280u:42240u));clear_cover_cache();
+    }
+    virtual_art=false;assert(!load_cover(book_at(0),0)&&!live_bytes);
+    virtual_art=true;alloc_fail=true;assert(!load_cover(book_at(0),0)&&!live_bytes);alloc_fail=false;
     puts("PASS: 300 actual in-place Home reorderings; duplicate/missing/modified identities; no stale pointer or double free; fast 5,280-byte BW only; gray-only ordinary/ripple; checked OOM and recovery");
 }
 '''

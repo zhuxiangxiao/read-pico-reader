@@ -209,6 +209,17 @@ int main(void) {
     assert(pico_boot_book_begin("/sdcard/books/unadmitted.epub")==ESP_FAIL);
     assert(present&&durable_size==sizeof(legacy)&&erases==1);
     fail_commit=false;free_bytes=SIZE_MAX;
+    // 虚拟目标沿用单次消费与隔离，恶意URI仍拒绝。/ Virtual targets retain one-shot/quarantine rules and reject malformed URIs.
+    pico_boot_init(false);pico_boot_ready();
+    pico_resume_t virtual_resume={.tab=1,.reader=1,.fullscreen=1};strcpy(virtual_resume.path,"weread://test_book_101");
+    assert(pico_boot_save_resume(&virtual_resume)==ESP_OK);
+    pico_boot_init(false);assert(pico_boot_take_resume(&out)&&out.fullscreen&&!strcmp(out.path,virtual_resume.path));
+    assert(!pico_boot_take_resume(&out));pico_boot_ready();
+    assert(pico_boot_book_begin(virtual_resume.path)==ESP_OK);pico_boot_init(false);
+    assert(pico_boot_interrupted_book(interrupted,sizeof(interrupted))&&!strcmp(interrupted,virtual_resume.path));
+    pico_boot_forget_interrupted_book();pico_boot_ready();
+    assert(pico_boot_book_begin("weread://../escape")==ESP_ERR_INVALID_ARG);
+    assert(pico_boot_book_begin("weread://book?other=1")==ESP_ERR_INVALID_ARG);
     puts("PASS: compact/legacy startup records; interrupted EPUB quarantine; unsupported cache ignored; low-space key-only reclaim; interrupted reclaim and failed commits stay safe; retry after transient NVS failure; settings/progress preserved");
     puts("PASS: one-shot reader/fullscreen resume; power-cut book quarantine; explicit retry; no false book blame; absent/corrupt NVS and commit failure; checked paths");
 }

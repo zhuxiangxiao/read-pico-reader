@@ -13,6 +13,8 @@
  * is unset, the factory page blocks first. Then control goes to app_loop.
  */
 
+#include "book_source_weread.h"
+#include "weread_runtime.h"
 #include <stdint.h>
 #include <string.h>
 #include <sys/time.h>
@@ -139,6 +141,7 @@ static bool prepare_startup_frame(EpdiyHighlevelState *hl,uint8_t *framebuffer,b
 }
 
 void app_main(void) {
+    weread_runtime_init();
     // 共享 TF 卡期间复位后，先把内部 PHY 交回串口，再清理已用完的 BOOT 请求。
     // Reclaim Serial/JTAG after a reset during card sharing, then clear the served BOOT request.
     usb_storage_phy_init();
@@ -229,7 +232,7 @@ void app_main(void) {
         else {
             // 挂载等待有界；恢复入口已消费，无卡或资源失败不会反复自动开书。
             // Bound mount waiting after consuming the checkpoint; absent media or failed resources cannot auto-open in a loop.
-            if (!strncmp(resume.path, "/sdcard/", 8)) {
+            if (book_path_is_weread(resume.path) || !strncmp(resume.path, "/sdcard/", 8)) {
                 read_pico_sd_info_t info;
                 for (unsigned wait = 0; wait < 150 && read_pico_sd_get_info(&info) == ESP_ERR_NOT_FINISHED; ++wait)
                     vTaskDelay(pdMS_TO_TICKS(20));
@@ -238,8 +241,9 @@ void app_main(void) {
                 book_store_root_t roots[BOOK_STORE_ROOT_MAX]; int count;
                 (void)book_store_roots(roots, &count);
             }
+            if (book_path_is_weread(resume.path)) weread_runtime_load_local();
             struct stat st;
-            if (!stat(resume.path, &st) && S_ISREG(st.st_mode) &&
+            if (!book_target_stat(resume.path, &st) && S_ISREG(st.st_mode) &&
                 app_book_request_resume(resume.path, resume.fullscreen)) first = app_at(1);
         }
     }

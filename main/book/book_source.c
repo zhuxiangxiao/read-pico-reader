@@ -1,12 +1,17 @@
 /* SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
- * 中文：TXT 与 EPUB 单实例书源分派，不依赖界面。
- * English: Singleton TXT and EPUB source dispatch without UI dependencies.
- * 冻结：TXT 保留源字节偏移，EPUB 采用累计 spine HTML 字节；兼容纯文本加载；只允许写来源校验的派生章节摘要，不改原书或进度。
- * Frozen: TXT retains source offsets; EPUB uses cumulative spine HTML bytes; retain plain-text loading; only source-validated derived chapter summaries may be written, never books or progress.
+ * 中文：本地 TXT/EPUB 与微信读书虚拟书源分派，不依赖界面。
+ * English: Dispatch local TXT/EPUB and virtual WeRead sources without UI dependencies.
+ * 冻结：本地 TXT 保留源字节偏移，EPUB 保留累计 spine HTML 字节和纯文本加载；不改原书或本地进度。
+ * Frozen: Retain local TXT source offsets, EPUB cumulative spine bytes and plain-text loading; never modify original books or local progress.
+ * 微信读书扩展仅由专用模块写独立且经过校验的缓存；不把虚拟 URI 加入本地扫书。
+ * The WeRead extension writes validated isolated caches through its own modules; virtual URIs never join local scans.
  */
 #include "book_source_internal.h"
 #include "book_epub.h"
+#include "book_source_weread.h"
+#include "book_weread_uri.h"
+#include "book_cover.h"
 #include "book_index_cache.h"
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -66,6 +71,7 @@ esp_err_t book_open(const char *path) {
 #else
     if (!path || !*path) return ESP_ERR_INVALID_ARG;
 #endif
+    if (book_path_is_weread(path)) return book_weread_open(path);
     const char *ext = strrchr(path, '.');
     if (ext && !strcasecmp(ext, ".epub")) {
         esp_err_t err=book_epub_open(path,&s_epub);if(err==ESP_OK)chapter_summary_opened(path);return err;
@@ -81,21 +87,25 @@ void book_close(void) {
     s_io_suspended = false; s_io_path[0] = 0;
 #else
 #endif
+    book_weread_close();
     book_epub_close(s_epub); s_epub = NULL;
     book_txt_close(&s_book);
 }
 void book_set_embedded_fonts(bool on) {
     if (s_epub) book_epub_set_fonts_enabled(s_epub, on);
 }
-size_t book_chapter_count(void) { return s_epub ? book_epub_chapter_count(s_epub) : s_book.count; }
+size_t book_chapter_count(void) { if (book_weread_is_open()) return book_weread_count(); return s_epub ? book_epub_chapter_count(s_epub) : s_book.count; }
 size_t book_navigation_count(void) {
+    if (book_weread_is_open()) return book_weread_count();
     return s_epub ? book_epub_navigation_count(s_epub) : s_book.nav_count?s_book.nav_count:s_book.count;
 }
 size_t book_navigation_chapter(size_t position) {
+    if (book_weread_is_open()) return position < book_weread_count() ? position : SIZE_MAX;
     return s_epub ? book_epub_navigation_chapter(s_epub, position) :
                     s_book.nav_count?book_txt_nav_chapter(&s_book,position):position<s_book.count?position:SIZE_MAX;
 }
 esp_err_t book_navigation_title(size_t position, char *buf, size_t cap) {
+    if (book_weread_is_open()) return book_weread_title(position, buf, cap);
     if (s_epub) return book_epub_navigation_title(s_epub, position, buf, cap);
     return s_book.nav_count?book_txt_title(&s_book,position,true,buf,cap):book_chapter_title(position,buf,cap);
 }
@@ -107,9 +117,10 @@ size_t book_navigation_source_offset(size_t position) {
         s_book.nav_count?book_txt_nav_source_offset(&s_book,position):SIZE_MAX;
 }
 size_t book_navigation_position(size_t chapter,size_t text_offset) {
+    if (book_weread_is_open()) return chapter < book_weread_count() ? chapter : SIZE_MAX;
     return s_epub?SIZE_MAX:book_txt_nav_position(&s_book,chapter,text_offset);
 }
-size_t book_navigation_volume_count(void) { return s_epub?0:s_book.volume_count; }
+size_t book_navigation_volume_count(void) { if (book_weread_is_open()) return 0; return s_epub?0:s_book.volume_count; }
 bool book_navigation_volume(size_t index,book_volume_t *out) {
     if(s_epub || !out || index>=s_book.volume_count)return false;
     const book_txt_volume_t *v=&s_book.volumes[index];
@@ -130,14 +141,15 @@ esp_err_t book_navigation_volume_title(size_t index,char *buf,size_t cap) {
     return n>=0&&(size_t)n<cap?ESP_OK:ESP_ERR_INVALID_SIZE;
 }
 esp_err_t book_chapter_title(size_t i, char *buf, size_t cap) {
+    if (book_weread_is_open()) return book_weread_title(i, buf, cap);
     if (s_epub) return book_epub_chapter_title(s_epub, i, buf, cap);
     return book_txt_title(&s_book,i,false,buf,cap);
 }
 esp_err_t book_chapter_load(size_t i, char **utf8, size_t *len) {
     if (!utf8 || !len) return ESP_ERR_INVALID_ARG;
     *utf8 = NULL; *len = 0;
-    if (s_epub) {
-        html_text_t text = {0}; esp_err_t err = book_epub_load(s_epub, i, &text);
+    if (s_epub || book_weread_is_open()) {
+        html_text_t text = {0}; esp_err_t err = book_weread_is_open() ? book_weread_load(i, NULL, NULL, &text) : book_epub_load(s_epub, i, &text);
         if (err != ESP_OK) return err;
         *utf8 = text.utf8; *len = text.len; text.utf8 = NULL;
         html_text_free(&text); return ESP_OK;
@@ -148,6 +160,7 @@ esp_err_t book_chapter_load(size_t i, char **utf8, size_t *len) {
 esp_err_t book_chapter_load_blocks(size_t i, html_text_t *out) {
     if (!out) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
+    if (book_weread_is_open()) return book_weread_load(i, NULL, NULL, out);
     if (s_epub) return book_epub_load(s_epub, i, out);
     return book_chapter_load(i, &out->utf8, &out->len);
 }
@@ -159,16 +172,18 @@ esp_err_t book_chapter_load_blocks_target(size_t i, const char *anchor,
                                            size_t source_offset, size_t *text_offset,
                                            html_text_t *out) {
     if (text_offset) *text_offset = 0;
+    if (book_weread_is_open()) return book_weread_load(i, anchor, text_offset, out);
     if (s_epub) return book_epub_load_target(s_epub, i, anchor, source_offset, text_offset, out);
     if(!out)return ESP_ERR_INVALID_ARG;
     memset(out,0,sizeof(*out));
     return book_txt_load_target(&s_book,i,source_offset,text_offset,&out->utf8,&out->len);
 }
-uint32_t book_total_bytes(void) { return s_epub ? book_epub_total_bytes(s_epub) : s_book.total; }
+uint32_t book_total_bytes(void) { if (book_weread_is_open()) return book_weread_total(); return s_epub ? book_epub_total_bytes(s_epub) : s_book.total; }
 uint32_t book_chapter_byte_offset(size_t i) {
+    if (book_weread_is_open()) return book_weread_offset(i);
     return s_epub ? book_epub_chapter_byte_offset(s_epub, i) : i < s_book.count ? s_book.entries[i].offset : 0;
 }
-book_kind_t book_kind(void) { return s_epub ? BOOK_KIND_EPUB : BOOK_KIND_TXT; }
+book_kind_t book_kind(void) { if (book_weread_is_open()) return BOOK_KIND_WEREAD; return s_epub ? BOOK_KIND_EPUB : BOOK_KIND_TXT; }
 #if KIIKO_BOARD_METALIO47
 int book_chapter_prefetch_step(size_t chapter) {
     return s_epub?book_epub_prefetch_step(s_epub,chapter):-1;
@@ -176,10 +191,17 @@ int book_chapter_prefetch_step(size_t chapter) {
 #else
 #endif
 esp_err_t book_chapter_image(size_t chapter, const char *src, uint8_t **data, size_t *size, bool *png) {
+    if (book_weread_is_open()) return book_weread_image(chapter, src, data, size, png);
     return s_epub ? book_epub_image(s_epub, chapter, src, data, size, png) : ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t book_chapter_image_dimensions(size_t chapter, const char *src, unsigned *width, unsigned *height) {
+    if (book_weread_is_open()) {
+        uint8_t *data = NULL; size_t len = 0; bool png = false;
+        esp_err_t err = book_weread_image(chapter, src, &data, &len, &png);
+        if (err == ESP_OK && !book_image_dimensions(data, len, png, width, height)) err = ESP_ERR_NOT_SUPPORTED;
+        free(data); return err;
+    }
     return s_epub ? book_epub_image_dimensions(s_epub, chapter, src, width, height) : ESP_ERR_NOT_SUPPORTED;
 }
 #if KIIKO_BOARD_METALIO47

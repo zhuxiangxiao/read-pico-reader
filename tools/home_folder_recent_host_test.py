@@ -26,6 +26,7 @@ static bool book_progress_load(const char *path,uint32_t bytes,book_progress_t *
 }
 static int test_stat(const char*path,struct stat*st){++stats;int id=identity(path);memset(st,0,sizeof(*st));st->st_size=100;st->st_mtime=200+id;return 0;}
 #define stat(path,out) test_stat(path,out)
+#define book_target_stat(path,out) test_stat(path,out)
 static bool app_settings_main_fast_refresh(void){return fast;}
 static unsigned app_settings_system_contrast(void){return contrast;}
 static void reset(void){memset(&s_current,0,sizeof(s_current));memset(s_recent,0,sizeof(s_recent));memset(readable,1,sizeof(readable));}

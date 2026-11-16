@@ -1,8 +1,8 @@
 /*
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
- * 中文：单实例 TXT/EPUB 书源与章节进度接口。
- * English: Singleton TXT/EPUB source and chapter progress interface.
+ * 中文：单实例 TXT/EPUB/微信读书书源与章节进度接口。
+ * English: Singleton TXT/EPUB/WeRead source and chapter progress interface.
  * 冻结：正文由调用方释放；不依赖 UI。
  * Frozen: The caller frees loaded text; no UI dependencies.
  */
@@ -15,6 +15,7 @@
 typedef enum {
     BOOK_KIND_TXT, ///< 文本 / Plain text
     BOOK_KIND_EPUB, ///< EPUB 容器 / EPUB container
+    BOOK_KIND_WEREAD, ///< 微信读书虚拟书源 / Virtual WeRead source
 } book_kind_t;
 /// 打开并替换当前书源。/ Open and replace the current source.
 esp_err_t book_open(const char *path);
