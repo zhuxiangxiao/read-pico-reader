@@ -215,8 +215,11 @@ def main():
     unit+=function('ui_root_shadow',ROOT/'main/ui/ui_root_style.h')+'\n'
     unit+='typedef struct{unsigned x,y,width,height;}book_crop_t;\n'+function('book_cover_crop',ROOT/'main/book/book_cover.c')+'\n'
     unit+='\n'.join(line for line in (ROOT/'main/ui/ui_book_manage_layout.h').read_text().splitlines() if not line.startswith(('#include','#pragma')))+'\n'+UI
-    unit+=(ROOT/'main/apps/book_shelf_badges.inc').read_text()+'\n'
-    for name in ['row_rect','shelf_cover_image','shelf_is_txt','shelf_cover_frame_ready','fast_cover_matches','draw_favorite_icon','draw_shelf_favorite_icon','cover_favorite_needs_white_edge','shelf_cover_white_edge','draw_shelf_cover_favorite','draw_shelf_cover','draw_list_title','draw_list_row','draw_shelf_furniture','draw_shelf_page_artwork']:
+    shared=(ROOT/'main/ui/ui_shelf.c').read_text();unit+=shared[shared.index('static uint8_t s_shelf_read_mask'):shared.index('void ui_shelf_furniture')]+'\n'
+    unit+='static void ui_draw_acrylic_guard(uint8_t*f,EpdRect r){(void)f;(void)r;assert(false); }\nstatic void ui_draw_liquid_shelf_rail(uint8_t*f,EpdRect r){(void)f;(void)r;assert(false); }\n'
+    unit+='typedef struct{uint64_t words[8];}metalio_cover_key_t;\nstatic bool display_pipeline_enabled(void){return false;}\nstatic uint32_t esp_rom_crc32_le(uint32_t seed,const uint8_t*p,size_t n){(void)p;(void)n;return seed;}\nstatic bool metalio_cover_cache_get_rows(const metalio_cover_key_t*k,uint8_t*p,int stride,int width,int height){(void)k;(void)p;(void)stride;(void)width;(void)height;assert(false);return false;}\nstatic bool metalio_cover_cache_put_rows(const metalio_cover_key_t*k,uint8_t*p,int stride,int width,int height){(void)k;(void)p;(void)stride;(void)width;(void)height;assert(false);return false;}\n'
+    for helper in ['ui_shelf_rows', 'ui_shelf_entry', 'ui_shelf_cover', 'ui_shelf_cover_begin', 'ui_shelf_cover_pixels', 'ui_shelf_cover_end', 'ui_shelf_cover_placeholder', 'draw_list_title', 'ui_shelf_list_row', 'ui_shelf_furniture']:unit+=function(helper,ROOT/'main/ui/ui_shelf.c')+'\n'
+    for name in ['row_rect','shelf_cover_image','shelf_is_txt','shelf_cover_frame_ready','fast_cover_matches','draw_favorite_icon','draw_shelf_favorite_icon','cover_favorite_needs_white_edge','shelf_cover_white_edge','draw_shelf_cover_favorite','draw_shelf_cover','draw_list_row','draw_shelf_furniture','draw_shelf_page_artwork']:
         body=function(name,book)
         if name=='draw_shelf_cover':body=body.replace('{','{++cover_draws;',1)
         unit+=body+'\n'

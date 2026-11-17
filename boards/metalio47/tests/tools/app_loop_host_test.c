@@ -16,6 +16,11 @@ void app_book_cover_mode_changed(void) {}
 void app_home_cover_mode_changed(void) {}
 esp_err_t pico_boot_save_resume(const pico_resume_t *resume) { (void)resume; return ESP_OK; }
 void pico_boot_clear_resume(void) {}
+int app_nav_id(int p){static const int ids[]={0,1,6,2,3};return p>=0&&p<5?ids[p]:-1;}
+int app_nav_position(int id){for(int i=0;i<5;++i)if(app_nav_id(i)==id)return i;return -1;}
+int app_menu_position(int id){return id;}
+uint8_t app_book_resume_origin(void){return 1;}
+void book_shelf_page_release(void){}
 bool app_book_resume_context(char *p,size_t c,bool *f) { (void)p;(void)c;(void)f;return false; }
 #include "read_pico_transfer.h"
 #include "ble_page_turner.h"
@@ -893,12 +898,12 @@ int main(void) {
     puts("PASS: system roots honor Water, child taps/top-left stay ordinary, edge returns use logical portrait LTR, scoped navigation restored");
     puts("PASS: S31 edge/central right-swipe return admission,one output,short/status/multitouch/refused boundaries");
     puts("PASS: real loop with real anti-fade: idle refresh, no transfer/modal-owner refresh or wake; legacy quick/PIN/sleep gates retained");
-    // 实际音量事件经过主键派发：四页循环、子页映射和覆盖层/升级保护。
+    // 实际音量事件经过主键派发：五页循环、子页映射和覆盖层/升级保护。
     // Actual volume events share root keys while retaining child mappings and overlay/update guards.
-    for(int tab=0;tab<4;++tab)for(int dir=-1;dir<=1;dir+=2){
-        reset();enable_main_tabs();fake_root_index=tab;volume_step=0;volume_value=dir;
+    for(int slot=0;slot<5;++slot)for(int dir=-1;dir<=1;dir+=2){
+        reset();enable_main_tabs();fake_root_index=app_nav_id(slot);volume_step=0;volume_value=dir;
         add(0,0,0,0);add(0,0,0,0);run();
-        assert(volume_tab==(tab+(dir<0?3:1))%4&&!keys[0]&&!keys[2]);
+        assert(volume_tab==app_nav_id((slot+(dir<0?4:1))%5)&&!keys[0]&&!keys[2]);
     }
     for(int dir=-1;dir<=1;dir+=2){
         reset();first.owns_keys=true;volume_step=0;volume_value=dir;
@@ -963,7 +968,7 @@ int main(void) {
     for(int i=0;i<5;++i)add(0,0,0,0);run();
     assert(ai_open_calls==1&&ai_restore_calls==1&&gl_areas==1&&fulls==2&&idle_locks==1);
     puts("PASS: actual AI scheduler one open/close scan,underlay frozen,selection persists without executing,save/OOM fallback,short full/light actions and upload/update/PMU/online guards");
-    puts("PASS: actual S31 volume events cycle all four roots, retain page-owned reader/child keys and reject online/power/menu input");
+    puts("PASS: actual S31 volume events cycle all five roots, retain page-owned reader/child keys and reject online/power/menu input");
     puts("app_loop: 50 scheduler scenarios passed, including automatic lock, save callback, input reset and busy guards");
     return 0;
 }

@@ -63,6 +63,7 @@
 #include <string.h>
 
 #include "app_registry.h"
+#include "book/book_shelf_page_cache.h"
 #include "app_content_open.h"
 #include "boot_state.h"
 #include "ble_page_turner.h"
@@ -647,7 +648,7 @@ typedef struct {
 static void menu_feedback(app_ctx_t* ctx, const app_desc_t* current,
                           int leaf, int hit, bool pressed, menu_feedback_t* feedback) {
     EpdRect area;
-    int row = hit - leaf * UI_MENU_ITEMS_PER_PAGE;
+    int row = app_menu_position(hit) - leaf * UI_MENU_ITEMS_PER_PAGE;
     if (!ui_menu_row_rect(leaf, row, &area)) return;
     ui_draw_menu_row_pressed(ctx->fb, current, leaf, row, pressed);
     if (feedback->updates == 0) feedback->area = area;
@@ -672,7 +673,7 @@ static void menu_feedback(app_ctx_t* ctx, const app_desc_t* current,
 // Leave the old page, enter the new one, then present a full page.
 static bool main_page_ready(app_ctx_t* ctx, const app_desc_t* app) {
     int index = app_index_of(app);
-    return index >= 0 && index < 4 &&
+    return app_nav_position(index) >= 0 &&
            app->main_page_visible && app->main_page_visible(ctx);
 }
 
@@ -682,9 +683,9 @@ static app_redraw_t main_key_action(app_ctx_t *ctx,const app_desc_t *current,int
     if(held)return key==UI_KEY_2?APP_REDRAW_FULL:APP_REDRAW_NONE;
     app_redraw_t redraw=APP_REDRAW_NONE;
     if(current->on_main_key && current->on_main_key(ctx,key,&redraw))return redraw;
-    int tab=app_index_of(current);
-    if(tab>=0 && tab<4 && (key==UI_KEY_1||key==UI_KEY_3))
-        ui_nav_request(ctx,(tab+(key==UI_KEY_1?3:1))%4);
+    int tab=app_nav_position(app_index_of(current));
+    if(tab>=0 && (key==UI_KEY_1||key==UI_KEY_3))
+        ui_nav_request(ctx,app_nav_id((tab+(key==UI_KEY_1?APP_NAV_COUNT-1:1))%APP_NAV_COUNT));
     return APP_REDRAW_NONE;
 }
 
@@ -755,6 +756,7 @@ static void switch_to(
 #endif
     display_main_transition_cancel();
     if ((*current)->on_exit != NULL) (*current)->on_exit(ctx);
+    if (next == app_at(6)) book_shelf_page_release();
 #if defined(KIIKO_LOCAL_LATENCY) || KIIKO_BOARD_METALIO47
     const int64_t probe_exit=esp_timer_get_time();
 #endif
@@ -973,10 +975,11 @@ static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedbac
     if (feedback) app_lock_feedback(ctx->hl);
     if (current->on_before_lock) current->on_before_lock(ctx);
     int tab = app_index_of(current);
-    pico_resume_t resume = {.tab = tab >= 0 && tab < 4 ? (uint8_t)tab : 0};
+    pico_resume_t resume = {.tab = app_nav_position(tab) >= 0 ? (uint8_t)tab : 0};
     bool fullscreen = false;
     if (tab == 1 && app_book_resume_context(resume.path, sizeof(resume.path), &fullscreen)) {
         resume.reader = 1;
+        resume.tab = app_book_resume_origin();
         resume.fullscreen = fullscreen;
     }
 #if KIIKO_BOARD_METALIO47
@@ -1954,7 +1957,7 @@ void app_loop_run(const app_loop_config_t* config) {
         bool fade_blocked=idle_blocked||menu_open||power_dialog_open||s_quick.open||quick_input_owned||
             ui_click_feedback_active()||ui_click_feedback_nav_pending()||touch.touched||touch.count>1||
             ctx.consumed||ctx.request_app||ctx.request_menu||ctx.request_return||ctx.now_ms<s_lock_ignore_until_ms;
-        if (!fade_blocked && !ai_overlay_open() && current != &app_book &&
+        if (!fade_blocked && !ai_overlay_open() && current != &app_book && current != app_at(6) &&
             !pico_online_busy() && main_page_ready(&ctx, current) && ctx.now_ms - last_input_ms >= 300) {
             app_book_shelf_prefetch_first(&ctx);
         } else {

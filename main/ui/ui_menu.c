@@ -42,7 +42,7 @@ static int leaf_range(int leaf, int* out_count) {
 }
 
 int ui_menu_leaf_for_app(const app_desc_t* app) {
-    const int index = app_index_of(app);
+    const int index = app_menu_position(app_index_of(app));
     if (index < 0) return 0;
     return index / UI_MENU_ITEMS_PER_PAGE;
 }
@@ -102,7 +102,7 @@ void ui_draw_menu_row_pressed(uint8_t* framebuffer, const app_desc_t* current,
     int count;
     const int first = leaf_range(leaf, &count);
     char line[80];
-    const app_desc_t* item = app_at(first + row);
+    const app_desc_t* item = app_at(app_menu_id(first + row));
     if (item == NULL) return;
     EpdRect rect;
     if (!ui_menu_row_rect(leaf, row, &rect)) return;
@@ -181,7 +181,7 @@ int ui_menu_hit_test(uint16_t x, uint16_t y, int leaf) {
     int count = 0;
     const int first = leaf_range(leaf, &count);
     if (row >= count) return UI_MENU_HIT_NONE;
-    return first + row;
+    return app_menu_id(first + row);
 }
 
 // 按 UI_KEY_PITCH 均分，三个按键的中心（80/240/400）正好落在各段中点，

@@ -2,9 +2,9 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
- * 产品页清单。四个主页面对应底部导航；传输由文件首页的直达按钮进入，工厂页独立。
+ * 产品页清单。五栏导航单独映射，持久页面编号保持兼容。
  *
- * Product page table. Four main pages match the tab bar; file-home buttons open transfer directly.
+ * Five-tab visual order is separate from stable persisted page IDs.
  */
 
 #include "app_registry.h"
@@ -30,6 +30,22 @@ static const app_desc_t* const s_apps[] = {
 };
 
 #define APP_COUNT ((int)(sizeof(s_apps) / sizeof(s_apps[0])))
+static const uint8_t s_nav_ids[APP_NAV_COUNT] = {0, 1, 6, 2, 3};
+int app_nav_id(int position) {
+    return position >= 0 && position < APP_NAV_COUNT ? s_nav_ids[position] : -1;
+}
+int app_nav_position(int page_id) {
+    for (int i=0;i<APP_NAV_COUNT;++i) if (s_nav_ids[i]==page_id) return i;
+    return -1;
+}
+int app_menu_id(int position) {
+    if(position<APP_NAV_COUNT)return app_nav_id(position);
+    return position<APP_COUNT ? position-1 : -1;
+}
+int app_menu_position(int page_id) {
+    for(int i=0;i<APP_COUNT;++i)if(app_menu_id(i)==page_id)return i;
+    return -1;
+}
 
 int app_count(void) {
     return APP_COUNT;

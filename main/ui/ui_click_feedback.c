@@ -16,6 +16,7 @@
 #include "esp_heap_caps.h"
 #include "settings.h"
 #include "ui_nav_layout.h"
+#include "app_registry.h"
 typedef struct { EpdRect area; ui_click_kind_t kind; ui_icon_t icon; } click_control_t;
 static click_control_t s_controls[12], s_active;
 static unsigned s_count;
@@ -147,7 +148,7 @@ bool ui_click_feedback_press(uint8_t *fb, int x, int y, EpdRect *area) {
 // 还原单次放大/复位反馈；新点击优先，连点同一图标用轻微尺寸差避免被差分吞掉。
 // Restore one enlargement/settle; new contacts win and a small repeated-tap variation prevents identical-frame skips.
 void ui_click_feedback_nav_request(int tab) {
-    if(tab<0||tab>=4)return;
+    if(app_nav_position(tab)<0)return;
     bool accent=s_nav.tab==tab&&s_pixels ? !s_nav.accent : false;
     if(s_pixels) {
         if(s_active.kind==UI_CLICK_NAV)s_nav.dirty=nav_union(s_nav.dirty,changed_area(s_frame));
@@ -177,14 +178,16 @@ bool ui_click_feedback_nav_tick(uint8_t *fb,int64_t now_ms,EpdRect *area) {
     if(s_nav.phase==0) {
         click_control_t *control=NULL;
         for(unsigned i=0;i<s_count;++i)if(s_controls[i].kind==UI_CLICK_NAV&&
-            (s_controls[i].area.x+s_controls[i].area.width/2)/(UI_LOCK_WIDTH/4)==s_nav.tab) {
+            app_nav_id((s_controls[i].area.x+s_controls[i].area.width/2)*APP_NAV_COUNT/UI_LOCK_WIDTH)==s_nav.tab) {
             control=&s_controls[i];break;
         }
         // 书架正等待封面时新帧尚未注册底栏；按稳定公共布局反馈，不能等待目标页出现。
         // While shelf covers load, the new frame may lack registrations; use the stable common footer immediately.
-        static const ui_icon_t tabs[]={UI_ICON_HOUSE,UI_ICON_LIBRARY_BIG,UI_ICON_FOLDER_OPEN,UI_ICON_SLIDERS_HORIZONTAL};
-        int center=(s_nav.tab*2+1)*UI_LOCK_WIDTH/8;
-        s_active=control?*control:(click_control_t){(EpdRect){center-30,UI_NAV_TOP+15,60,60},UI_CLICK_NAV,tabs[s_nav.tab]};
+        static const ui_icon_t tabs[]={UI_ICON_HOUSE,UI_ICON_LIBRARY_BIG,UI_ICON_BOOK_OPEN,UI_ICON_FOLDER_OPEN,UI_ICON_SLIDERS_HORIZONTAL};
+        int slot=app_nav_position(s_nav.tab);
+        int left=slot*UI_LOCK_WIDTH/APP_NAV_COUNT,right=(slot+1)*UI_LOCK_WIDTH/APP_NAV_COUNT;
+        int center=(left+right)/2;
+        s_active=control?*control:(click_control_t){(EpdRect){center-30,UI_NAV_TOP+15,60,60},UI_CLICK_NAV,tabs[slot]};
         EpdRect r=s_active.area;
         s_pixels=heap_caps_malloc((size_t)r.width*r.height,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
         if(!s_pixels) {

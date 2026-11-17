@@ -64,6 +64,11 @@ echo "Compiling and running production WeRead shelf/TOC tests..."
     tools/weread_stubs/cJSON.c -lm -o build/weread-tests/test_weread_shelf
 build/weread-tests/test_weread_shelf
 
+"${CC}" "${flags[@]}" -Dtime=resume_test_time tools/test_weread_shelf_resume.c \
+    main/weread/weread_{shelf,store,auth,client}.c tools/weread_stubs/cJSON.c \
+    -lm -o build/weread-tests/test_weread_shelf_resume
+build/weread-tests/test_weread_shelf_resume
+
 "${CC}" "${flags[@]}" -Dtime=toc_test_time tools/test_weread_toc_policy.c \
     main/weread/weread_{shelf,toc,store,auth,client}.c \
     tools/weread_stubs/cJSON.c -lm -o build/weread-tests/test_weread_toc_policy
@@ -167,6 +172,7 @@ echo "Compiling and running bounded cache lifecycle tests..."
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_cache
 build/weread-tests/test_weread_cache
 python3 tools/weread_cache_ui_host_test.py
+python3 tools/weread_reader_input_host_test.py
 python3 tools/weread_cover_cache_host_test.py
 python3 tools/weread_cache_fault_host_test.py
 python3 tools/weread_shelf_noop_host_test.py

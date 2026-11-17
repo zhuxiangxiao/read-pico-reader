@@ -12,6 +12,7 @@ unit = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "book_weread_uri.h"
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
@@ -28,7 +29,11 @@ enum {READING,TOC,SHELF,READER_PANEL_NONE,READER_PANEL_TOOLS};
 #define E0470_TURN_LTR -1
 #define ESP_LOGI(...) ((void)0)
 static char s_requested_open[288];
-static bool s_requested_fullscreen=true,s_requested_open_home,s_requested_resume_mode;
+static char s_path[288]="/sdcard/book.epub";
+static void weread_runtime_cancel_join(void){}
+static void weread_reader_input(bool local){if(!local)weread_runtime_cancel_join();}
+static void wr_reader_move(void){}
+static bool s_requested_fullscreen=true,s_requested_resume_mode;static uint8_t s_requested_open_origin;
 static bool default_fullscreen;
 static bool app_settings_reader_default_fullscreen(void){return default_fullscreen;}
 // Real reader_zoom_reset dependencies: keep its cleanup in the exercised turn path.
@@ -49,6 +54,7 @@ static bool s_reader_fullscreen,s_clear_confirm,s_reader_text_frame,s_reader_tur
 static bool s_water_turn_pending,s_reader_cleanup,draw_locked,load_failed;
 static int s_water_turn_dir;
 static unsigned s_stats_pending_turns,s_session_turns,s_turns,s_unsaved;
+static void ticket_count_turn(void){++s_stats_pending_turns;++s_session_turns;}
 static int64_t s_last_turn_ms,s_stats_activity_ms;
 static bool s_save_failed;
 static char s_message[128];
@@ -122,6 +128,8 @@ static void book_layout_set_first_line_indent_adjust(int px){assert(draw_locked)
 """
 unit+='static bool s_rc_auto_turning,s_rc_auto_waiting;\nstatic reader_auto_clock_t s_rc_auto;\n'+function('rc_pause_auto',ROOT/'main/apps/book_reader_controls_runtime.inc')+'\n'
 unit += function('apply_reader_indent', BOOK) + '\n'
+for name in ('wr_reader_text_page','wr_reader_text_turn'):
+    unit += function(name, ROOT/'main/apps/book_weread_bridge.inc') + '\n'
 for name in ('reader_zoom_reset', 'app_book_request_open', 'app_book_request_open_from_home', 'app_book_request_resume',
              'toggle_reader_fullscreen', 'apply_reader_option', 'reader_turn_chrome', 'turn_page'):
     unit += function(name, BOOK) + '\n'
@@ -164,12 +172,12 @@ int main(void){
  assert(apply_reader_indent(&ctx,2,101)==APP_REDRAW_NONE&&saves==1);
  assert(apply_reader_indent(&ctx,2,-101)==APP_REDRAW_NONE&&saves==1);
 
- assert(app_book_request_open("/sdcard/book.epub")&&!s_requested_fullscreen&&!s_requested_open_home);
- assert(app_book_request_resume("/sdcard/book.epub",false)&&!s_requested_fullscreen&&s_requested_open_home);
+ assert(app_book_request_open("/sdcard/book.epub")&&!s_requested_fullscreen&&s_requested_open_origin==1);
+ assert(app_book_request_resume("/sdcard/book.epub",false,0)&&!s_requested_fullscreen&&s_requested_open_origin==0);
  assert(app_book_request_open_from_home("/sdcard/other.epub")&&!s_requested_fullscreen);
  default_fullscreen=true;
  assert(app_book_request_open("/sdcard/book.epub")&&s_requested_fullscreen&&!s_requested_resume_mode);
- assert(app_book_request_resume("/sdcard/book.epub",false)&&!s_requested_fullscreen&&s_requested_resume_mode);
+ assert(app_book_request_resume("/sdcard/book.epub",false,0)&&!s_requested_fullscreen&&s_requested_resume_mode);
  default_fullscreen=false;
  assert(!app_book_request_open(NULL)&&!app_book_request_open(""));
  for(int full=0;full<2;++full)for(int tools=0;tools<2;++tools)for(int dir=-1;dir<=1;dir+=2){
@@ -258,6 +266,6 @@ with tempfile.TemporaryDirectory(dir=ROOT / 'build') as folder:
     c, exe = Path(folder) / 'test.c', Path(folder) / 'test'
     c.write_text(unit)
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-fsanitize=address,undefined',
-                    '-I', str(ROOT / 'main'),
+                    '-I', str(ROOT / 'main'), '-I', str(ROOT / 'main/book'),
                     str(c), '-o', str(exe)], check=True)
     subprocess.run([str(exe)], check=True)

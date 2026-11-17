@@ -16,7 +16,8 @@ typedef struct {
 typedef struct {
     char book_id[64],title[256],author[128];
     uint64_t cover_key;
-    uint32_t progress;
+    uint32_t progress,chapter_index;
+    uint64_t read_update_time,update_time;
     bool has_cover;
 } weread_shelf_item_t;
 

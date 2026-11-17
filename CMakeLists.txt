@@ -60,6 +60,19 @@ if(app_desc_launcher)
 endif()
 set_property(TARGET ${app_desc_lib} PROPERTY C_COMPILER_LAUNCHER "${app_desc_utc_launcher}")
 
+# 保留断言及完整组件内路径，省去每条诊断中重复的 /IDF/components 前缀。
+# Retain assertions and component-relative paths; avoid repeating /IDF/components in each diagnostic.
+idf_build_get_property(kiiko_idf_path IDF_PATH)
+idf_build_get_property(kiiko_build_components BUILD_COMPONENTS)
+foreach(kiiko_component IN LISTS kiiko_build_components)
+    idf_component_get_property(kiiko_component_lib ${kiiko_component} COMPONENT_LIB)
+    get_target_property(kiiko_component_type ${kiiko_component_lib} TYPE)
+    if(NOT kiiko_component_type STREQUAL "INTERFACE_LIBRARY")
+        target_compile_options(${kiiko_component_lib} PRIVATE
+            "-fmacro-prefix-map=${kiiko_idf_path}/components=idf")
+    endif()
+endforeach()
+
 # panic 包装器的链接选项在 main/CMakeLists.txt 里挂到 main 组件上：写在 project() 之后
 # 用 idf_build_set_property 设全局链接选项已经太晚，链接器看不到 --wrap。
 # The panic wrapper's link option hangs off the main component in main/CMakeLists.txt: setting a

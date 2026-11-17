@@ -23,3 +23,6 @@ cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -fsanitize=address,undefined
 python3 tools/lock_feedback_host_test.py
 
 python3 tools/power_dialog_host_test.py
+
+python3 tools/five_tab_navigation_host_test.py
+python3 tools/reader_origin_host_test.py

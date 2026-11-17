@@ -1,19 +1,23 @@
 # 微信读书 / WeRead
 
-设备入口为「书架 → 微信读书」。Pico 与 S31 共用登录、缓存、页面与同步服务；本地 TXT/EPUB 扫描范围保持原样。当前为本地测试功能：Pico 已确认真实扫码登录、正文、自导入封面，以及本轮缓存书架更流畅、从目录找回的位置退书重开后保持；跨端长时同步和 S31 实屏仍待验收。
-Open **Shelf → 微信读书**. Pico and S31 share login, caching, UI and synchronization; local TXT/EPUB enumeration is unchanged. Pico QR login, first-page shelf and text display have been confirmed on hardware. Cross-device positions and S31 panel acceptance remain pending.
+底部导航为「首页 / 书架 / 微信读书 / 文件 / 设置」，直接点击「微信读书」进入。Pico 与 S31 共用登录、缓存、页面与同步服务；本地 TXT/EPUB 扫描范围保持原样。当前为本地测试功能：Pico 已确认真实扫码登录、正文、自导入封面，以及本轮缓存书架更流畅、从目录找回的位置退书重开后保持；跨端长时同步和 S31 实屏仍待验收。
+Open **微信读书** in the five-tab bar: Home / Shelf / WeRead / Files / Settings. Pico and S31 share login, caching, UI and synchronization; local TXT/EPUB enumeration is unchanged. Pico QR login, first-page shelf and text display have been confirmed on hardware. Cross-device positions and S31 panel acceptance remain pending.
 
 ## 使用 / Use
 
-- 连接 WiFi 后扫码，在手机上完成确认或验证码；凭据保存在当前 TF 卡。
-  Connect WiFi, scan, and confirm or complete verification on the phone. Credentials belong to the current TF card.
-- 首次先加载第一页最多6本，显示后其余每批最多20本在后台补齐；已有缓存先显示，可直接点书中断后台加载并优先开书。部分详情缺失保留已显示书籍，未补齐时不前移同步游标。
-  Fetch at most6 books for the first page, then up to20 per background batch. Show cached books immediately; opening interrupts background loading. Missing details retain visible books without advancing the sync cursor.
-- 默认网格，可切换列表；支持书名和作者搜索、分页、逐本封面加载。单击阅读，长按清理该书离线内容。清理保留阅读进度，退出登录删除所有凭据副本。
+- 进入先从本地确认登录状态；此时显示书架加载状态，已登录不会闪出扫码页。确认未登录后立即尝试联网生成二维码，在手机上完成确认或验证码；可随时从底栏切换页面，网络失败可点「连接 WiFi」。凭据保存在当前 TF 卡。
+  Entry checks local authentication first without flashing the login screen. A confirmed unauthenticated entry immediately requests a QR code. Confirm or complete verification on the phone; the bottom navigation remains available. Use Connect WiFi if needed. Credentials belong to the current TF card.
+- 首次先加载一批最多6本，显示后其余每批最多20本在后台补齐；已有缓存先显示，可直接点书中断后台加载并优先开书。部分详情缺失保留已显示书籍，未补齐时不前移同步游标。
+  Fetch at most6 books for the first batch, then up to20 per background batch. Show cached books immediately; opening interrupts background loading. Missing details retain visible books without advancing the sync cursor.
+- 与本地书架共用外观设置：深色书轨、亚克力、液态玻璃均为9宫格，列表每页8本；搜索时临时使用列表。封面尺寸、裁切、进度角标、搜索、分页和排序控件共用绘制组件。
+- 两个书架分别保留搜索、页码和排序，切换入口再回来恢复各自状态。云端排序使用书名、最近阅读、更新时间和进度；书目以云端为准。题头「更多」提供刷新书架、WiFi和退出登录；长按书籍清理其离线内容，保留进度。退出登录删除所有凭据副本并立即请求新二维码。
+- 从微信书架开书返回微信书架，从首页继续阅读返回首页，本地书籍返回本地书架；睡眠恢复保持阅读来源、位置和全屏状态。老固件保存的文件/设置页编号继续兼容。
 - 书架缓存先上屏；完整同步后5分钟内重复进入不自动联网同步，过期后空闲1秒再后台增量检查。手动刷新立即检查；失败暂缓重试，首次/未完成书架继续分批加载。
 - 增量检查确认游标相同且所有变更集合为空时，保留原书架，仅原子更新很小的核对时间记录；部分同步、缺失详情、游标或账号变化仍走完整事务。
+- 已确认详情按当前账号与本轮云端游标记入批次检查点。切页、开书或重启后先核对云端游标，同一轮只补未确认详情；云端游标变化则重新核对相应书目。旧缓存缺少确认标记时逐批补核对，已有书目保留可读。完整核对成功后清理临时批次标记。
+- 成功响应缺少部分书号只代表详情未取到，保留已成功书籍及旧同步游标，并独立延迟5分钟重试；云端目标游标相同时只请求仍缺失的书，目标游标变化则重新核对。明确不支持的格式直接跳过并允许该轮完成。
 - 当前页先读完本地封面点阵，再补远端缺图；切换列表/网格复用同组像素，书架重排按书号和封面版本转移。账号、书号、原图地址或点阵格式变化使对应缓存失效；失败封面短期负缓存，手动刷新可重试。
-  Start in grid view and switch to a list if preferred; search titles/authors and load covers progressively. Tap to read or hold to clear that book's content while retaining progress. Logout removes every credential copy.
+  Both shelves share appearance and drawing components, with nine grid entries or eight list rows. Each retains its own query/page/order on tab switches. More provides refresh, WiFi and logout; hold a book to clear its content while retaining progress. Returning from reading follows its Home/local/WeRead origin, including sleep restoration.
 - 普通开书先检查本机和云端位置；存在冲突时明确选择。离线保留书架、目录和已完整下载的章节，未缓存章节需要联网。
   Normal opens compare local/cloud positions and ask when they conflict. Shelf, TOC and complete chapters remain available offline; uncached chapters require connectivity.
 - 云端未读空位置从首章打开。睡眠恢复从 TF 上按账号、版本与章节 UID 校验的位置恢复；损坏记录或未知章节会报错。普通新开书的位置候选在下载自愈后绑定最终目录版本。
@@ -35,10 +39,12 @@ Register JSON hooks once at boot: JSON nodes/strings in `WR_GUARD` task scopes u
 
 - `weread_runtime_start` / `poll`：登录、书架同步、开书检查、封面、清理和退出；调用方通过 `weread_runtime_result_free` 释放未接管的结果。
   Dispatch login, shelf sync, opening checks, covers, cleanup and logout; release unclaimed result allocations with `weread_runtime_result_free`.
-- `weread_reader_prepare(uri, chapter)`：阅读器解析前由 worker 确保章节完整；前台只解析缓存。阅读空闲预读下一章，触摸/按键/翻页先取消并等待，切章前强制检查点。
-  Ensure complete chapter content on the worker before foreground parsing. Idle reading prefetches the next chapter; input/turns cancel and join first, and chapter switches force a checkpoint.
-- `weread_reader_begin/resume/tick/flush/end`：保存本机位置，累计实际活跃读秒与翻页；按60秒或十页节流，切章、退书、锁屏强制上报。先保存 dirty 再联网；强制交接有截止时间，失败保留 dirty 待重试。
-  Track local position, active reading time and turns. Reports throttle at60 seconds or ten pages and are forced on chapter/exit/lock boundaries. Persist dirty state before networking; forced handoffs have a deadline and failed reports remain dirty for retry.
+- `weread_reader_prepare(uri, chapter)`：阅读器解析前由 worker 确保章节完整；前台只解析缓存，空闲时预读下一章。已载入的同章纯文字翻页允许进度任务用独立位置快照继续完成，旧快照结果不能覆盖更新的导航；图文、切章及释放资源前仍取消并等待。切章前提交离开章节的位置，目标章节成功显示后的真实导航由后续采样保存。
+  Ensure complete chapter content on the worker before foreground parsing and prefetch the next chapter during idle. Loaded same-chapter text turns may proceed while a progress worker owns its snapshot; stale completion cannot overwrite newer navigation. Image, chapter and resource-lifecycle boundaries still join. A chapter boundary flushes the departing position; committed navigation records the destination afterward.
+- `weread_reader_begin/resume/tick/flush/end`：保存本机位置，累计实际活跃读秒与翻页；普通上报按60秒或十页节流，切章、退书、锁屏对待报位置强制尝试。先保存 dirty/positionPending 再联网；必须收到成功业务响应 `succ=1/true` 才清标记，清标记写卡失败仍保留待报记录。强制请求有1800ms预算，但旧请求取消及DNS/TLS交接不构成同样严格的总耗时上限。
+  Track local position, active reading time and turns. Ordinary reports throttle at60 seconds or ten pages; chapter/exit/lock boundaries force an attempt for pending positions. Persist dirty/positionPending before networking and clear them only after a successful `succ=1/true` response; failed acknowledgement commits retain pending state. Forced requests use an1800ms budget, without a strict total bound on prior cancellation or DNS/TLS teardown.
+- 失败记录在当前书继续阅读时按15秒退避补报，睡眠恢复或重开并继续本机待报位置后也可重试。退书或锁屏后 worker 停止，没有跨书后台补报队列，也没有单独的“云端同步成功”界面状态；离线时不能承诺云端即时保存。无真实导航且无待报位置时不发位置请求，保留避免覆盖手机进度的保护。
+  Failed records retry with15-second backoff while reading the same book, or after resuming its pending local position. Exit/lock stops the worker; there is no cross-book retry queue or dedicated cloud-acknowledgement UI. Offline handoffs cannot promise immediate cloud persistence. No navigation and no pending position means no position write, retaining the phone-progress protection.
 - `cancel_join` / `stop` / `media_lost`：只 shutdown 自有 HTTP socket，等请求/解包完成退出后才释放媒体。WiFi 的启动与停止都归同一 worker；只关闭自己启动的射频会话。拔卡擦除内存账号，进入时重新绑定当前卡。
   Shut down only the owned HTTP socket and join before releasing media. One worker starts/stops its own WiFi session, retaining any externally owned connection. Media loss wipes account memory, and entry rebinds to the current card.
 

@@ -52,13 +52,15 @@ for name in ['ui_rect_hit','ui_pager_area_at','ui_pager_rect_at','ui_pager_hit_a
 
 u+=r'''
 #define EPD_DRAW_ALIGN_CENTER 1
-static EpdRect shelf_page_label_rect(int page,int pages){(void)page;(void)pages;return(EpdRect){280,1006,60,50};}
+static EpdRect ui_shelf_page_label_rect(int page,int pages){(void)page;(void)pages;return(EpdRect){280,1006,60,50};}
 static void ui_text_fixed_vc(uint8_t*f,int x,int y,int px,const char*label,int align,bool inverse){(void)f;(void)align;(void)inverse;assert(x>204&&x<480&&y==1031&&px<=32&&strchr(label,'/'));}
-static void draw_shelf_search_button(uint8_t*f,int page,int pages){(void)f;(void)page;(void)pages;}
+static void draw_shelf_search_button(uint8_t*f,int page,int pages,bool filtered,bool pressed){(void)f;(void)page;(void)pages;(void)filtered;(void)pressed;}
 static EpdRect shelf_pager_group_rect(int page,int pages){(void)page;(void)pages;return(EpdRect){240,1004,204,54};}
 static int ui_text_fixed_width_px(int px,const char*text){(void)text;return px*2;}
 static void epd_fill_circle(int x,int y,int radius,int color,uint8_t*fb){(void)x;(void)fb;assert(y==1031&&radius==2&&color==0x80);}
 '''
+u+='static char s_query[1];\n'
+u+=function('ui_shelf_pager',R/'main/ui/ui_shelf.c')+'\n'
 if 'static bool shelf_waiting_for_index(' in book.read_text():
  u+=function('shelf_waiting_for_index',book)+'\n'
 for name in ['leaves','draw_shelf_pager','shelf_key_paint','shelf_turn_page','shelf_pager_release_hit','shelf_pager_event']:

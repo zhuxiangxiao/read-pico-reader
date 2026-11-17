@@ -232,6 +232,12 @@ EpdRect ui_content_refresh_area(void) {return (EpdRect){0,0,684,1000};}
 const app_desc_t* app_home_page(void) {return &first;}
 const app_desc_t* app_at(int i) {return i==0?&first:i==1?&second:NULL;}
 int app_index_of(const app_desc_t* app) {return app==&first?0:app==&second?1:-1;}
+int app_nav_id(int position){const int ids[]={0,1,6,2,3};return position>=0&&position<5?ids[position]:-1;}
+int app_nav_position(int id){for(int i=0;i<5;++i)if(app_nav_id(i)==id)return i;return -1;}
+int app_menu_position(int id){return id;}
+uint8_t app_book_resume_origin(void){return 1;}
+void book_shelf_page_release(void){}
+
 int ui_key_hit_test(uint16_t x,uint16_t y) {return y>=1300 && x<480?x/160:-1;}
 bool ui_menu_handle_hit_test(uint16_t x,uint16_t y) {return x>600 && y>1100 && y<1300;}
 int ui_menu_leaf_for_app(const app_desc_t*a) {return a==&second?1:0;}

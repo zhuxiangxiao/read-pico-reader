@@ -87,6 +87,7 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "ui/datamatrix.c"
         "ui/ui_menu.c"
         "ui/ui_nav.c"
+        "ui/ui_shelf.c"
         "ui/ui_home_widget.c"
         "ui/ui_home_clock.c"
         "ui/ui_image_dither.c"
@@ -290,6 +291,7 @@ kiiko_board_sources(kiiko_selected_sources "${CMAKE_CURRENT_LIST_DIR}" "app_main
         "ui/datamatrix.c"
         "ui/ui_menu.c"
         "ui/ui_nav.c"
+        "ui/ui_shelf.c"
         "ui/ui_home_widget.c"
         "ui/ui_home_clock.c"
         "ui/ui_image_dither.c"
@@ -394,11 +396,15 @@ set(weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_rea
     app_cloud_sync.c ui_keyboard.c book_title.c app_book.c ota_online.c ota_release.c app_onboarding.c
     boot_state.c app_registry.c app_boot_recovery.c ota_update.c
     app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c book_weread_cover.c
-    ui_ime.c book_toc.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c)
+    ui_ime.c book_toc.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c)
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
+        # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
+        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|ota_update|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input)\\.c$")
+            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
+        endif()
     endif()
     if(weread_source MATCHES "(^|/)weread/" OR weread_source_name MATCHES "^(app_weread|book_weread_crypto|book_source_weread)\\.c$")
         set_property(SOURCE "${weread_source}" APPEND PROPERTY COMPILE_OPTIONS "-fstack-usage")

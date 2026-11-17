@@ -12,6 +12,7 @@ extern bool test_reader_open;
 static inline bool app_book_reader_open(void) { return test_reader_open; }
 
 #include <stddef.h>
+uint8_t app_book_resume_origin(void);
 bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen);
 
 void app_book_cover_mode_changed(void);

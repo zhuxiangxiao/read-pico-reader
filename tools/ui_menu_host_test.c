@@ -16,6 +16,8 @@ void ui_draw_icon(uint8_t *fb, int cx, int cy, int size, ui_icon_t icon, uint8_t
     last_icon = icon;
     ++icon_calls;
 }
+int app_menu_id(int i){return i;}
+int app_menu_position(int i){return i;}
 int app_count(void) {return 10;}
 const app_desc_t* app_at(int i) {return i>=0&&i<10?&items[i]:NULL;}
 int app_index_of(const app_desc_t*a) {return (int)(a-items);}

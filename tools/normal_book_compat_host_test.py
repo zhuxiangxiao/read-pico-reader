@@ -17,6 +17,7 @@ unit = r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include "book_weread_uri.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,12 +65,23 @@ static shelf_entry_t s_shelf[8];
 static int s_count,s_visible_count,s_view=0;
 enum {SHELF};
 static char s_query[65],s_latest_path[288],s_requested_open[288];
-static bool s_recent_sort=true,s_requested_open_home,s_requested_fullscreen;
+static bool s_recent_sort=true,s_requested_fullscreen,s_requested_resume_mode,s_chapters_started;static uint8_t s_requested_open_origin;
 typedef struct {nvs_handle_t favorites,hidden;bool truncated;} shelf_backfill_t;
 static bool shelf_reserve(void){++reserves;return s_count<8;}
 static void shelf_category_restore(app_ctx_t *ctx){(void)ctx;}
 static void shelf_categories_recount(void){}
 static void sort_shelf(app_ctx_t *ctx){(void)ctx;++sorts;s_visible_count=s_count;}
+'''
+unit += r'''
+static bool app_settings_reader_default_fullscreen(void){return false;}
+static bool book_name_from_path(const char*p,char*n,size_t nc,char*a,size_t ac){(void)a;(void)ac;return book_title_from_path(p,n,nc);}
+static bool book_weread_cover_metadata(const char*p,char*n,size_t nc,char*a,size_t ac){(void)p;(void)n;(void)nc;(void)a;(void)ac;return false;}
+static bool book_weread_metadata(const char*p,char*n,size_t nc,char*a,size_t ac){(void)p;(void)n;(void)nc;(void)a;(void)ac;return false;}
+static bool book_author_clean_display(char*a,size_t ac){(void)a;(void)ac;return false;}
+static void shelf_added_load(void){}
+static int shelf_order_mode(void){return 1;}
+static int book_target_stat(const char*p,struct stat*s){assert(!book_path_is_weread(p));return stat(p,s);}
+static void weread_runtime_load_local(void){}
 '''
 for name in ('app_book_request_open','app_book_request_open_from_home','app_book_request_resume',
              'shelf_backfill_visit','shelf_backfill_read_books','refresh_cached_progress'):
@@ -107,10 +119,10 @@ int main(int argc,char **argv){
   memset(&s_current,0,sizeof(s_current));memset(s_recent,0,sizeof(s_recent));strcpy(last,records[0].path);scan_books();assert(!strcmp(s_current.path,records[0].path));
   strcpy(last,oldlast);
  }else{
-  assert(app_book_request_open_from_home(records[0].path)&&s_requested_open_home);
-  for(int i=2;i<5;++i){assert(!app_book_request_open(records[i].path));assert(!app_book_request_resume(records[i].path,true));assert(!strcmp(s_requested_open,records[0].path));}
+  assert(app_book_request_open_from_home(records[0].path)&&s_requested_open_origin==0);
+  for(int i=2;i<5;++i){assert(!app_book_request_open(records[i].path));assert(!app_book_request_resume(records[i].path,true,0));assert(!strcmp(s_requested_open,records[0].path));}
   assert(!app_book_request_open(NULL)&&!app_book_request_open(""));
-  assert(app_book_request_resume(records[1].path,false)&&!s_requested_fullscreen&&!strcmp(s_requested_open,records[1].path));
+  assert(app_book_request_resume(records[1].path,false,0)&&!s_requested_fullscreen&&!strcmp(s_requested_open,records[1].path));
  }
  assert(!memcmp(before,records,sizeof(before))&&!strcmp(last,oldlast));
  printf("PASS: %s ignores unsupported shared records, accepts real local paths and preserves history\n",argv[2]);

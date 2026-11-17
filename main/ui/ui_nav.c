@@ -2,8 +2,8 @@
  * SPDX-FileCopyrightText: 2026 mindreset
  * SPDX-License-Identifier: Apache-2.0
  *
- * 中文：绘制与命中四栏导航；细线图标分别表示首页、书架、文件和设置，图形来自 Lucide。
- * English: Draw and hit-test the four-tab navigation with thin-line home, books, files and settings icons from Lucide.
+ * 中文：绘制与命中五栏导航；细线图标分别表示首页、书架、微信读书、文件和设置，图形来自 Lucide。
+ * English: Draw and hit-test the five-tab navigation with thin-line home, local books, WeRead, files and settings icons from Lucide.
  * 用户增加点击反馈：共享返回键和底栏图标登记局部命中，主循环只在按下和复位推该控件。
  * User adds click feedback: register local hits for shared backs and navigation icons; the loop presents only that control on press and restoration.
  * 用户修订：所有模式把内容扫描截止到分隔线之间的8行固定为白色留白；滚动不能把列表画进这条扫描保护带。
@@ -109,7 +109,7 @@ static void status_fit_signature(char *text, int width) {
     }
 }
 
-static const char *const labels[] = {"首页", "书架", "文件管理", "设置"};
+static const char *const labels[] = {"首页", "书架", "微信读书", "文件", "设置"};
 static int s_power_signature=-1000;
 static int power_signature(void) {
     const pmu_snapshot_t *pmu=read_pico_pmu_get();
@@ -141,13 +141,13 @@ void ui_nav_wifi_icon(uint8_t *fb, int cx, int cy, int size, uint8_t gray) {
 }
 
 static void icon(uint8_t *fb, int tab, int cx, int y) {
-    // 四个底栏图标固定用 Lucide 细线原图，线宽与状态栏一致；y 是图标盒顶边。
-    // The four bar icons stay on upstream Lucide line art at the status-bar stroke weight; y is the box top.
-    static const ui_icon_t tabs[4] = {
-        UI_ICON_HOUSE, UI_ICON_LIBRARY_BIG,
+    // 五个底栏图标固定用 Lucide 细线原图，线宽与状态栏一致；y 是图标盒顶边。
+    // The five bar icons use upstream Lucide line art at the status-bar stroke weight; y is the box top.
+    static const ui_icon_t tabs[APP_NAV_COUNT] = {
+        UI_ICON_HOUSE, UI_ICON_LIBRARY_BIG, UI_ICON_BOOK_OPEN,
         UI_ICON_FOLDER_OPEN, UI_ICON_SLIDERS_HORIZONTAL,
     };
-    if (tab < 0 || tab >= 4) return;
+    if (tab < 0 || tab >= APP_NAV_COUNT) return;
     ui_click_feedback_register(fb, (EpdRect){cx - 30, y - 12, 60, 60}, UI_CLICK_NAV, tabs[tab]);
     ui_draw_icon(fb, cx, y + 18, UI_NAV_TAB_ICON_PX, tabs[tab], UI_GRAY_BLACK);
 }
@@ -161,11 +161,14 @@ void ui_nav_draw(uint8_t *fb, int active) {
         // Reserve a blank fast-refresh boundary; short-update the marker on white while retaining icons and text.
         ui_fill_rect_fast((EpdRect){0, UI_NAV_MARKER_TOP, UI_LOCK_WIDTH, UI_NAV_MARKER_BOTTOM - UI_NAV_MARKER_TOP}, UI_GRAY_WHITE, fb);
     }
-    for (int i = 0; i < 4; ++i) {
-        int center = (i * 2 + 1) * UI_LOCK_WIDTH / 8;
-        if (i == active) ui_fill_rect_fast((EpdRect){center - 28, UI_NAV_TOP + 1, 56, 5}, UI_GRAY_BLACK, fb);
+    for (int i = 0; i < APP_NAV_COUNT; ++i) {
+        EpdRect tab_area=ui_nav_tab_area(app_nav_id(i));
+        int center=tab_area.x+tab_area.width/2;
+        if (app_nav_id(i) == active) ui_fill_rect_fast((EpdRect){center - 28, UI_NAV_TOP + 1, 56, 5}, UI_GRAY_BLACK, fb);
         icon(fb, i, center, UI_NAV_TOP + 27);
-        ui_text(fb, center, UI_NAV_TOP + 74, 17, labels[i], EPD_DRAW_ALIGN_CENTER, false);
+        int px=17;
+        while(px>10&&ui_text_fixed_width_px(ui_text_effective_px(px),labels[i])>tab_area.width-12)--px;
+        ui_text(fb, center, UI_NAV_TOP + 74, px, labels[i], EPD_DRAW_ALIGN_CENTER, false);
     }
 }
 
@@ -255,10 +258,16 @@ void ui_nav_status(uint8_t *fb) {
 
 int ui_nav_hit(uint16_t x, uint16_t y) {
     if (x >= UI_LOCK_WIDTH || y < UI_NAV_TOUCH_TOP || y >= UI_LOCK_HEIGHT) return -1;
-    int tab = x * 4 / UI_LOCK_WIDTH;
-    return tab < 4 ? tab : -1;
+    int tab = ((x+1) * APP_NAV_COUNT-1) / UI_LOCK_WIDTH;
+    return app_nav_id(tab);
 }
 
 void ui_nav_request(app_ctx_t *ctx, int index) {
-    if (index >= 0 && index < 4) ctx->request_app = app_at(index);
+    if (app_nav_position(index) >= 0) ctx->request_app = app_at(index);
+}
+
+EpdRect ui_nav_tab_area(int page_id) {
+    int slot=app_nav_position(page_id);if(slot<0)return (EpdRect){0};
+    int x=slot*UI_LOCK_WIDTH/APP_NAV_COUNT,end=(slot+1)*UI_LOCK_WIDTH/APP_NAV_COUNT;
+    return (EpdRect){x,UI_NAV_TOP,end-x,UI_LOCK_HEIGHT-UI_NAV_TOP};
 }

@@ -220,6 +220,19 @@ int main(void) {
     pico_boot_forget_interrupted_book();pico_boot_ready();
     assert(pico_boot_book_begin("weread://../escape")==ESP_ERR_INVALID_ARG);
     assert(pico_boot_book_begin("weread://book?other=1")==ESP_ERR_INVALID_ARG);
+    // Stable IDs survive the five-tab visual reorder, including old files/settings.
+    const unsigned roots[]={0,1,2,3,6};
+    for(unsigned i=0;i<sizeof(roots)/sizeof(*roots);++i){
+        pico_boot_clear_resume();pico_boot_ready();pico_resume_t page={.tab=roots[i]};
+        assert(pico_boot_save_resume(&page)==ESP_OK);pico_boot_init(false);pico_boot_ready();
+        assert(pico_boot_take_resume(&out)&&out.tab==roots[i]&&!out.reader);
+    }
+    pico_resume_t cloud={.tab=6,.reader=1,.fullscreen=1,.path="weread://test_book_101"};
+    assert(pico_boot_save_resume(&cloud)==ESP_OK);pico_boot_init(false);pico_boot_ready();
+    assert(pico_boot_take_resume(&out)&&out.tab==6&&out.reader&&out.fullscreen&&!strcmp(out.path,cloud.path));
+    cloud.tab=0;assert(pico_boot_save_resume(&cloud)==ESP_OK);pico_boot_init(false);pico_boot_ready();
+    assert(pico_boot_take_resume(&out)&&out.tab==0&&out.reader);
+    cloud.tab=6;strcpy(cloud.path,"/sdcard/books/local.epub");assert(pico_boot_save_resume(&cloud)==ESP_ERR_INVALID_ARG);
     puts("PASS: compact/legacy startup records; interrupted EPUB quarantine; unsupported cache ignored; low-space key-only reclaim; interrupted reclaim and failed commits stay safe; retry after transient NVS failure; settings/progress preserved");
     puts("PASS: one-shot reader/fullscreen resume; power-cut book quarantine; explicit retry; no false book blame; absent/corrupt NVS and commit failure; checked paths");
 }

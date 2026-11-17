@@ -37,6 +37,9 @@ bool weread_runtime_busy(void);
 bool weread_runtime_poll(weread_result_t *out);
 void weread_runtime_result_free(weread_result_t *result);
 void weread_runtime_cancel_join(void);
+/// 已载入的同章纯文字页可继续绘制，进度任务用自己的位置快照完成；IO/生命周期边界仍取消并等待。
+/// Loaded same-chapter text may render while a note uses its owned position snapshot; IO/lifecycle boundaries still join.
+void weread_reader_input(bool cached_text_only);
 void weread_runtime_stop(void);
 void weread_runtime_media_lost(void);
 unsigned weread_runtime_cache_epoch(void);

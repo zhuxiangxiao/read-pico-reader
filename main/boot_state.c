@@ -71,8 +71,8 @@ static bool path_valid(const char *path, bool empty) {
     return true;
 }
 static bool resume_valid(const pico_resume_t *r) {
-    return r && r->tab < 4 && r->reader <= 1 && r->fullscreen <= 1 &&
-        (!r->reader || r->tab == 1) && path_valid(r->path, !r->reader);
+    return r && (r->tab < 4 || r->tab == 6) && r->reader <= 1 && r->fullscreen <= 1 &&
+        (!r->reader || r->tab == 0 || r->tab == 1 || (r->tab == 6 && book_path_is_weread(r->path))) && path_valid(r->path, !r->reader);
 }
 static uint32_t packed_checksum(const uint8_t *data,size_t size) {
     uint32_t hash=2166136261u;

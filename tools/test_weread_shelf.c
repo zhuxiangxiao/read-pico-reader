@@ -162,7 +162,8 @@ int main(void) {
     while(weread_shelf_sync_pending())assert(weread_shelf_sync_step(false)==ESP_OK);
     weread_shelf_sync_progress(&done,&total,&skipped);
     assert(weread_shelf_count()==44&&done==45&&total==45&&skipped==1&&weread_shelf_synckey()==0);
-    assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)));
+    assert(weread_shelf_cache_fresh((uint64_t)time(NULL)));
+    assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)+301));
     mode=2;assert(weread_shelf_sync(true)==ESP_OK&&weread_shelf_count()==45);
     char tmp[512]; snprintf(tmp, sizeof(tmp), "%s/shelf.json.tmp", root); assert(!mkdir(tmp, 0700));
     mode = 5; assert(weread_shelf_sync(true) != ESP_OK && weread_shelf_count() == 45);

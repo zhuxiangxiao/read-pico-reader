@@ -455,8 +455,16 @@ static void consume_reader_result(void) {
 }
 static void join_job(void) { while (weread_runtime_busy()) pause_ms(1); }
 void weread_runtime_cancel_join(void) {
-    if (weread_runtime_busy()) { atomic_store(&s_cancel, true); weread_client_abort_active(); join_job(); }
+    if (weread_runtime_busy()) {
+        uint64_t begin=now_ms();unsigned job=s_work.job;
+        atomic_store(&s_cancel, true); weread_client_abort_active(); join_job();
+        if(now_ms()-begin>=25)ESP_LOGI("weread","foreground wait job=%u ms=%u",job,(unsigned)(now_ms()-begin));
+    }
     atomic_store(&s_cancel, false); atomic_store(&s_deadline, 0);
+}
+void weread_reader_input(bool cached_text_only){
+    if(cached_text_only&&weread_runtime_busy()&&s_work.job==WR_JOB_NOTE)return;
+    weread_runtime_cancel_join();
 }
 bool weread_runtime_start(weread_job_t job, const char *id, const char *value) {
     weread_runtime_init();

@@ -117,7 +117,8 @@ static void copy_text(char *d,size_t n,const char *v){snprintf(d,n,"%s",v);}
 static void fit_text(char *v,int px,int w){while(*v&&ui_text_fixed_width_px(px,v)>w){size_t n=strlen(v)-1;while(n&&((unsigned char)v[n]&0xc0)==0x80)--n;v[n]=0;}}
 '''
  unit+='#define FEEDBACK_SHADOW '+str(int('area.width += 2' in function('paint_list_cover_feedback',ROOT/'main/apps/app_book.c')))+'\n'
- for n in ('row_rect','shelf_cover_image','shelf_cover_frame_ready','draw_favorite_icon','draw_shelf_favorite_icon','cover_favorite_needs_white_edge','shelf_cover_white_edge','draw_shelf_cover_favorite','draw_shelf_cover','paint_list_cover_feedback','draw_list_title','draw_list_row'):
+ for helper in ['ui_shelf_rows', 'ui_shelf_entry', 'ui_shelf_cover', 'ui_shelf_cover_begin', 'ui_shelf_cover_pixels', 'ui_shelf_cover_end', 'ui_shelf_cover_placeholder', 'draw_list_title', 'ui_shelf_list_row']:unit+=function(helper,ROOT/'main/ui/ui_shelf.c')+'\n'
+ for n in ('row_rect','shelf_cover_image','shelf_cover_frame_ready','draw_favorite_icon','draw_shelf_favorite_icon','cover_favorite_needs_white_edge','shelf_cover_white_edge','draw_shelf_cover_favorite','draw_shelf_cover','paint_list_cover_feedback','draw_list_row'):
   unit+=function(n,ROOT/'main/apps/app_book.c')+'\n'
  unit+=r'''
 static void save(const char *path,uint8_t *frame){FILE *f=fopen(path,"wb");assert(f);for(int y=0;y<1216;++y)for(int x=0;x<684;++x){uint8_t v=(pixel(frame,x,y)>>4)*17;assert(fwrite(&v,1,1,f)==1);}assert(!fclose(f));}

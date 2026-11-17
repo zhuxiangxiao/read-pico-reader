@@ -250,7 +250,7 @@ void app_main(void) {
             if (book_path_is_weread(resume.path)) weread_runtime_load_local();
             struct stat st;
             if (!book_target_stat(resume.path, &st) && S_ISREG(st.st_mode) &&
-                app_book_request_resume(resume.path, resume.fullscreen)) first = app_at(1);
+                app_book_request_resume(resume.path, resume.fullscreen, resume.tab)) first = app_at(1);
         }
     }
     char interrupted[PICO_BOOT_PATH_MAX];

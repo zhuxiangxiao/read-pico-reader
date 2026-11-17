@@ -4,6 +4,15 @@
  * 中文：双板共用阅读位置采样；绘制路径不执行网络请求。
  * English: Shared reader sampling; rendering never performs network requests.
  */
+static bool wr_reader_text_page(void){
+    return s_view==READING&&s_text&&!s_clear_confirm&&s_reader_panel==READER_PANEL_NONE&&
+        s_page<book_layout_page_count()&&!book_layout_page_image_count(s_page);
+}
+static bool wr_reader_text_turn(int dir){
+    if(!wr_reader_text_page())return false;
+    if(dir>0)return s_page+1<book_layout_page_count()&&!book_layout_page_image_count(s_page+1);
+    return dir<0&&s_page&&!book_layout_page_image_count(s_page-1);
+}
 static void wr_reader_move(void){
     if(!s_text||!book_path_is_weread(s_path)||!book_layout_page_count())return;
     size_t offset=reader_page_offset(s_page);if(offset>s_text_len)offset=s_text_len;

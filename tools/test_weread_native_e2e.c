@@ -176,10 +176,33 @@ int main(int argc, char **argv) {
     assert(book_weread_open("weread://test_book_101")==ESP_OK);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
+    // 同章文字输入不等待上报；上报的旧快照不能覆盖其间的新导航。
+    // Local text input does not wait for a note; its old snapshot must not overwrite a newer move.
+    html_text_t stress={0};assert(book_weread_load(1,NULL,NULL,&stress)==ESP_OK);
+    const char *word=strstr(stress.utf8,"预读成功");assert(word);
+    uint32_t stress_offset=(uint32_t)(word-stress.utf8),expected_raw=0;
+    assert(book_weread_map(1,true,stress_offset+6,&expected_raw)==ESP_OK);
+    weread_reader_begin("weread://test_book_101",5000);
+    control("{\"latency\":1.0}");
+    for(unsigned i=0;i<10;++i){uint32_t target=stress_offset+(i%2)*3;
+        weread_reader_navigated("weread://test_book_101",1,target,83,stress.utf8+target);
+        weread_reader_tick("weread://test_book_101",1,target,83,stress.utf8+target,5000,false);
+    }
+    weread_reader_tick("weread://test_book_101",1,stress_offset+3,83,stress.utf8+stress_offset+3,6000,true);
+    usleep(150000);assert(weread_runtime_busy());uint64_t input_at=milliseconds();
+    weread_reader_input(true);assert(milliseconds()-input_at<100&&weread_runtime_busy());
+    weread_reader_navigated("weread://test_book_101",1,stress_offset+6,84,stress.utf8+stress_offset+6);
+    weread_reader_tick("weread://test_book_101",1,stress_offset+6,84,stress.utf8+stress_offset+6,6001,false);
+    assert(milliseconds()-input_at<100&&weread_runtime_busy());
+    result=completion();assert(result.job==WR_JOB_NOTE&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    control("{\"latency\":0}");weread_reader_flush(6100,true);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty&&local.chapter_offset==expected_raw&&local.progress==84);
+    html_text_free(&stress);weread_reader_end(6100);
+    puts("PASS: local text input remains below100ms during delayed production HTTP reporting; newer navigation survives completion and flush");
     // shutdown中断阻塞响应；取消后可重新创建任务。/ Shutdown interrupts blocked responses and permits worker restart.
     control("{\"latency\":1.5}");
     assert(weread_runtime_start(WR_JOB_SYNC,NULL,NULL));usleep(150000);
-    uint64_t cancelled_at=milliseconds();weread_runtime_cancel_join();
+    uint64_t cancelled_at=milliseconds();weread_reader_input(true);
     assert(milliseconds()-cancelled_at<1000);
     result=completion();assert(result.error!=ESP_OK);weread_runtime_result_free(&result);
     control("{\"latency\":0}");
