@@ -53,6 +53,10 @@ bool read_pico_sd_needs_recovery(void);
 /// 无I/O的快照门禁；挂载/卸载期间后台消费者不得重新打开TF文件。
 /// Snapshot-only gate; background consumers must not reopen TF files during mount/unmount.
 bool read_pico_sd_io_ready(void);
+#define READ_PICO_SD_MEDIA_ID_BYTES 28
+/// 只复制已挂载卡的CID身份，不访问总线；无有效卡返回false并清空输出。
+/// Copy the mounted card CID from RAM without bus IO; clear output when unavailable.
+bool read_pico_sd_media_id(uint8_t out[READ_PICO_SD_MEDIA_ID_BYTES]);
 /// 消费者全部释放后调用；ESP_OK表示已排队，NOT_FINISHED表示其他生命周期操作忙。
 /// Call after all consumers release handles; ESP_OK means queued, NOT_FINISHED means another lifecycle owner is busy.
 esp_err_t read_pico_sd_start_recovery(void);

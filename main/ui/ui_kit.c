@@ -101,6 +101,8 @@ void ui_acrylic_bw_rect(uint8_t* fb, EpdRect rect) {
 
 /* ---- 图标 / Icons ---- */
 
+#include "ui_icon_unpack.inc"
+
 // 越界钳到边缘，让双线性在掩模边界上也能取样。
 // Clamp to the edge so bilinear sampling stays valid at the mask border.
 static int icon_nibble(const uint8_t *mask, int x, int y) {
@@ -117,7 +119,9 @@ void ui_draw_icon(
     uint8_t *framebuffer, int cx, int cy, int size, ui_icon_t icon, uint8_t gray
 ) {
     if (framebuffer == NULL || size < 1 || icon < 0 || icon >= UI_ICON_COUNT) return;
-    const uint8_t *mask = ui_icon_masks[icon];
+    uint8_t unpacked[UI_ICON_UNPACKED_BYTES];
+    if (!icon_unpack(icon, unpacked)) return;
+    const uint8_t *mask = unpacked;
     // Q16 定点：一个目标像素跨过多少源像素。掩模 72 像素，显示通常更小，所以是降采样。
     // Q16 fixed point: source pixels spanned by one target pixel. The 72 px mask is
     // normally drawn smaller, so this is a downscale.

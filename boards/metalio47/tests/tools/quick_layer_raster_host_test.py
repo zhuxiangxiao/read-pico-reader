@@ -84,12 +84,14 @@ static void heap_caps_free(void *p){if(p){--live;size_t *base=(size_t*)p-1;live_
 code+='static void ui_fill_rect_fast(EpdRect r,uint8_t gray,uint8_t *fb){epd_fill_rect(r,gray,fb);}\n'
 header=(root/'main/ui/ui_quick_menu.h').read_text()
 code+='\n'.join(re.findall(r'^#define UI_QUICK[^\n]*',header,re.M))+'\n'
+code += '#include "'+str(root/'main/ui/ui_icon_unpack.inc')+'"\n'
 for name in ('ui_read_pixel','ui_image_bw_rect','icon_nibble','ui_draw_icon'):
     code+=function('main/ui/ui_kit.c',name)
 for name in ('epd_draw_circle',):code+=function('components/epdiy/src/epdiy.c',name)
 code+=function('main/ui/ui_kit.c','ui_inset_rect')+function('main/ui/ui_kit.c','ui_draw_control_frame')
 code+='static uint8_t pixel(const uint8_t *fb,int x,int y){return ui_read_pixel(fb,x,y)*17u;}\n'
 code+=body('main/ui/ui_quick_brightness.h').replace('#pragma once','')
+code += 'enum{APP_NAV_COUNT=5};static const uint8_t s_nav_ids[5]={0,1,6,2,3};\n'+function('main/app/app_registry.c','app_nav_id')+function('main/app/app_registry.c','app_nav_position')
 code+=body('main/ui/ui_glass.c')+body('main/ui/ui_quick_menu.c')+body('main/ui/ui_click_feedback.c')
 code+='#define UI_NAV_BACK_ICON_PX 48\n#define READER_SHEET_BACK_PX 52\n'
 code+=function('main/ui/ui_nav.c','ui_nav_back')+function('main/apps/app_book.c','draw_sheet_back')
@@ -213,10 +215,10 @@ int main(void){
  assert(ui_click_feedback_press(frame,85,1188,&r));ui_click_feedback_begin(frame);assert(!live&&!ui_click_feedback_release(frame,&r));
  // 三种主页模式的底栏共用灰底：按压不能改外沿、文字、横条或相邻图标。
  // All three main modes share a gray footer: presses must preserve its perimeter, labels, marker and neighboring icons.
- static const ui_icon_t tabs[]={UI_ICON_HOUSE,UI_ICON_LIBRARY_BIG,UI_ICON_FOLDER_OPEN,UI_ICON_SLIDERS_HORIZONTAL};
- for(int tab=0;tab<4;++tab)for(int policy=0;policy<3;++policy)for(int edge=0;edge<2;++edge){
+ static const ui_icon_t tabs[]={UI_ICON_HOUSE,UI_ICON_LIBRARY_BIG,UI_ICON_BOOK_OPEN,UI_ICON_FOLDER_OPEN,UI_ICON_SLIDERS_HORIZONTAL};
+ for(int tab=0;tab<5;++tab)for(int policy=0;policy<3;++policy)for(int edge=0;edge<2;++edge){
   fast=policy==1;memset(frame,0xee,BYTES);
-  int cx=(tab*2+1)*684/8;
+  int cx=(tab*684/5+(tab+1)*684/5)/2;
   epd_fill_rect((EpdRect){0,1097,684,5},0,frame);
   epd_fill_rect((EpdRect){0,1170,684,2},0x70,frame);
   ui_draw_icon(frame,cx,1141,44,tabs[tab],0);
@@ -240,12 +242,12 @@ int main(void){
 
  // 原来50px放大姿态立即显示，65ms后复位；不需要切换到另一个页面。
  // The original 50px enlarged pose appears immediately and settles after 65ms without navigation.
- for(int policy=0;policy<3;++policy)for(int tab=0;tab<4;++tab){
+ for(int policy=0;policy<3;++policy)for(int tab=0;tab<5;++tab){
   fast=policy==1;memset(frame,0xee,BYTES);ui_click_feedback_begin(frame);
-  for(int i=0;i<4;++i){int cx=(i*2+1)*684/8;ui_draw_icon(frame,cx,1141,44,tabs[i],0);
+  for(int i=0;i<5;++i){int cx=(i*684/5+(i+1)*684/5)/2;ui_draw_icon(frame,cx,1141,44,tabs[i],0);
    ui_click_feedback_register(frame,(EpdRect){cx-30,1111,60,60},UI_CLICK_NAV,tabs[i]);}
   memcpy(saved,frame,BYTES);int before=allocs;
-  ui_click_feedback_nav_request(tab);assert(allocs==before&&!live&&!memcmp(saved,frame,BYTES));
+  ui_click_feedback_nav_request(app_nav_id(tab));assert(allocs==before&&!live&&!memcmp(saved,frame,BYTES));
   assert(ui_click_feedback_nav_tick(frame,100,&r)&&live==1&&ui_click_feedback_active());
   assert(r.y>=UI_NAV_MARKER_SCAN_END&&r.y+r.height<=1170);
   assert(!ui_click_feedback_nav_tick(frame,164,&r));
@@ -254,11 +256,11 @@ int main(void){
  }
  // 第一段效果没结束就再点同一图标，像素必须产生新变化，不能被相同差分吞掉。
  // A repeated tap before settling must change pixels rather than disappear as an identical differential.
- for(int tab=0;tab<4;++tab){
-  ui_click_feedback_nav_request(tab);assert(ui_click_feedback_nav_tick(frame,0,&r));
+ for(int tab=0;tab<5;++tab){
+  ui_click_feedback_nav_request(app_nav_id(tab));assert(ui_click_feedback_nav_tick(frame,0,&r));
   memcpy(again,frame,BYTES);
   for(int repeat=0;repeat<20;++repeat){
-   ui_click_feedback_nav_request(tab);assert(!live);assert(ui_click_feedback_nav_tick(frame,repeat+1,&r));
+   ui_click_feedback_nav_request(app_nav_id(tab));assert(!live);assert(ui_click_feedback_nav_tick(frame,repeat+1,&r));
    assert(memcmp(again,frame,BYTES));memcpy(again,frame,BYTES);
   }
   assert(ui_click_feedback_nav_tick(frame,200,&r)&&!live&&!memcmp(frame,saved,BYTES));
@@ -275,7 +277,7 @@ int main(void){
  // 加载中底栏还没有完成注册，同样给到即时反馈；不等待下一页。
  // Loading before footer registration still gives immediate feedback without waiting for a new page.
  memset(frame,0xee,BYTES);ui_click_feedback_begin(frame);
- for(int i=0;i<4;++i)ui_draw_icon(frame,(i*2+1)*684/8,1141,44,tabs[i],0);
+ for(int i=0;i<5;++i)ui_draw_icon(frame,(i*684/5+(i+1)*684/5)/2,1141,44,tabs[i],0);
  memcpy(saved,frame,BYTES);
  ui_click_feedback_nav_request(2);assert(ui_click_feedback_nav_tick(frame,0,&r)&&live==1);
  assert(ui_click_feedback_nav_tick(frame,65,&r)&&!live&&!memcmp(frame,saved,BYTES));

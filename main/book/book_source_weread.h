@@ -22,6 +22,12 @@ esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t ind
 size_t book_weread_count(void);
 esp_err_t book_weread_title(size_t index, char *out, size_t cap);
 esp_err_t book_weread_load(size_t index, const char *anchor, size_t *offset, html_text_t *out);
+/// 分页成功才接管已载入的实际UID/版本；失败保留旧正文绑定并丢弃候选。/ Commit actual UID/version only after layout succeeds; failed layout discards the candidate and retains the old body.
+esp_err_t book_weread_commit_loaded(size_t *chapter,uint32_t *version);
+void book_weread_discard_loaded(void);
+bool book_weread_directory_in_use(const char *root);
+/// 当前与候选的精确映射表常驻字节，不包含正文/目录。/ Resident exact-map bytes across the active and candidate slots, excluding body/TOC storage.
+size_t book_weread_map_cache_bytes(void);
 esp_err_t book_weread_image(size_t index, const char *src, uint8_t **data, size_t *len, bool *png);
 uint32_t book_weread_total(void);
 uint32_t book_weread_offset(size_t index);
@@ -30,6 +36,7 @@ uint32_t book_weread_chapter_index(size_t index);
 size_t book_weread_index(uint32_t uid);
 /// 双向映射排版字节与源HTML UTF16坐标；失败时禁止上传猜测值。/ Map typeset bytes/source HTML UTF16 both ways; never upload guessed values after failure.
 esp_err_t book_weread_map(size_t index, bool to_cloud, uint32_t input, uint32_t *output);
+esp_err_t book_weread_map_version(size_t index,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output);
 /// 虚拟身份仅用于恢复/进度，绝不代替本地扫描 stat。/ Virtual identity is for resume/progress, never local file enumeration.
 bool book_weread_stat(const char *uri, struct stat *out);
 

@@ -34,6 +34,8 @@ void wr_display_copy(char *out, size_t cap, const char *text);
 esp_err_t wr_mkdirs(const char *path);
 esp_err_t wr_cache_path(const char *id, const char *leaf, char *out, size_t cap);
 esp_err_t wr_read_json(const char *path, cJSON **out);
+/// 仅读取指定主文件，让按账号恢复的调用方自行判定副本归属。/ Read only the named primary so account-aware recovery can validate backup ownership.
+esp_err_t wr_read_json_primary(const char *path, cJSON **out);
 esp_err_t wr_write_json(const char *path, const cJSON *json);
 esp_err_t wr_write_bytes(const char *path, const void *data, size_t len);
 esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out);

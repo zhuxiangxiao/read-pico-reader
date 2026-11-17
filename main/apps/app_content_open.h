@@ -56,6 +56,8 @@ void app_home_cover_mode_changed(void);
 void app_home_release_clock_cache(void);
 
 #include "app.h"
+/// 微信书籍保存失败时保留当前阅读，不静默退出或休眠。/ Retain a WeRead session when local persistence fails.
+bool app_book_prepare_leave(app_ctx_t *ctx);
 /// 书架外的主界面空闲时只预热第一页；导航和前台任务可直接取消。
 /// Warm only the first shelf page while another root is idle; navigation and foreground work can cancel.
 void app_book_shelf_prefetch_first(app_ctx_t *ctx);

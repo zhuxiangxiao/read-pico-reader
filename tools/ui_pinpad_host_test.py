@@ -63,6 +63,7 @@ void ui_fill_rect_fast(EpdRect r,uint8_t gray,uint8_t *fb){epd_fill_rect(r,gray,
 '''
  for n in ('_rotate','epd_draw_pixel','epd_get_pixel','epd_draw_hline','epd_draw_vline','epd_fill_rect','epd_draw_circle','epd_fill_circle_helper','epd_fill_circle'):
   unit+=function(n,ROOT/'components/epdiy/src/epdiy.c')+'\n'
+ unit += '#include "'+str(ROOT/'main/ui/ui_icon_unpack.inc')+'"\n'
  for n in ('ui_read_pixel','icon_nibble','ui_draw_icon','clamp_radius','draw_arc','ui_draw_round_rect'):unit+=function(n,ROOT/'main/ui/ui_kit.c')+'\n'
  unit+=r'''
 int ui_font_title_px(int n,const char *v){(void)v;return n;}

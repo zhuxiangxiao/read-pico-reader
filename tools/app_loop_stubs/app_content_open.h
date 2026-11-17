@@ -32,3 +32,5 @@ static inline bool app_book_status_bar_visible(void){return true;}
 void app_book_shelf_prefetch_cancel(void);
 void app_book_shelf_prefetch_reset(void);
 void app_book_shelf_prefetch_first(app_ctx_t *ctx);
+
+bool app_book_prepare_leave(app_ctx_t *ctx);

@@ -46,6 +46,8 @@ static void unlock_draw(void){assert(locked);locked=false;}
 static void invalidate_prep(void){++invalidations;}
 static void release_page_images(void){assert(!locked);++releases;}
 static void prepare_inline_image(void){assert(!locked&&s_page<book_layout_page_count());++images;}
+static void wr_reader_move(void){}
+static void book_ticket_format_time(char *out,size_t cap,int64_t ms){snprintf(out,cap,"%lld min",(long long)(ms/60000));}
 static void save_progress(void){assert(!locked);++saves;}
 static void flush_ticket_stats(void){++flushes;}
 static bool book_ticket_recent_days(int *days){(void)days;return true;}

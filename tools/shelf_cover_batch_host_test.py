@@ -112,6 +112,8 @@ static void draw_shelf_cover(uint8_t *fb,EpdRect rect,int row,const char *name,b
  (void)fb;(void)rect;(void)name;(void)favorite;slots_drawn|=1u<<row;
  if(shelf_cover_frame_ready()&&(s_covers[row].gray||s_covers[row].fast_bits))art_drawn|=1u<<row;
 }
+static __attribute__((unused)) void ui_shelf_begin(void){}
+static void ui_shelf_progress(uint8_t *fb,EpdRect r,int style,int percent){(void)fb;(void)r;(void)style;(void)percent;}
 static void draw_shelf_furniture(uint8_t *fb){(void)fb;}
 static void draw_shelf_cover_favorite(uint8_t *fb,int row,EpdRect rect,bool favorite){
  (void)fb;(void)row;(void)rect;(void)favorite;

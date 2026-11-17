@@ -6,9 +6,9 @@
 set -euo pipefail
 mkdir -p build/book-tests
 python3 tools/gen_book_fixtures.py
-flags=(-std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain)
+flags=(-std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -Werror -g -fsanitize=address,undefined -fno-omit-frame-pointer -Imain/book -Imain/weread -Imain)
 if [[ "$(uname -s)" == Darwin ]]; then link_gc=(-Wl,-dead_strip); else link_gc=(-Wl,--gc-sections); fi
-gcc "${flags[@]}" -Itools/book_epub_stubs -Itools/zip_host_stubs tools/book_source_host_test.c main/book/book_source.c main/book/book_index_cache.c main/book/book_txt.c main/book/gbk.c main/book/book_epub.c main/book/book_image_header.c main/book/zip_reader.c main/book/html_text.c -lz -o build/book-tests/source
+gcc "${flags[@]}" -Itools/book_epub_stubs -Itools/zip_host_stubs tools/book_source_host_test.c tools/book_source_weread_stub.c main/book/book_source.c main/book/book_index_cache.c main/book/book_txt.c main/book/gbk.c main/book/book_epub.c main/book/book_image_header.c main/book/zip_reader.c main/book/html_text.c -lz -o build/book-tests/source
 gcc "${flags[@]}" -Itools/book_layout_stubs -Itools/book_source_host_stubs tools/book_layout_host_test.c main/book/book_layout.c main/book/html_text.c -o build/book-tests/layout
 gcc "${flags[@]}" -Itools/book_storage_stubs tools/book_storage_host_test.c main/book/book_progress.c -o build/book-tests/progress
 gcc "${flags[@]}" -Imain -Itools/book_storage_stubs -Icomponents/read_pico/include tools/book_store_host_test.c main/book/book_added.c -o build/book-tests/store

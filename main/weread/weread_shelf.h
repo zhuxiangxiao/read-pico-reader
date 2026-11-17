@@ -24,7 +24,8 @@ typedef struct {
 /// 同步成功并落盘后才替换内存；失败保留离线书架。/ Publish only after persistence; retain offline data on errors.
 esp_err_t weread_shelf_sync(bool full);
 esp_err_t weread_shelf_refresh_book(const char *id);
-/// 首次六本上屏，后续每次最多二十本；未完成时不前移synckey。/ Publish the first six, then at most twenty per step; retain synckey until completion.
+/// 首次六本上屏，后续最多二十本；原生游标与持久待补详情队列同事务推进。
+/// Publish the first six, then at most twenty; commit the native cursor together with its durable unresolved-detail queue.
 esp_err_t weread_shelf_sync_step(bool restart);
 void weread_shelf_sync_discard(void);
 bool weread_shelf_sync_pending(void);

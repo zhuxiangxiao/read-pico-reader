@@ -60,17 +60,18 @@ static esp_err_t transport(const char *url, const char *method, const char *head
             assert(strstr(url, "synckey=100&onlyBookid=1"));
             *out = reply("{\"synckey\":101,\"bookIds\":[\"C\"],\"bookProgress\":[{\"bookId\":\"C\",\"progress\":46,\"updateTime\":999}],\"removed\":[{\"bookId\":\"B\"}]}");
         } else if (mode == 8 || mode == 9 || mode == 11) {
-            assert(strstr(url, mode==9?"synckey=201&":"synckey=200&"));
+            assert(strstr(url, mode==9||mode==11?"synckey=201&":"synckey=200&"));
             *out=reply(mode==9?"{\"synckey\":202,\"bookIds\":[\"book_02\"]}":
                 "{\"synckey\":201,\"bookIds\":[\"book_02\",\"book_03\"]}");
         } else if (mode == 2 || mode == 3 || mode==7 || mode==10) {
             cJSON *r = cJSON_CreateObject(), *ids = cJSON_AddArrayToObject(r, "bookIds");
-            if(mode==10)assert(strstr(url,"synckey=0&")&&strstr(url,"lectureSynckey=0"));
+            if(mode==10)assert(strstr(url,"synckey=200&"));
             for (int i = 0; i < 45; ++i) {
                 if(mode==10&&i==2)continue;
                 char id[32]; snprintf(id, sizeof(id), "book_%02d", i);
                 cJSON_AddItemToArray(ids, cJSON_CreateString(id));
             }
+            if(mode==10){cJSON *removed=cJSON_AddArrayToObject(r,"removed");cJSON_AddItemToArray(removed,cJSON_CreateString("book_02"));}
             cJSON_AddNumberToObject(r, "synckey", mode==10?202:200);
             *out = cJSON_PrintUnformatted(r); cJSON_Delete(r);
         } else if (mode == 4) *out = reply("{\"synckey\":300,\"bookIds\":[\"../../escape\"]}");
@@ -127,12 +128,12 @@ int main(void) {
     assert(batches == 3 && weread_shelf_count() == 45);
     weread_shelf_clear();batches=0;
     assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6&&last_batch==6&&weread_shelf_sync_pending());
-    assert(weread_shelf_synckey()==0);
+    assert(weread_shelf_synckey()==200);
     assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)));
     mode=3;assert(weread_shelf_sync_step(false)==ESP_ERR_TIMEOUT&&weread_shelf_count()==6);
     assert(!weread_shelf_sync_pending()&&weread_shelf_load()==ESP_OK&&weread_shelf_count()==6);
-    // key0重进使用当前完整ID集合，不保留中断后被手机删除的首批书。/ Restart key0 from current IDs, dropping a first-batch book removed on the phone after interruption.
-    mode=10;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6);
+    // 中断后从已持久化原生游标取成员删除增量，保留成功详情。/ A restart applies native removal deltas and retains successful metadata.
+    mode=10;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()>=6);
     assert(!weread_shelf_find("book_02",&book));
     while(weread_shelf_sync_pending())assert(weread_shelf_sync_step(false)==ESP_OK);
     assert(weread_shelf_count()==44&&weread_shelf_synckey()==202);
@@ -141,15 +142,15 @@ int main(void) {
     mode=2;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6);
     assert(weread_shelf_sync_step(false)==ESP_OK&&weread_shelf_count()==26&&last_batch==20);
     assert(weread_shelf_sync_step(false)==ESP_OK&&weread_shelf_count()==45&&!weread_shelf_sync_pending()&&weread_shelf_synckey()==200);
-    // 已有书详情遗漏也须重试其版本变更；原子接口回滚，渐进接口保留旧书但不前移key。
-    // Retry a changed existing book omitted by details: atomic sync rolls back, staged sync retains the book without advancing the key.
+    // 已有书详情遗漏也须重试其版本变更；原子接口回滚，渐进接口持久待补队列和原生游标。
+    // Atomic sync rolls back; staged sync commits the cursor together with the unresolved detail queue.
     mode=8;assert(weread_shelf_sync(false)==ESP_ERR_INVALID_RESPONSE&&weread_shelf_synckey()==200);
     assert(weread_shelf_find("book_03",&book)&&book.book_version==12);
-    assert(weread_shelf_sync_step(true)==ESP_OK&&!weread_shelf_sync_pending()&&weread_shelf_synckey()==200);
+    assert(weread_shelf_sync_step(true)==ESP_OK&&!weread_shelf_sync_pending()&&weread_shelf_synckey()==201);
     size_t done,total,skipped;weread_shelf_sync_progress(&done,&total,&skipped);
     assert(done==2&&total==2&&skipped==1&&weread_shelf_find("book_02",&book)&&book.book_version==12);
     assert(weread_shelf_find("book_03",&book)&&book.book_version==13);
-    weread_shelf_clear();assert(weread_shelf_load()==ESP_OK&&weread_shelf_synckey()==200);
+    weread_shelf_clear();assert(weread_shelf_load()==ESP_OK&&weread_shelf_synckey()==201);
     mode=11;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_synckey()==201);
     assert(weread_shelf_find("book_02",&book)&&book.book_version==13);
     // 明确返回audio不是遗漏，可移除旧书并提交游标。/ An explicit audio result is not omitted: remove the old book and commit the cursor.
@@ -161,7 +162,7 @@ int main(void) {
     weread_shelf_clear();assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==5);
     while(weread_shelf_sync_pending())assert(weread_shelf_sync_step(false)==ESP_OK);
     weread_shelf_sync_progress(&done,&total,&skipped);
-    assert(weread_shelf_count()==44&&done==45&&total==45&&skipped==1&&weread_shelf_synckey()==0);
+    assert(weread_shelf_count()==44&&done==45&&total==45&&skipped==1&&weread_shelf_synckey()==200);
     assert(weread_shelf_cache_fresh((uint64_t)time(NULL)));
     assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)+301));
     mode=2;assert(weread_shelf_sync(true)==ESP_OK&&weread_shelf_count()==45);

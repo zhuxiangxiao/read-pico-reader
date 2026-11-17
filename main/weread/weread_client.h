@@ -37,6 +37,7 @@ typedef bool (*weread_cancel_fn)(void *ctx);
 /// 在服务空闲时安装长期有效的取消查询；回调不得获取服务锁。/ Install a lifetime-stable cancellation query while idle; it must not acquire the service lock.
 void weread_client_set_cancel(weread_cancel_fn fn, void *ctx);
 bool weread_client_cancelled(void);
+/// 非阻塞中断自有socket；调用方先设置取消查询，正在清理时不等待句柄锁。/ Abort the owned socket without blocking; set cancellation first and do not wait on cleanup.
 void weread_client_abort_active(void);
 /// 仅最近一次受信任登录响应的指定Cookie，下一次请求即擦除。/ Selected cookies from the last trusted login response; erased at the next request.
 void weread_client_forget_login_cookies(void);
@@ -46,6 +47,11 @@ void weread_client_set_network(weread_network_fn fn, void *ctx);
 /// 返回0沿用请求默认等待；正数缩短截止时间，扫码长轮询仍可即时取消。/ Zero retains the request default; positive values cap its deadline. QR long polls remain cancellable.
 typedef int (*weread_timeout_fn)(void *ctx);
 void weread_client_set_timeout_budget(weread_timeout_fn fn, void *ctx);
+/// 低优先级任务遇401保留凭据，不自动续期或清登录；不选择传输方式。
+/// Background jobs retain credentials on401 without renewal/logout; transport selection is independent.
+void weread_client_set_background(bool enabled);
+/// 仅选择WeRead可取消传输，不改变前台续期/撤销策略。/ Select cancellable WeRead transport without changing foreground renewal.
+void weread_client_set_polling(bool enabled);
 typedef struct {
     int status;
     size_t bytes;
@@ -127,6 +133,18 @@ esp_err_t weread_client_request(
     size_t *out_len,
     int *out_status
 );
+
+/// 后台补报使用独立凭据快照，传输不持服务锁；过时会话拒收，401不续期或清登录。
+/// Background reports own their credentials and release the service lock during transport; stale sessions are rejected and401 never renews or clears login.
+esp_err_t weread_client_request_snapshot(const char *url, const char *method,
+    const char *custom_headers, const char *body, char **out_resp, size_t *out_len, int *out_status);
+typedef struct {
+    char root[256],vid[WEREAD_VID_MAX_LEN],token[WEREAD_TOKEN_MAX_LEN],refresh[WEREAD_TOKEN_MAX_LEN],device[WEREAD_DEVICE_ID_MAX_LEN];
+} weread_client_identity_t;
+/// 跨多个请求绑定同一身份；捕获与请求构造均在短服务锁内完成。/ Bind multiple requests to one identity using short locked capture/construction.
+bool weread_client_identity_get(weread_client_identity_t *out);
+esp_err_t weread_client_request_bound(const char *url,const char *method,const char *custom_headers,
+    const char *body,char **out_resp,size_t *out_len,int *out_status,const weread_client_identity_t *expected);
 
 #ifdef __cplusplus
 }

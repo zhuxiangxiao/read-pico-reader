@@ -39,6 +39,10 @@ static void control(const char *body) {
     char *resp=NULL;size_t len;int status;
     assert(weread_client_request(url,"POST","Content-Type: application/json\r\n",body,&resp,&len,&status)==ESP_OK&&status==200);free(resp);
 }
+static uint32_t commit_chapter(size_t expected){
+    size_t chapter=expected;uint32_t version=UINT32_MAX;
+    assert(book_weread_commit_loaded(&chapter,&version)==ESP_OK&&chapter==expected);return version;
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     assert(!setenv("WEREAD_STORAGE_ROOT",argv[1],1));
@@ -62,6 +66,7 @@ int main(int argc, char **argv) {
     assert(book_weread_load(0,NULL,NULL,&text)==ESP_ERR_NOT_FOUND);
     assert(weread_chapter_download("test_book_101",1)==ESP_OK);
     assert(book_weread_load(0, NULL, NULL, &text) == ESP_OK);
+    assert(commit_chapter(0)==100);
     assert(text.len && text.count && strstr(text.utf8, "微风吹过荒原") && strstr(text.utf8, "探索者踏上了新的征程"));
     html_text_free(&text);
     weread_progress_t local, cloud; bool conflict;
@@ -71,6 +76,7 @@ int main(int argc, char **argv) {
     assert(weread_progress_load("test_book_101", &local) == ESP_OK && !local.dirty);
     weread_client_set_download_transport(offline, NULL);
     assert(book_weread_load(0, NULL, NULL, &text) == ESP_OK && !offline_downloads);
+    assert(commit_chapter(0)==100);
     html_text_free(&text); book_weread_close(); weread_shelf_clear();
     weread_client_set_download_transport(NULL,NULL);
     assert(weread_shelf_load() == ESP_OK && weread_shelf_count() == 2);
@@ -111,6 +117,7 @@ int main(int argc, char **argv) {
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==0);
     weread_reader_begin("weread://test_book_101",1000);
     assert(book_weread_load(0,NULL,NULL,&text)==ESP_OK);
+    assert(commit_chapter(0)==100);
     offset=(uint32_t)(strstr(text.utf8,"微风")-text.utf8);
     weread_reader_navigated("weread://test_book_101",0,offset,17,text.utf8+offset);
     control("{\"endpoint_errors\":{\"/book/read\":{\"status\":503}}}");
@@ -122,10 +129,16 @@ int main(int argc, char **argv) {
     control("{\"endpoint_errors\":{\"/book/read\":{\"status\":503,\"delay\":2.5}}}");
     uint64_t handoff_started=milliseconds();
     weread_reader_flush(2200,true);
-    assert(milliseconds()-handoff_started<2600);
+    assert(milliseconds()-handoff_started<100);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.chapter_offset==207&&local.reading_time>=1);
+    // Explicitly exercise the failed network job after the local-only handoff.
+    assert(weread_runtime_start(WR_JOB_NOTE,"test_book_101",NULL));usleep(150000);
+    handoff_started=milliseconds();weread_reader_flush(2300,true);
+    assert(milliseconds()-handoff_started<1000);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.chapter_offset==207);
     control("{\"endpoint_errors\":{}}");
-    weread_reader_flush(2400,true);
+    assert(weread_runtime_start(WR_JOB_NOTE,"test_book_101",NULL));result=completion();
+    assert(result.error==ESP_OK);weread_runtime_result_free(&result);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty);
     weread_reader_tick("weread://test_book_101",0,offset,17,text.utf8+offset,3500,true);
     result=completion();assert(result.job==WR_JOB_PREFETCH&&result.error==ESP_OK);weread_runtime_result_free(&result);
@@ -133,7 +146,7 @@ int main(int argc, char **argv) {
     html_text_t next={0};unsigned old_downloads=offline_downloads;
     assert(weread_reader_prepare("weread://test_book_101",1)==ESP_OK);
     assert(book_weread_load(1,NULL,NULL,&next)==ESP_OK&&strstr(next.utf8,"预读成功")&&offline_downloads==old_downloads);
-    html_text_free(&next);weread_client_set_download_transport(NULL,NULL);
+    html_text_free(&next);book_weread_discard_loaded();weread_client_set_download_transport(NULL,NULL);
     // 阅读中-2063自愈换版本，NVS仍是旧身份；冷恢复必须使用TF的UID/UTF16位置。
     // A mid-read version retry changes the NVS identity; cold resume must use the TF UID/UTF16 record.
     struct stat old_identity,new_identity;assert(book_weread_stat("weread://test_book_101",&old_identity));
@@ -142,8 +155,9 @@ int main(int argc, char **argv) {
     control("{\"book_version\":101,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":101},{\"bookId\":\"txt_book_202\",\"bookVersion\":100}]}");
     assert(weread_reader_prepare("weread://test_book_101",1)==ESP_OK);
     assert(book_weread_load(1,NULL,NULL,&next)==ESP_OK);
+    uint32_t next_version=commit_chapter(1);assert(next_version==101);
     uint32_t next_offset=(uint32_t)(strstr(next.utf8,"预读成功")-next.utf8);
-    weread_reader_navigated("weread://test_book_101",1,next_offset,86,next.utf8+next_offset);
+    weread_reader_navigated_version("weread://test_book_101",1,next_offset,86,next.utf8+next_offset,next_version);
     weread_reader_tick("weread://test_book_101",1,next_offset,86,next.utf8+next_offset,3800,false);
     weread_reader_flush(3800,true);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.chapter_uid==2&&local.book_version==101);
@@ -176,35 +190,64 @@ int main(int argc, char **argv) {
     assert(book_weread_open("weread://test_book_101")==ESP_OK);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
-    // 同章文字输入不等待上报；上报的旧快照不能覆盖其间的新导航。
-    // Local text input does not wait for a note; its old snapshot must not overwrite a newer move.
+    // Measure latency under an explicit stable edition; the unknown-version resume above remains a separate guard.
+    book_weread_close();
+    control("{\"book_version\":101,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":101},{\"bookId\":\"txt_book_202\",\"bookVersion\":1}],\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50}}}");
+    assert(weread_shelf_refresh_book("test_book_101")==ESP_OK);
+    assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(book_weread_open("weread://test_book_101")==ESP_OK);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
+    // Local persistence precedes HTTP; cached chapter reads and newer navigation do not wait for a delayed ACK.
     html_text_t stress={0};assert(book_weread_load(1,NULL,NULL,&stress)==ESP_OK);
+    assert(commit_chapter(1)==101);
     const char *word=strstr(stress.utf8,"预读成功");assert(word);
     uint32_t stress_offset=(uint32_t)(word-stress.utf8),expected_raw=0;
-    assert(book_weread_map(1,true,stress_offset+6,&expected_raw)==ESP_OK);
+    assert(book_weread_map(1,true,stress_offset+9,&expected_raw)==ESP_OK);
+    assert(weread_reader_prepare("weread://test_book_101",0)==ESP_OK);
     weread_reader_begin("weread://test_book_101",5000);
-    control("{\"latency\":1.0}");
     for(unsigned i=0;i<10;++i){uint32_t target=stress_offset+(i%2)*3;
         weread_reader_navigated("weread://test_book_101",1,target,83,stress.utf8+target);
         weread_reader_tick("weread://test_book_101",1,target,83,stress.utf8+target,5000,false);
     }
+    uint64_t saved_at=milliseconds();
     weread_reader_tick("weread://test_book_101",1,stress_offset+3,83,stress.utf8+stress_offset+3,6000,true);
+    assert(milliseconds()-saved_at<100&&!weread_runtime_busy());
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.position_pending);
+    control("{\"endpoint_errors\":{\"/book/read\":{\"status\":200,\"delay\":1.0,\"body\":{\"succ\":1}}}}");
+    weread_reader_tick("weread://test_book_101",1,stress_offset+3,83,stress.utf8+stress_offset+3,6200,true);
     usleep(150000);assert(weread_runtime_busy());uint64_t input_at=milliseconds();
     weread_reader_input(true);assert(milliseconds()-input_at<100&&weread_runtime_busy());
+    saved_at=milliseconds();assert(weread_reader_prepare("weread://test_book_101",0)==ESP_OK);
+    html_text_t cached_cross={0};assert(book_weread_load(0,NULL,NULL,&cached_cross)==ESP_OK);
+    assert(milliseconds()-saved_at<100&&weread_runtime_busy());html_text_free(&cached_cross);book_weread_discard_loaded();
     weread_reader_navigated("weread://test_book_101",1,stress_offset+6,84,stress.utf8+stress_offset+6);
-    weread_reader_tick("weread://test_book_101",1,stress_offset+6,84,stress.utf8+stress_offset+6,6001,false);
-    assert(milliseconds()-input_at<100&&weread_runtime_busy());
-    result=completion();assert(result.job==WR_JOB_NOTE&&result.error==ESP_OK);weread_runtime_result_free(&result);
-    control("{\"latency\":0}");weread_reader_flush(6100,true);
-    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty&&local.chapter_offset==expected_raw&&local.progress==84);
-    html_text_free(&stress);weread_reader_end(6100);
-    puts("PASS: local text input remains below100ms during delayed production HTTP reporting; newer navigation survives completion and flush");
+    weread_reader_tick("weread://test_book_101",1,stress_offset+6,84,stress.utf8+stress_offset+6,6201,false);
+    saved_at=milliseconds();assert(weread_reader_save(6201)==ESP_OK&&milliseconds()-saved_at<100&&weread_runtime_busy());
+    result=completion();assert(result.job==WR_JOB_NOTE&&result.error==ESP_OK&&result.local.dirty);weread_runtime_result_free(&result);
+    assert(weread_reader_state()==WR_PROGRESS_PENDING);
+    // Complete another ACK, then save newer navigation before polling that old clean result.
+    assert(weread_runtime_start(WR_JOB_NOTE,"test_book_101",NULL));
+    saved_at=milliseconds();while(weread_runtime_busy()){assert(milliseconds()-saved_at<5000);usleep(1000);}
+    weread_reader_navigated("weread://test_book_101",1,stress_offset+9,85,stress.utf8+stress_offset+9);
+    assert(weread_reader_save(6202)==ESP_OK&&weread_reader_state()==WR_PROGRESS_PENDING);
+    assert(weread_runtime_poll(&result)&&result.error==ESP_OK&&!result.local.dirty);weread_runtime_result_free(&result);
+    assert(weread_reader_state()==WR_PROGRESS_PENDING);
+    control("{\"endpoint_errors\":{}}");weread_reader_flush(6300,true);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.chapter_offset==expected_raw&&local.progress==85);
+    html_text_free(&stress);weread_reader_end(6300);book_weread_close();
+    // The durable queue drains after leaving the book, without reopening it.
+    assert(weread_runtime_idle(7000));result=completion();
+    assert(result.job==WR_JOB_REPORT&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty&&local.chapter_offset==expected_raw&&local.progress==85);
+    puts("PASS: local persistence, cached chapter preparation and text input remain below100ms during delayed HTTP; ACK preserves newer revisions; closed-book idle drains the durable outbox");
     // shutdown中断阻塞响应；取消后可重新创建任务。/ Shutdown interrupts blocked responses and permits worker restart.
     control("{\"latency\":1.5}");
     assert(weread_runtime_start(WR_JOB_SYNC,NULL,NULL));usleep(150000);
     uint64_t cancelled_at=milliseconds();weread_reader_input(true);
-    assert(milliseconds()-cancelled_at<1000);
+    assert(milliseconds()-cancelled_at<100);
     result=completion();assert(result.error!=ESP_OK);weread_runtime_result_free(&result);
+    weread_runtime_cancel_join(); // Acknowledge the asynchronous cancellation before the direct test-control request.
     control("{\"latency\":0}");
     html_text_free(&text);weread_reader_end(4000);book_weread_close();
     weread_runtime_media_lost();assert(!weread_shelf_count());
@@ -216,7 +259,15 @@ int main(int argc, char **argv) {
     assert(!setenv("WEREAD_STORAGE_ROOT",argv[1],1));
     assert(weread_runtime_start(WR_JOB_INIT,NULL,NULL));result=completion();assert(result.authenticated&&result.count==2);weread_runtime_result_free(&result);
     assert(weread_runtime_start(WR_JOB_CLEAR,"txt_book_202",NULL));result=completion();assert(result.error==ESP_OK);weread_runtime_result_free(&result);
+    // Switching owners archives pending positions; ordinary content cleanup retains all account progress files.
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK);
+    assert(weread_progress_note("test_book_101",local.chapter_uid,local.chapter_index,local.chapter_offset,local.progress,1,1,"retained account",1700000300)==ESP_OK);
+    account=*weread_auth_get_current_session();other=account;strcpy(other.vid,"999");
+    assert(weread_auth_save_session(&other)==ESP_OK&&weread_auth_load_session(&other)==ESP_OK);
+    assert(weread_progress_select("test_book_101",&local,true)==ESP_OK);
     assert(weread_runtime_start(WR_JOB_CLEAR,"test_book_101",NULL));result=completion();assert(result.error==ESP_OK);weread_runtime_result_free(&result);
+    assert(weread_auth_save_session(&account)==ESP_OK&&weread_auth_load_session(&account)==ESP_OK);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.position_pending);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK);
     assert(weread_runtime_start(WR_JOB_LOGOUT,NULL,NULL));result=completion();assert(result.error==ESP_OK&&!result.authenticated&&!result.count);weread_runtime_result_free(&result);
     // 65秒扫码等待也必须被退页/锁屏立即打断。/ Exit/lock must also interrupt the65s QR wait immediately.

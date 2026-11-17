@@ -30,6 +30,11 @@
 #define lstat stat
 #endif
 #include <unistd.h>
+#if defined(ESP_PLATFORM)
+#include "esp_vfs_fat.h"
+#else
+#include <sys/statvfs.h>
+#endif
 
 #define CHAPTER_LIMIT (4u * 1024u * 1024u)
 #define ARCHIVE_LIMIT (32u * 1024u * 1024u)
@@ -71,6 +76,7 @@ static esp_err_t join(const char *dir, const char *leaf, char *out, size_t cap) 
     return n >= 0 && (size_t)n < cap ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
 static void remove_tree(const char *path, unsigned depth) {
+    if(book_weread_directory_in_use(path))return;
     if (depth > 32) return;
     struct stat st;
     if (lstat(path, &st)) return;
@@ -116,6 +122,17 @@ static esp_err_t directory(const char *id, uint32_t uid, bool res, char *out, si
 }
 esp_err_t weread_chapter_directory(const char *id, uint32_t uid, char *out, size_t cap) { WR_GUARD; return directory(id, uid, false, out, cap); }
 esp_err_t weread_chapter_resource_directory(const char *id, char *out, size_t cap) { WR_GUARD; return directory(id, 0, true, out, cap); }
+esp_err_t weread_chapter_snapshot(const char *id,uint32_t uid,char *root,size_t cap,char *resources,size_t resources_cap,uint32_t *v){WR_GUARD;
+    if(!root||!cap||!resources||!resources_cap||!v)return ESP_ERR_INVALID_ARG;
+    cJSON *m=NULL;esp_err_t err=manifest(id,uid,false,&m);
+    if(err==ESP_OK)err=wr_cache_path(id,wr_string(m,"root"),root,cap);
+    struct stat st;
+    if(err==ESP_OK&&(stat(root,&st)||!S_ISDIR(st.st_mode)))err=ESP_ERR_NOT_FOUND;
+    if(err==ESP_OK)*v=(uint32_t)number(m,"bookVersion");
+    cJSON_Delete(m);resources[0]=0;
+    if(err==ESP_OK){esp_err_t res=directory(id,0,true,resources,resources_cap);if(res!=ESP_OK)resources[0]=0;if(res!=ESP_OK&&res!=ESP_ERR_NOT_FOUND)err=res;}
+    return err;
+}
 static esp_err_t read_file(const char *path, char **out, size_t *len) {
     *out = NULL; *len = 0;
     FILE *f = fopen(path, "rb"); if (!f) return ESP_ERR_NOT_FOUND;
@@ -236,6 +253,95 @@ static bool append_html(FILE *f, const char *data, size_t len, const char *sourc
     }
     return append_source(f, data + start, len - start, total, map);
 }
+// 只识别短小且明确为空的body，复杂/过长内容交回普通解析，不分配第二份正文。/ Recognize only small unambiguously empty bodies, leaving complex/long content to normal parsing without another text allocation.
+static bool empty_background_body(const char *p,const char *end){
+    if(!p||p>end)return false;
+    if(end-p>4096)return false;
+    bool closed=false;
+    while(p<end){
+        if(isspace((unsigned char)*p)){++p;continue;}
+        if(end-p>=4&&!memcmp(p,"<!--",4)){
+            p+=4;while(end-p>=3&&memcmp(p,"-->",3))++p;
+            if(end-p<3)return false;
+            p+=3;continue;
+        }
+        if(*p++!='<')return false;
+        bool close=p<end&&*p=='/';if(close)++p;
+        const char *name=p;while(p<end&&isalpha((unsigned char)*p))++p;
+        size_t n=(size_t)(p-name);
+        bool body=n==4&&!strncasecmp(name,"body",4),html=n==4&&!strncasecmp(name,"html",4);
+        bool wrapper=(n==1&&!strncasecmp(name,"p",1))||(n==3&&!strncasecmp(name,"div",3))||
+            (n==4&&!strncasecmp(name,"span",4))||(n==2&&!strncasecmp(name,"br",2));
+        if(closed?!(close&&html):!(wrapper||(close&&body)))return false;
+        while(p<end&&isspace((unsigned char)*p))++p;
+        if(!close&&p<end&&*p=='/')++p;
+        if(p==end||*p++!='>')return false;
+        if(close&&body)closed=true;
+    }
+    return closed;
+}
+// 仅补微信归档的空白背景图页，不改通用HTML/CSS或把装饰背景变成正文。/ Promote empty WeRead body backgrounds only, leaving generic HTML/CSS and decorative text backgrounds alone.
+static esp_err_t background_image(const char *data,size_t len,const char *source,char out[512]){
+    out[0]=0;const char *p=data,*end=data+(len>16384?16384:len),*style=NULL,*style_end=NULL,*body=NULL;
+    while(p<end){
+        if(*p++!='<')continue;
+        if(end-p>=3&&!memcmp(p,"!--",3)){
+            const char *close=p+3;
+            while(end-close>=3&&memcmp(close,"-->",3))++close;
+            if(end-close<3)return ESP_OK;
+            p=close+3;continue;
+        }
+        const char *tag=p;char quote=0;
+        while(p<end){char c=*p++;if(quote){if(c==quote)quote=0;}else if(c=='\''||c=='"')quote=c;else if(c=='>')break;}
+        const char *tag_end=p;
+        const char *skip=NULL;
+        if(tag_end-tag>=5&&!strncasecmp(tag,"head",4)&&(isspace((unsigned char)tag[4])||tag[4]=='>'))skip="</head";
+        else if(tag_end-tag>=7&&!strncasecmp(tag,"script",6)&&(isspace((unsigned char)tag[6])||tag[6]=='>'))skip="</script";
+        else if(tag_end-tag>=6&&!strncasecmp(tag,"style",5)&&(isspace((unsigned char)tag[5])||tag[5]=='>'))skip="</style";
+        if(skip){size_t n=strlen(skip);while(end-p>=(ptrdiff_t)n&&strncasecmp(p,skip,n))++p;if(end-p<(ptrdiff_t)n)return ESP_OK;continue;}
+        if(tag_end-tag<5||strncasecmp(tag,"body",4)||(!isspace((unsigned char)tag[4])&&tag[4]!='>'))continue;
+        body=tag_end;
+        for(const char *a=tag+4;a<tag_end;){
+            while(a<tag_end&&isspace((unsigned char)*a))++a;
+            const char *key=a;while(a<tag_end&&!isspace((unsigned char)*a)&&*a!='='&&*a!='>')++a;
+            size_t key_len=(size_t)(a-key);while(a<tag_end&&isspace((unsigned char)*a))++a;
+            if(a==tag_end||*a!='='){if(a<tag_end)++a;continue;}++a;
+            while(a<tag_end&&isspace((unsigned char)*a))++a;
+            char q=a<tag_end&&(*a=='\''||*a=='"')?*a++:0;const char *value=a;
+            while(a<tag_end&&(q?*a!=q:!isspace((unsigned char)*a)&&*a!='>'))++a;
+            if(key_len==5&&!strncasecmp(key,"style",5)){style=value;style_end=a;break;}
+            if(q&&a<tag_end)++a;
+        }
+        break;
+    }
+    if(!style||!empty_background_body(body,data+len))return ESP_OK;
+    for(p=style;p<style_end;){
+        while(p<style_end&&(isspace((unsigned char)*p)||*p==';'))++p;
+        const char *key=p;while(p<style_end&&*p!=':'&&*p!=';')++p;
+        const char *key_end=p;while(key_end>key&&isspace((unsigned char)key_end[-1]))--key_end;
+        if(p==style_end||*p!=':')break;
+        ++p;
+        const char *value=p;while(p<style_end&&*p!=';')++p;
+        size_t n=(size_t)(key_end-key);
+        if(!((n==10&&!strncasecmp(key,"background",10))||(n==16&&!strncasecmp(key,"background-image",16))))continue;
+        while(value<p&&isspace((unsigned char)*value))++value;
+        if(p-value<5||strncasecmp(value,"url(",4))continue;
+        value+=4;
+        while(value<p&&isspace((unsigned char)*value))++value;
+        char q=value<p&&(*value=='\''||*value=='"')?*value++:0;const char *last=value;
+        while(last<p&&(q?*last!=q:*last!=')'))++last;
+        if(last==p)continue;
+        const char *close=last+(q?1:0);while(close<p&&isspace((unsigned char)*close))++close;
+        if(close==p||*close!=')')continue;
+        while(last>value&&isspace((unsigned char)last[-1]))--last;
+        size_t length=(size_t)(last-value);if(!length||length>=512)continue;
+        char raw[512];memcpy(raw,value,length);raw[length]=0;
+        bool safe=true;for(size_t i=0;i<length;++i)if((unsigned char)raw[i]<32||strchr("\"'<>&",raw[i]))safe=false;
+        if(!safe||!weread_resource_path(source,raw,out,512)){out[0]=0;continue;}
+        return ESP_OK;
+    }
+    return ESP_OK;
+}
 static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32_t version, const char *format) {
     char path[1024]; if (join(root, "info.txt", path, sizeof(path)) != ESP_OK) return ESP_ERR_INVALID_SIZE;
     cJSON *info = NULL; esp_err_t err = wr_read_json(path, &info);
@@ -271,7 +377,12 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
                 free(data); data = (char *)plain; len = plain_len;
             }
         }
-        if (!strcmp(format, "txt") ? !append_source(f, data, len, &total, &map) : !append_html(f, data, len, normalized, files, &total, &map)) err = ESP_ERR_INVALID_SIZE;
+        char background[512]="";
+        if(strcmp(format,"txt"))err=background_image(data,len,normalized,background);
+        if(err==ESP_OK&&(!strcmp(format, "txt") ? !append_source(f, data, len, &total, &map) : !append_html(f, data, len, normalized, files, &total, &map))) err = ESP_ERR_INVALID_SIZE;
+        // 合成图片不增加源UTF16坐标；映射锚点仍绑定原文件末尾。/ Synthetic images add no source UTF16 units; map anchors remain at the original file end.
+        if(err==ESP_OK&&background[0]&&(!position_anchor(&map,total)||!append(f,"<img src=\"",10,&total)||
+            !append(f,background,strlen(background),&total)||!append(f,"\"/>",3,&total)))err=ESP_ERR_INVALID_SIZE;
         if (err == ESP_OK && !append(f, "\n", 1, &total)) err = ESP_ERR_INVALID_SIZE;
         free(data); if (err != ESP_OK) break;
     }
@@ -298,18 +409,46 @@ static void release_chapter_work(chapter_download_work_t **p) {
     wr_release(p);
 }
 bool weread_chapter_cached(const char *id,uint32_t uid){WR_GUARD;
+    if(!wr_valid_id(id)||!uid)return false;
     char existing[512];
     if (weread_chapter_directory(id, uid, existing, sizeof(existing)) == ESP_OK) {
-        char cache_path[600]; struct stat st; join(existing, "body.html", cache_path, sizeof(cache_path));
+        char cache_path[600]; struct stat st={0}; join(existing, "body.html", cache_path, sizeof(cache_path));
         bool body_ok = !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
+        off_t body_size=st.st_size;
         join(existing, "position.map", cache_path, sizeof(cache_path));
-        if (body_ok && !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size >= (off_t)sizeof(weread_position_header_t)) return true;
+        if (!body_ok || stat(cache_path, &st) || !S_ISREG(st.st_mode)) return false;
+        FILE *f=fopen(cache_path,"rb");if(!f)return false;
+        weread_position_header_t h={0};bool ok=fread(&h,sizeof(h),1,f)==1;
+        if(fclose(f))ok=false;
+        return ok&&h.magic==WEREAD_POSITION_MAGIC&&h.bytes==(uint32_t)body_size&&h.count&&h.count<=16384&&
+            st.st_size==(off_t)(sizeof(h)+(size_t)h.count*sizeof(weread_position_point_t));
     }
     return false;
+}
+esp_err_t weread_chapter_prefetch_space(uint64_t *available){WR_GUARD;
+    if(available)*available=0;
+    uint64_t free_bytes=0;
+#if defined(ESP_PLATFORM)
+    const char *root=weread_auth_get_storage_root(),*end=strchr(root+1,'/');
+    char mount[32];size_t n=end?(size_t)(end-root):strlen(root);
+    if(!n||n>=sizeof(mount))return ESP_ERR_INVALID_ARG;
+    memcpy(mount,root,n);mount[n]=0;
+    uint64_t total=0;esp_err_t err=esp_vfs_fat_info(mount,&total,&free_bytes);
+    if(err!=ESP_OK)return err;
+#else
+    struct statvfs info;
+    if(statvfs(weread_auth_get_storage_root(),&info))return ESP_FAIL;
+    if(info.f_frsize&&info.f_bavail>UINT64_MAX/info.f_frsize)free_bytes=UINT64_MAX;
+    else free_bytes=(uint64_t)info.f_bavail*info.f_frsize;
+#endif
+    if(available)*available=free_bytes;
+    // 32MiB归档和64MiB展开同时存在，另留4MiB正文、映射及事务余量。/ Archive32MiB and expanded64MiB coexist; retain body4MiB plus map/transaction slack.
+    return free_bytes>=104u*1024u*1024u?ESP_OK:WEREAD_ERR_STORAGE;
 }
 esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_GUARD;
     if (!wr_valid_id(id) || !uid) return ESP_ERR_INVALID_ARG;
     if(weread_chapter_cached(id,uid))return ESP_OK;
+    if(preload){esp_err_t space=weread_chapter_prefetch_space(NULL);if(space!=ESP_OK)return space;}
     char existing[512];
     chapter_download_work_t *w __attribute__((cleanup(release_chapter_work)))=wr_alloc(sizeof(*w));
     if(!w)return ESP_ERR_NO_MEM;
@@ -387,6 +526,10 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         book_weread_clear_prepared();
         err = weread_shelf_refresh_book(id); if (err == ESP_OK) err = weread_toc_sync_version(id,weread_shelf_book_version(id));
         if (err != ESP_OK) return err;
+        // 原生拒绝旧版且新元数据不给版本时，必须重新开书核对，不能重标当前原文/待报坐标。
+        // If the native endpoint rejects the held version and fresh metadata cannot name one, reopen instead of relabeling active text/pending coordinates.
+        uint32_t held_version=0;
+        if(!weread_shelf_book_version(id)&&book_weread_cached_version(id,&held_version)&&held_version)return WEREAD_ERR_VERSION;
     }
     return WEREAD_ERR_VERSION;
 }

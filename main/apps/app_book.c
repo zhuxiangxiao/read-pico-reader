@@ -2477,6 +2477,7 @@ static void pause_reader_prep(void) {
 // 目录使用系统字体；切换前等待预渲染结束，回正文时恢复阅读字体与字形缓存。
 // The directory uses the system face; join painting before switching and restore the reader face on return.
 static void set_reader_view(book_view_t view) {
+    if(view!=READING)wr_chapter_cancel();
     reader_indent_hold_cancel();
     s_reader_tap.pending = false;
     lock_draw();
@@ -3160,10 +3161,10 @@ static void draw_rule_settings(uint8_t *fb) {
     for (int i = 0; i < 2; ++i) {
         EpdRect choice = rule_span_rect(i);
         bool active = full == (i != 0);
-        ui_fill_round_rect(fb, choice, 16, active ? UI_GRAY_BLACK : 0xe8);
+        ui_fill_round_rect(fb, choice, 16, active ? (book_path_is_weread(s_path)?0xd0:UI_GRAY_BLACK) : 0xe8);
         ui_draw_control_frame(fb, choice, 16, active ? UI_GRAY_BLACK : 0x78);
         ui_text_box(fb, (EpdRect){choice.x+8, choice.y+6, choice.width-16, choice.height-12},
-                    23, spans[i], EPD_DRAW_ALIGN_CENTER, active);
+                    23, spans[i], EPD_DRAW_ALIGN_CENTER, active&&!book_path_is_weread(s_path));
     }
     char offset[36];
     snprintf(offset, sizeof(offset), "上下位置  %+d", app_settings_book_reading_line_offset());
@@ -3253,9 +3254,9 @@ static void draw_layout_settings(uint8_t* fb) {
     for (int i = 0; i < 4; ++i) {
         EpdRect choice = {214 + i * 108, 970, 100, 64};
         bool selected = i == indent;
-        ui_fill_round_rect(fb, choice, 16, selected ? UI_GRAY_BLACK : 0xe4);
+        ui_fill_round_rect(fb, choice, 16, selected ? (book_path_is_weread(s_path)?0xd0:UI_GRAY_BLACK) : 0xe4);
         ui_draw_control_frame(fb, choice, 16, selected ? UI_GRAY_BLACK : 0x98);
-        ui_text_box(fb,(EpdRect){choice.x+8,choice.y+5,choice.width-16,choice.height-10},23,indent_names[i],EPD_DRAW_ALIGN_CENTER,selected);
+        ui_text_box(fb,(EpdRect){choice.x+8,choice.y+5,choice.width-16,choice.height-10},23,indent_names[i],EPD_DRAW_ALIGN_CENTER,selected&&!book_path_is_weread(s_path));
     }
     ui_text_box(fb,(EpdRect){42,1044,154,72},24,"缩进微调",EPD_DRAW_ALIGN_LEFT,false);
     draw_indent_adjustments(fb);
@@ -4550,7 +4551,8 @@ static void draw_reader_metadata(uint8_t *fb,size_t page) {
         }
         char chapter[128];reader_footer_chapter_name(chapter,sizeof(chapter));
         char progress[48];reader_footer_progress(progress,sizeof(progress),page);
-        char line[160];snprintf(line,sizeof(line),"%s%s",s_save_failed?"未保存 · ":"",chapter);
+        char offline[48];wr_reader_offline_caption(offline,sizeof(offline));
+        char line[208];snprintf(line,sizeof(line),"%s%s%s%s",s_save_failed?"未保存 · ":"",wr_reader_status(),offline,chapter);
         fit_fixed_text(line,UI_READER_FOOTER_TEXT_PX,620-ui_text_fixed_width_px(UI_READER_FOOTER_TEXT_PX,progress)-12);
         ui_text_fixed_vc(fb,32,footer.y+UI_READER_FOOTER_TEXT_Y-1168,UI_READER_FOOTER_TEXT_PX,line,EPD_DRAW_ALIGN_LEFT,false);
         ui_text_fixed_vc(fb,652,footer.y+UI_READER_FOOTER_TEXT_Y-1168,UI_READER_FOOTER_TEXT_PX,progress,EPD_DRAW_ALIGN_RIGHT,false);
@@ -5396,6 +5398,7 @@ static bool reader_image_dims(void* ctx, int image, int* width, int* height) {
 }
 #include "book_ticket_reader.inc"
 static void free_book(void) {
+    wr_chapter_cancel();
     if (book_path_is_weread(s_path)) weread_reader_end((uint64_t)esp_timer_get_time()/1000);
     if (s_txt_opening) {
         s_txt_opening = false;
@@ -5616,9 +5619,19 @@ static bool heading_text_matches(const char *text, const char *toc, const char *
 static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
                             bool last_page, const char *anchor, size_t source_offset) {
     if (book_path_is_weread(s_path)) {
-        wr_reader_sample(ctx->now_ms, false);
-        if (s_text && chapter != s_chapter) weread_reader_flush(ctx->now_ms, false);
-        weread_runtime_cancel_join();
+        if(s_wr_jump.committing&&!weread_reader_cached(s_path,chapter)){
+            copy_text(s_message,sizeof(s_message),"缓存读取失败，请重试");return false;
+        }
+        if(s_text&&!s_wr_jump.committing&&!weread_reader_cached(s_path,chapter)){
+            if(!wr_chapter_queue(ctx,chapter,offset,last_page,anchor,source_offset)){
+                copy_text(s_message,sizeof(s_message),"内存不足，无法准备章节");
+            }
+            return false;
+        }
+        wr_reader_sample(ctx->now_ms,false);
+        if(s_text&&chapter!=s_chapter&&weread_reader_save(ctx->now_ms)!=ESP_OK){
+            copy_text(s_message,sizeof(s_message),"本地位置未保存，请检查存储卡后重试");return false;
+        }
     }
     bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX);
     html_text_t loaded = {0};
@@ -5627,12 +5640,15 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     if (err == ESP_OK) err = book_chapter_load_blocks_target(chapter, anchor, source_offset,
                                                     &anchor_offset, &loaded);
     if (err != ESP_OK) {
+        if(book_path_is_weread(s_path))book_weread_discard_loaded();
         ESP_LOGW(TAG, "chapter load failed: %s", esp_err_to_name(err));
         copy_text(s_message, sizeof(s_message), err == WEREAD_ERR_PURCHASE ? "请在微信读书手机端购买或领取此章节" :
             err == WEREAD_ERR_SOLD_OUT ? "这本书已下架，暂时无法下载" :
+            err==WEREAD_ERR_VERSION?"书籍已更新，请返回书架重新打开":
             book_path_is_weread(s_path)?"加载失败，请检查存储卡或网络后重试":"加载失败，请检查存储卡后重试");
         return false;
     }
+    uint32_t wr_content_version=0;
     char heading[128] = {0}, label[32] = {0}, toc_title[128] = {0};
     size_t lead_skip = 0;
     unsigned lead_height = 0;
@@ -5698,7 +5714,13 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     book_layout_set_runs(loaded.runs, loaded.run_count);
     book_layout_set_inline_images(loaded.notes, loaded.note_count);
     bool ok = book_layout_build_blocks(loaded.utf8, loaded.len, loaded.blocks, loaded.count, body_rect(), s_px);
+    if(ok&&book_path_is_weread(s_path)){
+        size_t actual=chapter;
+        ok=book_weread_commit_loaded(&actual,&wr_content_version)==ESP_OK;
+        if(ok){chapter=actual;s_reader_dims_ctx.chapter=actual;}
+    }
     if (!ok) {
+        if(book_path_is_weread(s_path))book_weread_discard_loaded();
         // 回滚前恢复旧章上下文，避免尺寸回调引用已释放的新章图片。/ Restore the previous context before rollback to avoid a freed image list.
         s_reader_dims_ctx = old_dims_ctx;
         book_layout_set_inline_images(s_notes, s_note_count);
@@ -5742,6 +5764,7 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     free(s_images);
     s_images = loaded.images; s_image_count = loaded.image_count;
     release_page_images();
+    s_wr_content_version=wr_content_version;
     s_chapter = chapter;
     s_chapter_jump_undo.valid = false;
     if (clear_toc) s_selected_toc = SIZE_MAX;
@@ -5772,6 +5795,15 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
 static bool load_chapter(app_ctx_t* ctx, size_t chapter, size_t offset, bool last_page) {
     return load_chapter_at(ctx, chapter, offset, last_page, NULL, SIZE_MAX);
 }
+#include "book_weread_chapter.inc"
+bool app_book_prepare_leave(app_ctx_t *ctx){
+    if(!s_text||!book_path_is_weread(s_path))return true;
+    wr_chapter_cancel();weread_runtime_cancel_join();wr_reader_sample(ctx->now_ms,false);
+    if(weread_reader_save(ctx->now_ms)==ESP_OK)return true;
+    copy_text(s_reader_notice,sizeof(s_reader_notice),"位置未保存，请检查存储卡后重试");
+    s_reader_notice_until=ctx->now_ms+3000;return false;
+}
+
 // 关闭图片时跳过纯插图页，避免出现空白翻页。/ Skip illustration-only pages when images are disabled.
 static void skip_hidden_image_pages(app_ctx_t *ctx, int direction) {
     if (!app_settings_reader_hide_images()) return;
@@ -6020,6 +6052,10 @@ static void cover_cache_warm_async(const char* path) {
 #endif
 
 static bool open_book(app_ctx_t *ctx, const char *path) {
+    if(weread_reader_pending_save()&&weread_reader_save(ctx->now_ms)!=ESP_OK){
+        copy_text(s_message,sizeof(s_message),"上一位置未保存，请检查存储卡后重试");return false;
+    }
+
     if (s_txt_opening) {
         s_txt_opening = false;
         pico_boot_book_end(false);
@@ -7075,7 +7111,11 @@ static bool reader_turn_chrome(app_ctx_t *ctx) {
 static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     if(!s_rc_auto_turning)rc_pause_auto();
     if (!s_text || s_clear_confirm) return APP_REDRAW_NONE;
-    if (book_path_is_weread(s_path)) weread_reader_input(wr_reader_text_turn(dir));
+    if(book_path_is_weread(s_path)){
+        bool edge=dir>0?s_page+1>=book_layout_page_count():!s_page;
+        if(!edge)wr_chapter_cancel();
+        if(!edge)weread_reader_input(wr_reader_text_turn(dir));
+    }
     reader_zoom_reset();
 #if KIIKO_BOARD_METALIO47
     s_turn_direction=dir;
@@ -7093,6 +7133,7 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     else if (dir > 0 && s_chapter + 1 < book_chapter_count()) { save_progress(); changed = load_chapter(ctx, s_chapter + 1, 0, false); }
     else if (dir < 0 && s_chapter) { save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true); }
     else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
+    if(!changed&&s_wr_jump.pending)return APP_REDRAW_PAGE;
     if (!changed) { set_reader_view(s_text ? TOC : SHELF); ctx->leaf = s_text ? book_toc_open(current_toc_position()) : 0; return APP_REDRAW_PAGE; }
     skip_hidden_image_pages(ctx, dir);
     if (!s_text) { s_view = SHELF; return APP_REDRAW_PAGE; }
@@ -8555,15 +8596,16 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             set_reader_view(READING);
             if (load_chapter_at(ctx, chapter, 0, false, book_navigation_anchor((size_t)target),
                                 book_navigation_source_offset((size_t)target))) {
-                s_selected_toc = (size_t)target;
+                s_selected_toc = book_path_is_weread(s_path)?s_chapter:(size_t)target;
                 s_selected_toc_offset = reader_page_offset(s_page);
                 char entry_title[sizeof(s_title)];
-                if (book_navigation_title((size_t)target, entry_title, sizeof(entry_title)) == ESP_OK)
+                if (book_navigation_title(s_selected_toc, entry_title, sizeof(entry_title)) == ESP_OK)
                     copy_text(s_title, sizeof(s_title), entry_title);
                 s_view = READING;
                 s_reader_panel = READER_PANEL_NONE;
                 wr_reader_move();save_progress();
-            } else set_reader_view(s_text ? TOC : SHELF);
+            } else if(s_wr_jump.pending){s_wr_jump.toc=(size_t)target;s_view=READING;}
+            else set_reader_view(s_text ? TOC : SHELF);
             return APP_REDRAW_PAGE;
         }
         return APP_REDRAW_NONE;
@@ -9861,7 +9903,8 @@ static app_redraw_t shelf_cover_tick(app_ctx_t *ctx) {
 }
 
 static app_redraw_t on_tick(app_ctx_t* ctx) {
-    wr_reader_sample(ctx->now_ms, s_view == READING && s_reader_panel == READER_PANEL_NONE &&
+    app_redraw_t chapter=wr_chapter_tick(ctx);if(chapter!=APP_REDRAW_NONE)return chapter;
+    wr_reader_sample(ctx->now_ms, s_view == READING && !s_wr_jump.pending && s_reader_panel == READER_PANEL_NONE &&
         !ctx->consumed && !ctx->request_app && !(ctx->touch && ctx->touch->touched));
     const app_redraw_t cover_lookup = bulk_cover_tick(ctx);
     if (cover_lookup != APP_REDRAW_NONE || s_view == COVER_LOOKUP) return cover_lookup;
@@ -10049,6 +10092,7 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     return clock;
 }
 static void before_lock(app_ctx_t* ctx) {
+    wr_chapter_cancel();
     if (book_path_is_weread(s_path)) weread_runtime_cancel_join();
     book_weread_cover_cancel();
     rc_stop_auto();rc_cancel_side();s_rc_double_pending=false;

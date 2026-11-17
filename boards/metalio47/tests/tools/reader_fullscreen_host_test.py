@@ -33,6 +33,8 @@ static char s_path[288]="/sdcard/book.epub";
 static void weread_runtime_cancel_join(void){}
 static void weread_reader_input(bool local){if(!local)weread_runtime_cancel_join();}
 static void wr_reader_move(void){}
+static struct {bool pending;}s_wr_jump;
+static void wr_chapter_cancel(void){s_wr_jump.pending=false;}
 static bool s_requested_fullscreen=true,s_requested_resume_mode;static uint8_t s_requested_open_origin;
 static bool default_fullscreen;
 static bool app_settings_reader_default_fullscreen(void){return default_fullscreen;}

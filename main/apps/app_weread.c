@@ -63,6 +63,11 @@ static ui_text_edit_t s_edit;
 static uint64_t s_next_poll, s_next_action;
 static EpdRect s_area;
 static bool s_cover_remote, s_requested_home, s_open_home, s_reader_failed;
+static bool s_cover_warm, s_preconnected, s_cover_dirty, s_open_queued;
+static uint64_t s_open_owner;static unsigned s_open_epoch;
+static uint64_t s_warm_page, s_cover_paint_at;
+static unsigned s_warm_slot;
+static int s_warm_direction=1;
 typedef struct { uint8_t *pixels; bool checked; weread_cover_retry_t retry; uint64_t key; } row_cover_t;
 static row_cover_t s_covers[ROWS];
 static int display_style(void){return s_query[0]?5:s_style;}
@@ -75,8 +80,8 @@ bool app_weread_request_open(const char *uri) {
 }
 void app_weread_reader_failed(void){s_reader_failed=true;}
 static void message(const char *s) { wr_display_copy(s_message, sizeof(s_message), s); }
-static void release_covers(void) { for (int i = 0; i < ROWS; ++i) { free(s_covers[i].pixels); memset(&s_covers[i], 0, sizeof(s_covers[i])); } }
-static void stop_job(void) { weread_runtime_cancel_join(); weread_result_t r; if (weread_runtime_poll(&r)) weread_runtime_result_free(&r);s_syncing=false;s_more_sync=weread_shelf_sync_pending(); }
+static void release_covers(void) { for (int i = 0; i < ROWS; ++i) { free(s_covers[i].pixels); memset(&s_covers[i], 0, sizeof(s_covers[i])); } s_cover_dirty=false;s_cover_paint_at=0;s_next_action=0; }
+static void stop_job(void) { s_open_queued=false;weread_runtime_cancel_join();s_cover_warm=false; weread_result_t r; if (weread_runtime_poll(&r)) weread_runtime_result_free(&r);s_syncing=false;s_more_sync=weread_shelf_sync_pending(); }
 static int compare_match(const void *a,const void *b){
     const weread_shelf_item_t *x=&s_books[*(const uint16_t*)a],*y=&s_books[*(const uint16_t*)b];
     int mode=ui_shelf_order_mode(s_order),c=0;
@@ -157,30 +162,36 @@ static bool start(weread_job_t job, const char *id, const char *value) {
     message("操作暂不可用，请稍后重试"); return false;
 }
 static void open_id(const char *id) {
-    s_open_home=false; stop_job(); strcpy(s_id, id); s_conflict = s_clear = false;
-    s_more_sync=false;
-    message("正在准备阅读…"); start(WR_JOB_OPEN, id, NULL);
+    s_open_home=false;strcpy(s_id,id);s_conflict=s_clear=false;s_more_sync=false;
+    message("正在准备阅读…");
+    if(weread_runtime_busy()){
+        s_open_queued=true;s_open_owner=s_owner;s_open_epoch=s_epoch;weread_runtime_cancel();
+    }else{stop_job();start(WR_JOB_OPEN,id,NULL);}
 }
 static void enter(app_ctx_t *ctx) {
     int first=s_page*page_rows();s_style=app_settings_shelf_style();s_page=first/page_rows();
     s_last_input=ctx->now_ms;s_sync_check=ctx->now_ms+1200;s_force_cover=false;
+    s_preconnected=s_cover_warm=s_open_queued=false;s_warm_page=0;s_warm_slot=0;s_warm_direction=1;
     s_keep_network = s_wifi = s_search = s_conflict = s_clear = s_logout = s_auth = false;
     s_uid[0] = s_qr[0] = s_message[0] = 0; s_next_poll = s_next_action = 0;
     s_sync_after_init = true; s_wake=false;s_sort_menu=s_more_menu=s_key_mode=false; start(WR_JOB_INIT, NULL, NULL);
     s_more_sync=false;
 }
 static void leave(app_ctx_t *ctx) {
+    s_open_queued=false;
     wifi_close(ctx); ui_keyboard_end(); ui_wifi_qr_clear(); s_requested[0]=0;
     if (!s_keep_network) weread_runtime_stop(); else stop_job();
     release_covers(); free(s_books); s_books = NULL; free(s_matches); s_matches = NULL; s_count = s_visible = 0;
     s_more_sync=s_syncing=false;
 }
 static void media_lost(app_ctx_t *ctx) {
+    s_open_queued=false;
     wifi_close(ctx); weread_runtime_media_lost(); release_covers();
     free(s_books); s_books = NULL; free(s_matches); s_matches = NULL; s_count = s_visible = 0;
     s_auth = false; s_requested[0] = s_uid[0] = s_qr[0] = 0;ui_wifi_qr_clear();message("TF 卡不可用，请重新插入");
 }
 static void before_lock(app_ctx_t *ctx) {
+    s_open_queued=false;
     wifi_close(ctx); weread_runtime_stop(); s_wake = true; ui_keyboard_end(); s_search = false;
 }
 static void media_ready(app_ctx_t *ctx) { (void)ctx; s_wake = true; }
@@ -249,6 +260,12 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
     unsigned x=e->x0,y=e->y0;
     int tab=ui_nav_hit(x,y);if(tab>=0){ui_nav_request(ctx,tab);return APP_REDRAW_NONE;}
     if(s_sync_after_init)return APP_REDRAW_NONE;
+    if(s_open_queued){
+        for(int i=0;i<page_rows();++i){weread_shelf_item_t *b=row_book(i);
+            if(b&&ui_rect_hit(row_rect(i),x,y)){open_id(b->book_id);return APP_REDRAW_PAGE;}
+        }
+        return APP_REDRAW_NONE;
+    }
     if(s_conflict||s_clear||s_logout) {
         if(ui_rect_hit(MAIN_ACTION,x,y)){
             if(s_conflict) {weread_runtime_choose(s_id,&s_local,false);message("正在准备阅读…");}
@@ -289,7 +306,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
         s_search=true;wr_copy(s_search_draft,sizeof(s_search_draft),s_query);ui_text_edit_init(&s_edit,s_search_draft,sizeof(s_search_draft));ui_keyboard_begin(&s_edit,false);return APP_REDRAW_PAGE;
     }
     int hit=ui_pager_hit(x,y),target=ui_pager_target(hit,s_page,page_count());
-    if(hit>=0&&target!=s_page){stop_job();s_page=target;release_covers();return APP_REDRAW_PAGE;}
+    if(hit>=0&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();return APP_REDRAW_PAGE;}
     for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&ui_rect_hit(row_rect(i),x,y)){
         if(e->type==UI_GESTURE_LONG_PRESS){stop_job();strcpy(s_id,b->book_id);s_clear=true;}
         else open_id(b->book_id);
@@ -310,7 +327,51 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         }return r;
     }
     weread_result_t r;
+    if(s_open_queued){
+        if(weread_runtime_busy())return APP_REDRAW_NONE;
+        if(weread_runtime_poll(&r))weread_runtime_result_free(&r);
+        s_open_queued=s_cover_warm=false;
+        if(s_open_owner!=weread_cover_key("","")||s_open_epoch!=weread_runtime_cache_epoch()){
+            s_sync_after_init=true;s_auth=false;
+            start(WR_JOB_INIT,NULL,NULL);message("登录或存储卡已变化，正在重新加载…");return APP_REDRAW_PAGE;
+        }
+        start(WR_JOB_OPEN,s_id,NULL);return APP_REDRAW_NONE;
+    }
     if(weread_runtime_poll(&r)){
+        bool live_auth=false;
+        if(!r.authenticated&&r.job!=WR_JOB_REPORT){WR_GUARD;live_auth=weread_auth_is_authenticated();}
+        if(!r.authenticated&&live_auth&&r.job!=WR_JOB_REPORT){
+            bool failed_init=r.job==WR_JOB_INIT&&r.error!=ESP_OK;
+            weread_runtime_result_free(&r);s_auth=true;s_sync_after_init=true;s_open_queued=false;
+            s_requested[0]=s_uid[0]=s_qr[0]=0;ui_wifi_qr_clear();
+            if(failed_init)message("TF 卡不可用，请重新挂载后进入");
+            else{start(WR_JOB_INIT,NULL,NULL);message("登录已更新，正在加载书架…");}
+            return APP_REDRAW_PAGE;
+        }
+        bool expired_job=r.job==WR_JOB_COVER||r.job==WR_JOB_OPEN||r.job==WR_JOB_LOCAL||r.job==WR_JOB_CLOUD||r.job==WR_JOB_SYNC||(r.job==WR_JOB_INIT&&r.error==ESP_OK);
+        if(expired_job&&s_auth&&!r.authenticated&&!live_auth){
+            s_auth=s_cover_warm=false;s_uid[0]=s_qr[0]=0;ui_wifi_qr_clear();
+            s_open_queued=false;s_requested[0]=0;
+            weread_runtime_result_free(&r);start(WR_JOB_QR,NULL,NULL);message("登录已失效，请重新扫码");return APP_REDRAW_PAGE;
+        }
+        // 不可见预热与预连接不改变当前画面，也不弹出后台网络错误。/ Invisible warming and preconnection never repaint or surface background network errors.
+        if((r.job==WR_JOB_COVER&&s_cover_warm)||r.job==WR_JOB_CONNECT||r.job==WR_JOB_DISCONNECT){
+            bool expired=s_auth&&!r.authenticated;
+            s_cover_warm=false;weread_runtime_result_free(&r);
+            if(expired){s_auth=false;start(WR_JOB_QR,NULL,NULL);message("登录已失效，请重新扫码");return APP_REDRAW_PAGE;}
+            return APP_REDRAW_NONE;
+        }
+        if(r.job==WR_JOB_REPORT){
+            const char *text=NULL;
+            if(r.id[0]){
+                static const char *states[]={"进度已保存本地","进度待同步，联网后自动重试","进度已同步","进度与手机不同，开书时请选择"};
+                text=!r.local.chapter_uid&&r.error!=ESP_OK?"进度保存失败，请检查存储卡":states[weread_progress_state(&r.local)];
+            }
+            bool changed=text&&strcmp(s_message,text);
+            if(changed){message(text);s_area=(EpdRect){36,988,612,24};}
+            weread_runtime_result_free(&r);return changed?APP_REDRAW_AREA:APP_REDRAW_NONE;
+        }
+        if(r.job==WR_JOB_SYNC||(r.job==WR_JOB_COVER&&s_cover_remote))s_preconnected=true;
         uint64_t old_page=page_signature();char old_message[sizeof(s_message)];strcpy(old_message,s_message);
         bool local_cover=r.job==WR_JOB_COVER&&!s_cover_remote;
         s_auth=r.authenticated;
@@ -346,7 +407,12 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         }
         if(r.job==WR_JOB_COVER){for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
             s_covers[i].checked=true;
-            if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;}
+            if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;
+                if(!s_cover_dirty)s_cover_paint_at=ctx->now_ms+150;
+                s_cover_dirty=true;
+            }
+            else if(r.error==ESP_ERR_NO_MEM||r.error==ESP_ERR_INVALID_STATE)
+                s_covers[i].retry.not_before_ms=ctx->now_ms+(r.error==ESP_ERR_NO_MEM?15000:250);
             else if(s_cover_remote)weread_cover_retry_result(&s_covers[i].retry,
                 r.error!=ESP_OK&&r.http_status>=200&&r.http_status<300?0:r.http_status,ctx->now_ms);
             if(r.cover_retry_seconds&&(!s_cover_remote||s_covers[i].retry.failures>=3))
@@ -361,7 +427,7 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             if(r.error==ESP_OK){
                 if(s_auth){message("单击阅读，长按清理离线内容");s_sync_check=ctx->now_ms+1200;
                     if(!s_count&&!weread_shelf_cache_fresh((uint64_t)time(NULL))&&ctx->now_ms>=s_sync_not_before){start(WR_JOB_SYNC,NULL,NULL);message("正在加载第一页…");}}
-                else if(initial){start(WR_JOB_QR,NULL,NULL);message("正在生成二维码…");}
+                else if(initial||!s_uid[0]){start(WR_JOB_QR,NULL,NULL);message("正在生成二维码…");}
             }
             else message("TF 卡不可用，请重新挂载后进入");
         }
@@ -388,9 +454,15 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             stop_job();open_id(s_requested);s_open_home=s_requested_home;s_requested_home=false;s_requested[0]=0;
         }
         bool unchanged=r.job==WR_JOB_SYNC&&old_page==page_signature()&&!strcmp(old_message,s_message);
-        bool batch_cover=local_cover&&!covers_checked();
+        bool cover_result=r.job==WR_JOB_COVER;
+        bool batch_cover=cover_result&&(!local_cover||!covers_checked());
+        bool paint_cover=cover_result&&local_cover&&covers_checked()&&s_cover_dirty;
         if(local_cover)s_next_action=ctx->now_ms;
-        weread_runtime_result_free(&r);return unchanged||batch_cover?APP_REDRAW_NONE:APP_REDRAW_PAGE;
+        if(paint_cover){s_cover_dirty=false;s_cover_paint_at=0;}
+        weread_runtime_result_free(&r);return unchanged||batch_cover||(cover_result&&!paint_cover)?APP_REDRAW_NONE:APP_REDRAW_PAGE;
+    }
+    if(s_cover_dirty&&covers_checked()&&ctx->now_ms>=s_cover_paint_at&&!s_search&&!s_sort_menu&&!s_more_menu&&!s_conflict&&!s_clear&&!s_logout){
+        s_cover_dirty=false;s_cover_paint_at=0;return APP_REDRAW_PAGE;
     }
     if(weread_runtime_busy()||s_sync_after_init||s_search||s_sort_menu||s_more_menu||s_conflict||s_clear||s_logout||ctx->request_app||ctx->request_return)return APP_REDRAW_NONE;
     bool idle=ctx->now_ms>=s_last_input&&ctx->now_ms-s_last_input>=1000;
@@ -412,9 +484,25 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         }s_next_action=ctx->now_ms+150;
         if(covers_checked())s_force_cover=false;
     }
+    if(s_auth&&idle&&!weread_runtime_busy()&&covers_checked()&&!covers_waiting(ctx->now_ms)&&!s_more_sync){
+        if(weread_runtime_idle(ctx->now_ms))return APP_REDRAW_NONE;
+        if(!s_preconnected&&ctx->now_ms-s_last_input>=1500){
+            s_preconnected=true;(void)weread_runtime_start(WR_JOB_CONNECT,NULL,NULL);return APP_REDRAW_NONE;
+        }
+        uint64_t signature=page_signature();
+        if(signature!=s_warm_page){s_warm_page=signature;s_warm_slot=0;}
+        int next=s_page+s_warm_direction;
+        if(next>=0&&next<page_count()&&s_warm_slot<2){
+            size_t index=(size_t)next*page_rows()+s_warm_slot++;
+            if(index<s_visible){weread_shelf_item_t *b=&s_books[s_matches[index]];
+                if(b->has_cover)s_cover_warm=weread_runtime_start(WR_JOB_COVER,b->book_id,"warm-disk");
+            }
+        }
+    }
     return APP_REDRAW_NONE;
 }
 static app_redraw_t key(app_ctx_t *ctx,int key) {
+    s_open_queued=false;
     s_last_input=ctx->now_ms;
     if(s_wifi&&app_transfer.on_key)return app_transfer.on_key(ctx,key);
     if(s_search){ui_keyboard_end();s_search=false;return APP_REDRAW_PAGE;}
@@ -424,11 +512,12 @@ static app_redraw_t key(app_ctx_t *ctx,int key) {
 static bool navigation(app_ctx_t *ctx){return !s_wifi||!app_transfer.navigation_visible||app_transfer.navigation_visible(ctx);}
 static bool main_page(app_ctx_t *ctx){(void)ctx;return !s_wifi&&!s_search&&!s_conflict&&!s_clear&&!s_logout&&!s_sort_menu&&!s_more_menu;}
 static bool main_key(app_ctx_t *ctx,int key,app_redraw_t *redraw){
-    if(!s_auth||s_sync_after_init||!main_page(ctx))return false;
+    s_last_input=ctx->now_ms;
+    if(!s_auth||s_sync_after_init||s_open_queued||!main_page(ctx))return false;
     if(key==UI_KEY_2){s_key_mode=!s_key_mode;*redraw=APP_REDRAW_PAGE;return true;}
     if(!s_key_mode)return false;
     int target=s_page+(key==UI_KEY_1?-1:1);
-    if(target>=0&&target<page_count()&&target!=s_page){stop_job();s_page=target;release_covers();*redraw=APP_REDRAW_PAGE;}
+    if(target>=0&&target<page_count()&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();*redraw=APP_REDRAW_PAGE;}
     else *redraw=APP_REDRAW_NONE;
     return true;
 }

@@ -59,9 +59,13 @@ typedef struct {
     int (*crt_bundle_attach)(void *conf);
     bool disable_auto_redirect;
     bool keep_alive_enable;
+    bool is_async,skip_cert_common_name_check;
+    const char *common_name;
+    int transport_type;
     int (*event_handler)(esp_http_client_event_t *evt);
     void *user_data;
 } esp_http_client_config_t;
+#define HTTP_TRANSPORT_OVER_SSL 2
 
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config);
 esp_err_t esp_http_client_set_url(esp_http_client_handle_t client, const char *url);

@@ -41,6 +41,7 @@ echo "Compiling WeRead crypto host tests..."
     main/book/book_weread_crypto.c \
     -lz \
     -o build/weread-tests/test_weread_crypto
+python3 tools/weread_platform_crypto_host_test.py
 
 echo "Running WeRead crypto host tests under ASan/UBSan..."
 build/weread-tests/test_weread_crypto
@@ -173,6 +174,14 @@ echo "Compiling and running bounded cache lifecycle tests..."
 build/weread-tests/test_weread_cache
 python3 tools/weread_cache_ui_host_test.py
 python3 tools/weread_reader_input_host_test.py
+python3 tools/weread_chapter_transition_host_test.py
+python3 tools/weread_client_snapshot_host_test.py
+python3 tools/weread_client_cancel_cleanup_host_test.py
+python3 tools/test_weread_outbox.py
+python3 tools/weread_offline_host_test.py
+python3 tools/test_weread_window.py
+python3 tools/test_weread_runtime_save.py
+python3 tools/weread_shelf_idle_host_test.py
 python3 tools/weread_cover_cache_host_test.py
 python3 tools/weread_cache_fault_host_test.py
 python3 tools/weread_shelf_noop_host_test.py

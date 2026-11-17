@@ -50,6 +50,7 @@ static atomic_bool s_busy, s_done, s_cancel, s_alive;
 static atomic_uint_fast64_t s_deadline;
 static bool s_configured, s_owns_network;
 static unsigned s_cache_epoch;
+static uint64_t s_idle_at,s_network_active;
 static weread_result_t s_result;
 static struct {
     weread_job_t job;
@@ -62,13 +63,18 @@ static struct {
 } s_work;
 static struct { char id[64]; weread_progress_t progress; uint32_t fresh_version,last_chapter;bool valid, resume_ready; } s_choice;
 static struct {
-    char id[64], summary[256];
+    char id[64], summary[256], owner_root[256], owner_vid[WEREAD_VID_MAX_LEN], owner_device[WEREAD_DEVICE_ID_MAX_LEN];
+    uint32_t owner_version,nav_version;unsigned owner_epoch;
     size_t chapter, nav_chapter;
     uint32_t offset, percent, nav_offset, nav_percent, anchor_uid, anchor_index, anchor_offset, anchor_percent, revision;
     unsigned pages;
+    uint32_t durable_revision;
     uint64_t last_tick, active_ms, last_store, last_move, prefetch_retry;
     uint32_t prefetched;
-    bool seen, changed, retry, cover_warmed, anchor, navigation_pending;
+    uint64_t report_at;
+    unsigned prefetch_mask, prefetch_failures;
+    weread_progress_state_t state;
+    bool seen, changed, retry, cover_warmed, anchor, navigation_pending, storage_blocked, pending_coordinate, save_failed;
 } s_reader;
 static uint64_t now_ms(void) {
 #if defined(ESP_PLATFORM)
@@ -114,13 +120,13 @@ static esp_err_t connect_network(void) {
                 esp_err_t err=read_pico_transfer_sync_time_online_cancelable(&utc,cancelled,NULL);
                 if(err!=ESP_OK)return err;
             }
-            return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_OK;
+            s_network_active=now_ms();return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_OK;
         }
         if(status.state==READ_PICO_TRANSFER_STOPPED){
             s_owns_network=false;
             read_pico_transfer_cfg_t cfg={.mode=READ_PICO_TRANSFER_MODE_STA,.network_only=true,.cover_lookup=true};
             esp_err_t err=read_pico_transfer_start(&cfg);
-            if(err==ESP_OK)s_owns_network=true;
+            if(err==ESP_OK){s_owns_network=true;s_network_active=now_ms();}
             else if(err!=ESP_ERR_INVALID_STATE && err!=ESP_ERR_NOT_FINISHED)return err;
         } else if(status.mode!=READ_PICO_TRANSFER_MODE_STA){
             return ESP_ERR_INVALID_STATE;
@@ -132,20 +138,20 @@ static esp_err_t connect_network(void) {
     }
     return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_ERR_TIMEOUT;
 #else
-    s_owns_network = true; return ESP_OK;
+    s_owns_network = true;s_network_active=now_ms(); return ESP_OK;
 #endif
 }
 static void stop_network(void) {
 #if defined(ESP_PLATFORM)
     if (s_owns_network) read_pico_transfer_stop();
 #endif
-    s_owns_network = false;
+    s_owns_network = false;s_network_active=0;
 }
 void weread_runtime_result_free(weread_result_t *r) {
     if (r) { free(r->books); free(r->cover); memset(r, 0, sizeof(*r)); }
 }
 void weread_runtime_load_local(void) {
-    WR_GUARD;
+    WR_GUARD;weread_progress_outbox_reset();
 #if defined(ESP_PLATFORM)
     if (!read_pico_sd_io_ready()) {weread_auth_forget_session();weread_shelf_clear();return;}
 #endif
@@ -321,10 +327,12 @@ static void perform_job(void) {
     s_result.job = s_work.job; strcpy(s_result.id, s_work.id);
     esp_err_t err = ESP_OK;
 #if defined(ESP_PLATFORM)
-    if (s_work.job != WR_JOB_STOP && s_work.job != WR_JOB_CONNECT && !read_pico_sd_io_ready()) {
+    if (s_work.job != WR_JOB_STOP && s_work.job != WR_JOB_CONNECT && s_work.job!=WR_JOB_DISCONNECT && !read_pico_sd_io_ready()) {
         s_result.error=ESP_ERR_INVALID_STATE;return;
     }
 #endif
+    weread_client_set_polling(true);
+    weread_client_set_background(s_work.job==WR_JOB_NOTE||s_work.job==WR_JOB_REPORT||s_work.job==WR_JOB_PREFETCH||s_work.job==WR_JOB_CHAPTER||s_work.job==WR_JOB_COVER);
     switch (s_work.job) {
         case WR_JOB_INIT: weread_runtime_load_local(); snapshot(); break;
         case WR_JOB_SYNC:
@@ -365,23 +373,17 @@ static void perform_job(void) {
             break;
         }
         case WR_JOB_LOGOUT:
-            err = weread_auth_clear_session(); weread_shelf_clear(); memset(&s_choice,0,sizeof(s_choice)); ++s_cache_epoch; stop_network(); snapshot(); break;
-        case WR_JOB_NOTE: {
-            uint32_t co = s_work.offset;
-            err = s_work.raw_position?ESP_OK:book_weread_map(s_work.chapter, true, s_work.offset, &co);
-            if(err==ESP_OK&&!cancelled(NULL)){
-                s_result.local.chapter_uid=s_work.uid;s_result.local.chapter_index=s_work.index;
-                s_result.local.chapter_offset=co;s_result.local.progress=s_work.percent;
-                s_result.local.reading_time=s_work.seconds;s_result.local.pending_pages=s_work.pages;
-                wr_display_copy(s_result.local.summary,sizeof(s_result.local.summary),s_work.summary);
-                err=weread_progress_update(s_work.id,&s_result.local,!s_work.raw_position,s_work.force,s_work.now,(uint64_t)time(NULL),&s_result.noted);
-            }
+            weread_progress_outbox_reset();err = weread_auth_clear_session(); weread_shelf_clear(); memset(&s_choice,0,sizeof(s_choice)); ++s_cache_epoch; stop_network(); snapshot(); break;
+        case WR_JOB_NOTE: case WR_JOB_REPORT: {
+            if(s_work.id[0] || weread_progress_outbox_next(s_result.id,sizeof(s_result.id),(uint64_t)time(NULL))==ESP_OK)
+                err=weread_progress_outbox_report(s_result.id,s_work.now,(uint64_t)time(NULL),&s_result.local);
             break;
         }
-        case WR_JOB_CHAPTER: err = weread_chapter_download(s_work.id,(uint32_t)s_work.chapter); break;
+        case WR_JOB_CHAPTER: s_result.chapter_uid=(uint32_t)s_work.chapter;err = weread_chapter_download(s_work.id,(uint32_t)s_work.chapter); break;
         case WR_JOB_PREFETCH: err = weread_chapter_download_ex(s_work.id, (uint32_t)s_work.chapter, true); break;
         case WR_JOB_CONNECT: err = connect_network(); break;
-        case WR_JOB_STOP: book_weread_clear_prepared();weread_shelf_sync_discard();stop_network(); break;
+        case WR_JOB_DISCONNECT: stop_network();break;
+        case WR_JOB_STOP: weread_progress_outbox_reset();book_weread_clear_prepared();weread_shelf_sync_discard();stop_network(); break;
         case WR_JOB_TOC: err=book_weread_prepare_open(s_work.id);break;
     }
     if (s_result.conflict) {
@@ -392,12 +394,13 @@ static void perform_job(void) {
     if (err != ESP_OK || s_result.error == ESP_OK) s_result.error = err;
     s_result.authenticated = weread_auth_is_authenticated();
 #if defined(ESP_PLATFORM)
-    if(s_work.job!=WR_JOB_COVER&&s_work.job!=WR_JOB_NOTE)
+    if(s_work.job!=WR_JOB_COVER&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT&&s_work.job!=WR_JOB_DISCONNECT)
         ESP_LOGI("weread","memory job=%u result=%d internal=%u largest=%u psram=%u stack=%u",
             (unsigned)s_work.job,(int)s_result.error,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT),(unsigned)uxTaskGetStackHighWaterMark(NULL));
 #endif
+    weread_client_set_background(false);weread_client_set_polling(false);
 }
 #if defined(ESP_PLATFORM)
 static void worker(void *arg) {
@@ -435,22 +438,21 @@ void weread_runtime_init(void) {
 bool weread_runtime_busy(void) { return atomic_load(&s_busy); }
 static void consume_reader_result(void) {
     if (!s_reader.id[0] || strcmp(s_reader.id, s_result.id)) return;
-    if (s_result.job == WR_JOB_NOTE) {
-        if (!s_result.noted) {
-            s_reader.pages += s_work.pages;
-            s_reader.active_ms += (uint64_t)s_work.seconds * 1000;
-            s_reader.changed = true;
+    if (s_result.job == WR_JOB_NOTE || s_result.job == WR_JOB_REPORT) {
+        if(s_result.local.revision==s_reader.durable_revision){
+            s_reader.state=weread_progress_state(&s_result.local);
+            s_reader.retry=s_result.local.dirty&&s_result.local.position_pending;
         }
-        if(s_result.noted&&s_work.revision==s_reader.revision){
-            s_reader.anchor_uid=s_result.local.chapter_uid;s_reader.anchor_index=s_result.local.chapter_index;
-            s_reader.anchor_offset=s_result.local.chapter_offset;s_reader.anchor_percent=s_result.local.progress;
-            wr_display_copy(s_reader.summary,sizeof(s_reader.summary),s_result.local.summary);s_reader.anchor=true;
-        }
-        s_reader.retry = s_result.error != ESP_OK || (s_result.local.dirty&&s_result.local.position_pending);
     }
     if (s_result.job == WR_JOB_PREFETCH) {
-        s_reader.prefetched = s_result.error == ESP_OK ? (uint32_t)s_work.chapter : 0;
-        s_reader.prefetch_retry = s_reader.last_tick + 15000;
+        bool matching=false;
+        for(unsigned i=0;i<3;++i)if(book_weread_uid(s_reader.chapter+1+i)==s_work.chapter){
+            matching=true;
+            if(s_result.error==ESP_OK)s_reader.prefetch_mask|=1u<<i;
+            else if(s_result.error==WEREAD_ERR_STORAGE)s_reader.storage_blocked=true;
+            else if(s_result.error!=ESP_ERR_INVALID_STATE)++s_reader.prefetch_failures;
+        }
+        if(matching)s_reader.prefetch_retry=s_reader.last_tick+(s_result.error==ESP_OK?0:15000);
     }
 }
 static void join_job(void) { while (weread_runtime_busy()) pause_ms(1); }
@@ -462,13 +464,20 @@ void weread_runtime_cancel_join(void) {
     }
     atomic_store(&s_cancel, false); atomic_store(&s_deadline, 0);
 }
+void weread_runtime_cancel(void){
+    if(weread_runtime_busy()){atomic_store(&s_cancel,true);weread_client_abort_active();}
+}
 void weread_reader_input(bool cached_text_only){
-    if(cached_text_only&&weread_runtime_busy()&&s_work.job==WR_JOB_NOTE)return;
+    if(cached_text_only&&weread_runtime_busy()){
+        if(s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT&&s_work.job!=WR_JOB_CHAPTER)weread_runtime_cancel();
+        return;
+    }
     weread_runtime_cancel_join();
 }
 bool weread_runtime_start(weread_job_t job, const char *id, const char *value) {
     weread_runtime_init();
     if (weread_runtime_busy() || (id && *id && !wr_valid_id(id)) || (value && strlen(value) >= sizeof(s_work.value))) return false;
+    if((job==WR_JOB_OPEN||job==WR_JOB_LOCAL||job==WR_JOB_CLOUD)&&weread_reader_pending_save()&&weread_reader_save(now_ms())!=ESP_OK)return false;
     if (atomic_exchange(&s_done, false)) consume_reader_result();
     weread_runtime_result_free(&s_result);
     memset(&s_work, 0, sizeof(s_work)); s_work.job = job;
@@ -478,23 +487,14 @@ bool weread_runtime_start(weread_job_t job, const char *id, const char *value) {
         if (!id || strcmp(id, s_choice.id) || (!s_choice.progress.chapter_uid &&
             (job != WR_JOB_CLOUD || s_choice.progress.chapter_index || s_choice.progress.chapter_offset || s_choice.progress.progress))) return false;
     }
-    if (job == WR_JOB_NOTE) {
-        s_work.raw_position=s_reader.anchor;s_work.revision=s_reader.revision;
-        s_work.uid=s_reader.anchor?s_reader.anchor_uid:book_weread_uid(s_reader.nav_chapter);
-        s_work.index=s_reader.anchor?s_reader.anchor_index:book_weread_chapter_index(s_reader.nav_chapter);
-        s_work.chapter = s_reader.nav_chapter; s_work.offset = s_reader.anchor?s_reader.anchor_offset:s_reader.nav_offset;
-        s_work.percent = s_reader.anchor?s_reader.anchor_percent:s_reader.nav_percent;
-        s_work.pages = s_reader.pages; s_work.seconds = (uint32_t)(s_reader.active_ms / 1000);
-        s_work.now = s_reader.last_tick; s_work.force = value && *value == '1';
-        wr_copy(s_work.summary, sizeof(s_work.summary), s_reader.summary);
-    }
+    if(job==WR_JOB_NOTE||job==WR_JOB_REPORT)s_work.now=now_ms();
     if (job == WR_JOB_CHAPTER) {
         char *end=NULL; unsigned long uid=value?strtoul(value,&end,10):0;
         if (!uid || uid>UINT32_MAX || !end || *end) return false;
         s_work.chapter=(uint32_t)uid;
     }
     if (job == WR_JOB_PREFETCH) {
-        s_work.chapter = book_weread_uid(s_reader.chapter + 1);
+        s_work.chapter = book_weread_uid(s_reader.chapter + (value&&*value?(unsigned)strtoul(value,NULL,10):1));
         if (!s_work.chapter) return false;
     }
     atomic_store(&s_cancel, false);
@@ -550,12 +550,26 @@ void weread_runtime_stop(void) {
     weread_runtime_result_free(&s_result); atomic_store(&s_done, false);
 }
 void weread_runtime_media_lost(void) {
-    weread_runtime_stop(); memset(&s_reader, 0, sizeof(s_reader)); memset(&s_choice,0,sizeof(s_choice)); ++s_cache_epoch;
+    weread_runtime_stop();weread_progress_outbox_reset(); memset(&s_reader, 0, sizeof(s_reader)); memset(&s_choice,0,sizeof(s_choice)); ++s_cache_epoch;
     weread_shelf_clear();weread_auth_forget_session();
 }
 unsigned weread_runtime_cache_epoch(void){return s_cache_epoch;}
+bool weread_runtime_idle(uint64_t now){
+    if(weread_runtime_busy()||now<s_idle_at)return false;
+    if(s_reader.id[0]&&s_reader.save_failed&&(weread_reader_save(now)!=ESP_OK))return false;
+    if(s_owns_network&&s_network_active&&now>=s_network_active&&now-s_network_active>=60000)
+        return weread_runtime_start(WR_JOB_DISCONNECT,NULL,NULL);
+    s_idle_at=now+1000;
+    return weread_runtime_start(WR_JOB_REPORT,NULL,NULL);
+}
+bool weread_reader_cached(const char *uri,size_t chapter){
+    if(!book_path_is_weread(uri)||(weread_runtime_busy()&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT))return false;
+    uint32_t uid=book_weread_uid(chapter);
+    return uid&&weread_chapter_cached(uri+9,uid);
+}
 esp_err_t weread_reader_prepare(const char *uri,size_t chapter) {
     if (!book_path_is_weread(uri)) return ESP_ERR_INVALID_ARG;
+    if(weread_reader_cached(uri,chapter))return ESP_OK;
     uint32_t uid=book_weread_uid(chapter); if (!uid) return ESP_ERR_INVALID_ARG;
     weread_runtime_cancel_join();char value[16];snprintf(value,sizeof(value),"%u",(unsigned)uid);
     if (!weread_runtime_start(WR_JOB_CHAPTER,uri+9,value)) return ESP_ERR_INVALID_STATE;
@@ -572,21 +586,35 @@ bool weread_reader_open_ready(const char *uri){
     return book_path_is_weread(uri)&&s_choice.valid&&!strcmp(s_choice.id,uri+9)&&book_weread_prepared(uri+9);
 }
 void weread_reader_begin(const char *uri, uint64_t now) {
+    if(weread_reader_pending_save()&&weread_reader_save(now)!=ESP_OK)return;
     memset(&s_reader, 0, sizeof(s_reader));
     if (book_path_is_weread(uri)&&s_choice.resume_ready&&!strcmp(s_choice.id,uri+9)) {
+        WR_GUARD;
+        const weread_auth_session_t *session=weread_auth_get_current_session();
+        if(!session||!wr_copy(s_reader.owner_root,sizeof(s_reader.owner_root),weread_auth_get_storage_root())||
+            !wr_copy(s_reader.owner_vid,sizeof(s_reader.owner_vid),session->vid)||
+            !wr_copy(s_reader.owner_device,sizeof(s_reader.owner_device),session->device_id))return;
+        s_reader.owner_epoch=s_cache_epoch;(void)book_weread_cached_version(uri+9,&s_reader.owner_version);s_reader.nav_version=s_reader.owner_version;
         wr_copy(s_reader.id,sizeof(s_reader.id),uri+9);s_reader.last_tick=s_reader.last_store=now;
         s_reader.anchor_uid=s_choice.progress.chapter_uid;s_reader.anchor_index=s_choice.progress.chapter_index;
         s_reader.anchor_offset=s_choice.progress.chapter_offset;s_reader.anchor_percent=s_choice.progress.progress;
         wr_display_copy(s_reader.summary,sizeof(s_reader.summary),s_choice.progress.summary);
-        s_reader.retry=s_choice.progress.dirty&&s_choice.progress.position_pending;s_reader.anchor=true;s_choice.resume_ready=false;
+        s_reader.retry=s_choice.progress.dirty&&s_choice.progress.position_pending;s_reader.state=weread_progress_state(&s_choice.progress);s_reader.durable_revision=s_choice.progress.revision;s_reader.anchor=true;s_choice.resume_ready=false;
     }
 }
-void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary){
+void weread_reader_navigated_version(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary,uint32_t content_version){
     if(book_path_is_weread(uri)&&!strcmp(s_reader.id,uri+9)){
-        ++s_reader.revision;s_reader.anchor=false;s_reader.navigation_pending=true;
+        if(s_reader.nav_version!=content_version){
+            s_reader.prefetch_mask=s_reader.prefetch_failures=0;s_reader.prefetch_retry=0;s_reader.storage_blocked=false;
+        }
+        s_reader.nav_version=content_version;
+        ++s_reader.revision;s_reader.anchor=false;s_reader.pending_coordinate=false;s_reader.navigation_pending=true;
         s_reader.nav_chapter=chapter;s_reader.nav_offset=offset;s_reader.nav_percent=percent;
         wr_display_copy(s_reader.summary,sizeof(s_reader.summary),summary);
     }
+}
+void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary){
+    weread_reader_navigated_version(uri,chapter,offset,percent,summary,s_reader.owner_version);
 }
 esp_err_t weread_reader_resume(const char *uri, size_t *chapter, uint32_t *offset) {
     s_choice.resume_ready=false;
@@ -610,13 +638,55 @@ esp_err_t weread_reader_resume(const char *uri, size_t *chapter, uint32_t *offse
     ESP_LOGI("weread","resume uid=%u chapter=%u offset=%u result=%d",(unsigned)s_choice.progress.chapter_uid,(unsigned)i,(unsigned)*offset,(int)err);
     return err == ESP_ERR_NOT_FOUND ? ESP_ERR_INVALID_RESPONSE : err;
 }
-static bool checkpoint(uint64_t now, bool force) {
-    s_reader.last_tick = now;
-    if (!s_reader.seen || (!s_reader.changed&&!s_reader.retry&&s_reader.active_ms<1000) ||
-        !weread_runtime_start(WR_JOB_NOTE, s_reader.id, force ? "1" : "0")) return false;
-    s_reader.pages = 0; s_reader.active_ms %= 1000; s_reader.changed = s_reader.retry = false; s_reader.last_store = now;
-    return true;
+esp_err_t weread_reader_save(uint64_t now){
+    if(!s_reader.id[0])return ESP_OK;
+    if(s_reader.navigation_pending){++s_reader.pages;s_reader.changed=true;s_reader.navigation_pending=false;s_reader.seen=true;}
+    if(!s_reader.seen)return ESP_OK;
+    if(weread_runtime_busy()&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT)return ESP_ERR_NOT_FINISHED;
+    if(!s_reader.changed&&s_reader.active_ms<1000)return ESP_OK;
+    WR_GUARD;
+    const weread_auth_session_t *session=weread_auth_get_current_session();
+    if(!session||s_reader.owner_epoch!=s_cache_epoch||strcmp(s_reader.owner_root,weread_auth_get_storage_root())||
+        strcmp(s_reader.owner_vid,session->vid)||strcmp(s_reader.owner_device,session->device_id)){
+        s_reader.save_failed=true;s_reader.state=WR_PROGRESS_CONFLICT;return ESP_ERR_INVALID_STATE;
+    }
+    weread_progress_t sample={0};bool noted=false;
+    bool mapped=s_reader.anchor||s_reader.pending_coordinate;
+    sample.chapter_uid=mapped?s_reader.anchor_uid:book_weread_uid(s_reader.nav_chapter);
+    sample.chapter_index=mapped?s_reader.anchor_index:book_weread_chapter_index(s_reader.nav_chapter);
+    sample.chapter_offset=mapped?s_reader.anchor_offset:s_reader.nav_offset;
+    sample.progress=s_reader.anchor?s_reader.anchor_percent:s_reader.nav_percent;
+    sample.reading_time=(uint32_t)(s_reader.active_ms/1000);sample.pending_pages=s_reader.pages;
+    wr_display_copy(sample.summary,sizeof(sample.summary),s_reader.summary);
+    esp_err_t err=mapped?ESP_OK:book_weread_map_version(s_reader.nav_chapter,s_reader.nav_version,true,s_reader.nav_offset,&sample.chapter_offset);
+    if(err==ESP_OK&&!s_reader.anchor&&s_reader.nav_version!=s_reader.owner_version){
+        uint32_t proven=0;
+        err=book_weread_validate_prepared(s_reader.id,sample.chapter_uid,sample.chapter_index,sample.chapter_offset,&proven);
+        if(err==ESP_OK&&proven!=s_reader.nav_version)err=WEREAD_ERR_VERSION;
+    }
+    if(err==ESP_OK&&!s_reader.anchor){
+        s_reader.owner_version=s_reader.nav_version;
+        s_reader.pending_coordinate=true;s_reader.anchor_uid=sample.chapter_uid;s_reader.anchor_index=sample.chapter_index;
+        s_reader.anchor_offset=sample.chapter_offset;s_reader.anchor_percent=sample.progress;
+    }
+    if(err==ESP_OK)err=weread_progress_store_version(s_reader.id,&sample,!s_reader.anchor,s_reader.nav_version,(uint64_t)time(NULL),&noted);
+    if(noted){
+        s_reader.pages=0;s_reader.active_ms%=1000;s_reader.changed=false;s_reader.last_store=now;
+        s_reader.anchor_uid=sample.chapter_uid;s_reader.anchor_index=sample.chapter_index;
+        s_reader.anchor_offset=sample.chapter_offset;s_reader.anchor_percent=sample.progress;s_reader.anchor=true;
+        s_reader.state=weread_progress_state(&sample);s_reader.retry=sample.dirty&&sample.position_pending;
+        s_reader.durable_revision=sample.revision;s_reader.pending_coordinate=false;
+        if(!mapped||s_reader.nav_version!=s_reader.owner_version)s_reader.owner_version=s_reader.nav_version;
+    }
+    s_reader.save_failed=err!=ESP_OK;
+    return err;
 }
+weread_progress_state_t weread_reader_state(void){return s_reader.state;}
+bool weread_reader_save_failed(void){return s_reader.save_failed;}
+bool weread_reader_pending_save(void){return s_reader.changed||s_reader.navigation_pending||s_reader.save_failed;}
+unsigned weread_reader_offline(void){unsigned n=0;while(n<3&&(s_reader.prefetch_mask&(1u<<n)))++n;return n;}
+bool weread_reader_storage_blocked(void){return s_reader.storage_blocked;}
+bool weread_reader_caching(void){return weread_runtime_busy()&&s_work.job==WR_JOB_PREFETCH&&!strcmp(s_work.id,s_reader.id);}
 void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsigned percent,
     const char *summary, uint64_t now, bool active) {
     if (!book_path_is_weread(uri) || strcmp(s_reader.id, uri + 9)) return;
@@ -624,7 +694,7 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
     s_reader.last_tick = now;
     if (!s_reader.seen || chapter != s_reader.chapter || offset != s_reader.offset) {
         s_reader.last_move = now;
-        if (!s_reader.seen || chapter != s_reader.chapter) { s_reader.prefetched = 0; s_reader.prefetch_retry = 0; }
+        if (!s_reader.seen || chapter != s_reader.chapter) { s_reader.prefetched = 0; s_reader.prefetch_retry = 0;s_reader.prefetch_mask=s_reader.prefetch_failures=0;s_reader.storage_blocked=false; }
         s_reader.chapter = chapter; s_reader.offset = offset; s_reader.percent = percent;
         s_reader.seen = true;
     }
@@ -633,26 +703,35 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
     }
     (void)summary;
     weread_result_t result;
-    if (weread_runtime_poll(&result)) {
-        weread_runtime_result_free(&result);
-    }
+    // 冷章结果由页面准备状态机消费，采样不能提前吞掉错误。
+    // The page transition owns cold-chapter completion, including errors.
+    if (!weread_runtime_busy()&&s_result.job!=WR_JOB_CHAPTER&&weread_runtime_poll(&result))weread_runtime_result_free(&result);
     if (weread_runtime_busy() || !active) return;
-    if ((s_reader.changed && now - s_reader.last_store >= 1000) || s_reader.active_ms >= 60000 ||
-        (s_reader.retry && now - s_reader.last_store >= 15000)) { (void)checkpoint(now, false); return; }
-    uint32_t uid = book_weread_uid(chapter + 1);
-    if (uid && uid != s_reader.prefetched && now >= s_reader.prefetch_retry && now - s_reader.last_move >= 1000) {
-        (void)weread_runtime_start(WR_JOB_PREFETCH, s_reader.id, NULL);return;
+    if((s_reader.changed&&now-s_reader.last_store>=1000)||s_reader.active_ms>=60000){
+        (void)weread_reader_save(now);return;
     }
-    if(!s_reader.cover_warmed&&now-s_reader.last_move>=1000)
-        s_reader.cover_warmed=weread_runtime_start(WR_JOB_COVER,s_reader.id,"warm");
+    if(s_reader.retry&&now>=s_reader.report_at&&now-s_reader.last_move>=1000){
+        s_reader.report_at=now+15000;(void)weread_runtime_start(WR_JOB_NOTE,s_reader.id,NULL);return;
+    }
+    if(now-s_reader.last_move<1000)return;
+    if(!(s_reader.prefetch_mask&1u)&&book_weread_uid(chapter+1)&&!s_reader.storage_blocked&&
+        s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry){
+        (void)weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"1");return;
+    }
+    if(!s_reader.cover_warmed){s_reader.cover_warmed=weread_runtime_start(WR_JOB_COVER,s_reader.id,"warm");return;}
+    if(!s_reader.storage_blocked&&s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry)
+        for(unsigned i=1;i<3;++i)if(!(s_reader.prefetch_mask&(1u<<i))&&book_weread_uid(chapter+1+i)){
+            const char *distance=i==1?"2":"3";(void)weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,distance);return;
+        }
+    (void)weread_runtime_idle(now);
 }
 void weread_reader_flush(uint64_t now, bool stop) {
-    weread_runtime_cancel_join();
+    if(stop||!s_reader.id[0]||(weread_runtime_busy()&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT))weread_runtime_cancel_join();
     weread_result_t result;if(weread_runtime_poll(&result))weread_runtime_result_free(&result);
-    if (s_reader.id[0] && s_reader.seen && checkpoint(now, true)) join_job();
-    if (stop) weread_runtime_stop();
+    (void)weread_reader_save(now);
+    if(stop)weread_runtime_stop();
 }
 void weread_reader_end(uint64_t now) {
     if (s_reader.id[0]) weread_reader_flush(now, true);
-    memset(&s_reader, 0, sizeof(s_reader));
+    if(!s_reader.changed&&!s_reader.navigation_pending&&s_reader.active_ms<1000)memset(&s_reader,0,sizeof(s_reader));
 }

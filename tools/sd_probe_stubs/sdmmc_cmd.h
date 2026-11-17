@@ -8,7 +8,7 @@
 #include "driver/sdmmc_host.h"
 
 typedef struct {
-    struct { char name[8]; } cid;
+    struct { int mfg_id,oem_id;char name[8];int revision,serial,date; } cid;
     struct { uint32_t capacity, sector_size; } csd;
 } sdmmc_card_t;
 

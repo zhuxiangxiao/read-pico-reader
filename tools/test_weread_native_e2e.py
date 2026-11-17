@@ -17,6 +17,10 @@ from weread_mock_server import GLOBAL_STATE, ThreadedHTTPServer, WeReadMockReque
 class NativeHandler(WeReadMockRequestHandler):
     cookie_only=False
     chapter_two={}
+    chapter_one={}
+    def _record_and_check_security(self,body):
+        self.request_body=body
+        return super()._record_and_check_security(body)
     def do_GET(self):
         if self.path.startswith('/mock/cover-'):
             if not self._record_and_check_security(b''):return
@@ -34,17 +38,27 @@ class NativeHandler(WeReadMockRequestHandler):
             self.end_headers();self.wfile.write(data);return
         return super().do_GET()
     def _handle_chapter_download(self,query):
-        if query.get("chapters",[""])[0].split(",")[-1]=="2":
-            version=int(query.get("bookVersion",["0"])[0])
+        uid=query.get("chapters",[""])[0].split(",")[-1]
+        version=int(query.get("bookVersion",["0"])[0])
+        if query.get("bookId",[""])[0]=="test_book_101" and (uid=="2" or (uid=="1" and version!=100)):
             if version!=GLOBAL_STATE.book_version:
                 self._send_json(200,{"errcode":-2063});return
-            chapter=self.chapter_two[version]
+            chapter=(self.chapter_two if uid=="2" else self.chapter_one)[version]
             self.send_response(200)
             self.send_header("Content-Length",str(len(chapter)))
             self.send_header("encryptkey",encrypt_encrypt_key("test_password_123",str(GLOBAL_STATE.current_vid)))
             self.end_headers();self.wfile.write(chapter);return
         return super()._handle_chapter_download(query)
     def _send_json(self,status,data,extra_headers=None):
+        # A successful production report changes the simulated authoritative position.
+        # Failed/empty acknowledgements deliberately retain the old cloud position.
+        if self.path.startswith('/book/read') and status==200 and data.get('succ') in (1,True):
+            payload=json.loads(self.request_body)
+            assert not any(k in payload for k in ('sync','dirty','positionPending','pendingPages','lastReportMs','updateTime'))
+            bid=payload['bookId']
+            with GLOBAL_STATE.lock:
+                old=GLOBAL_STATE.progress_data.get(bid,{})
+                GLOBAL_STATE.progress_data[bid]={**old,**{k:payload[k] for k in ('chapterUid','chapterIdx','chapterOffset','progress','bookVersion') if k in payload}}
         if self.path.startswith('/shelf/syncbook') and status==200 and 'books' in data:
             positions=[]
             for b in data['books']:
@@ -97,6 +111,10 @@ def main():
         "info.txt":json.dumps({"bookId":"test_book_101","bookVersion":version,"chapters":[{"chapterUid":2,"files":["Text/second.xhtml"]}]}).encode(),
         "Text/second.xhtml":"<html><body><p>第二章😀预读成功</p></body></html>".encode(),
     },b"test_password_123") for version in (0,100,101)}
+    NativeHandler.chapter_one={version:fixture["_make_zipcrypto_zip"]({
+        "info.txt":json.dumps({"bookId":"test_book_101","bookVersion":version,"chapters":[{"chapterUid":1,"files":["Text/first.xhtml"]}]}).encode(),
+        "Text/first.xhtml":"<html><body><p>跨章缓存测试</p></body></html>".encode(),
+    },b"test_password_123") for version in (0,101)}
     GLOBAL_STATE.reset()
     server = ThreadedHTTPServer(("127.0.0.1", 0), NativeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

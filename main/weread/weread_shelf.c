@@ -21,8 +21,10 @@
 
 static cJSON *s_shelf;
 static uint64_t s_checked_at,s_checked_key;
+static size_t id_slot(const char **seen,const char *id);
 
 static cJSON *books(cJSON *s) { return cJSON_GetObjectItemCaseSensitive(s, "books"); }
+static cJSON *detail_queue(cJSON *s) { return cJSON_GetObjectItemCaseSensitive(s,"detailPending"); }
 static const char *item_id(const cJSON *v) {
     return cJSON_IsString(v) ? v->valuestring : wr_string(v, "bookId");
 }
@@ -71,7 +73,7 @@ static esp_err_t merge_progress(cJSON *array, const cJSON *r) {
     cJSON *v;
     cJSON_ArrayForEach(v, cJSON_GetObjectItemCaseSensitive(r, "bookProgress")) {
         const char *id = item_id(v);
-        if (!wr_valid_id(id)) return ESP_ERR_INVALID_RESPONSE;
+        if (!cJSON_IsObject(v)||!wr_valid_id(id)) return ESP_ERR_INVALID_RESPONSE;
         cJSON *b = find(array, id);
         if (!b) continue;
         if (!wr_set_copy(b, "readingProgress", v)) return ESP_ERR_NO_MEM;
@@ -114,6 +116,56 @@ static esp_err_t validate_books(cJSON *array){
         for(i=1;i<count;++i)if(!compare_id(&items[i-1],&items[i])){err=ESP_ERR_INVALID_RESPONSE;break;}}
     free(items);return err;
 }
+static esp_err_t validate_detail_queue(cJSON *s){
+    cJSON *pending=detail_queue(s);if(!pending)return ESP_OK;
+    if(!cJSON_IsArray(pending)||cJSON_GetArraySize(pending)>WEREAD_SHELF_LIMIT||
+       (!!pending->child!=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s,"syncPending"))))return ESP_ERR_INVALID_RESPONSE;
+    if(!pending->child)return ESP_OK;
+    const char **seen=wr_alloc(2048*sizeof(*seen));if(!seen)return ESP_ERR_NO_MEM;
+    esp_err_t err=ESP_OK;size_t unique=0;cJSON *entry;
+    cJSON_ArrayForEach(entry,pending){
+        const char *id=item_id(entry);cJSON *progress=cJSON_GetObjectItemCaseSensitive(entry,"readingProgress");
+        if(!wr_valid_id(id)||(!cJSON_IsString(entry)&&!cJSON_IsObject(entry))||
+           (progress&&(!cJSON_IsObject(progress)||!item_id(progress)||strcmp(item_id(progress),id)))){err=ESP_ERR_INVALID_RESPONSE;break;}
+        size_t slot=id_slot(seen,id);if(seen[slot]){err=ESP_ERR_INVALID_RESPONSE;break;}
+        seen[slot]=id;++unique;
+    }
+    if(err==ESP_OK)cJSON_ArrayForEach(entry,books(s)){
+        const char *id=item_id(entry);size_t slot=id_slot(seen,id);
+        if(!seen[slot]){seen[slot]=id;if(++unique>WEREAD_SHELF_LIMIT){err=ESP_ERR_INVALID_SIZE;break;}}
+    }
+    free(seen);return err;
+}
+static esp_err_t pending_progress(cJSON *s,const cJSON *response){
+    cJSON *entry,*pending=detail_queue(s),*array=books(s);
+    cJSON_ArrayForEach(entry,cJSON_GetObjectItemCaseSensitive(response,"bookProgress")){
+        const char *id=item_id(entry);if(!wr_valid_id(id))return ESP_ERR_INVALID_RESPONSE;
+        cJSON *node=find(pending,id);if(!node||find(array,id))continue;
+        if(cJSON_IsString(node)){
+            cJSON *replacement=cJSON_CreateObject();
+            if(!replacement||!cJSON_AddStringToObject(replacement,"bookId",id)||!wr_set_copy(replacement,"readingProgress",entry)){
+                cJSON_Delete(replacement);return ESP_ERR_NO_MEM;
+            }
+            cJSON_ReplaceItemViaPointer(pending,node,replacement);
+        }else if(!wr_set_copy(node,"readingProgress",entry))return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+static esp_err_t resolve_pending(cJSON *s,const cJSON *response){
+    cJSON *entry,*pending=detail_queue(s),*array=books(s);
+    cJSON_ArrayForEach(entry,books((cJSON *)response)){
+        const char *id=item_id(entry);cJSON *node=find(pending,id),*cached=find(array,id);
+        const cJSON *progress=cJSON_GetObjectItemCaseSensitive(node,"readingProgress");
+        if(cached&&progress&&!cJSON_IsObject(cJSON_GetObjectItemCaseSensitive(entry,"readingProgress"))&&
+           !find(cJSON_GetObjectItemCaseSensitive(response,"bookProgress"),id)){
+            if(!wr_set_copy(cached,"readingProgress",progress))return ESP_ERR_NO_MEM;
+            cJSON *stamp=cJSON_GetObjectItemCaseSensitive(progress,"updateTime");
+            if(stamp&&!cJSON_GetObjectItemCaseSensitive(entry,"readUpdateTime")&&!wr_set_copy(cached,"readUpdateTime",stamp))return ESP_ERR_NO_MEM;
+        }
+        remove_id(pending,id);
+    }
+    return ESP_OK;
+}
 static esp_err_t sort_shelf(cJSON *s) {
     cJSON *array = books(s);
     size_t n = (size_t)cJSON_GetArraySize(array);
@@ -146,7 +198,7 @@ bool weread_shelf_cache_fresh(uint64_t now){WR_GUARD;
     if(now>INT64_MAX||!wr_owner_matches(s_shelf))return false;
     if(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s_shelf,"syncPending"))){
         uint64_t retry=number(s_shelf,"syncRetryAt");
-        return number(s_shelf,"syncTarget")&&retry>now&&retry-now<=300;
+        return (detail_queue(s_shelf)?weread_shelf_synckey():number(s_shelf,"syncTarget"))&&retry>now&&retry-now<=300;
     }
     uint64_t checked=number(s_shelf,"checkedAt");
     if(checked>now)checked=0;
@@ -280,6 +332,7 @@ esp_err_t weread_shelf_load(void) { WR_GUARD;
     if (err == ESP_OK && (!wr_owner_matches(s) || !cJSON_IsArray(array) ||
         !wr_uint(s, "synckey", NULL) || (pending&&!cJSON_IsBool(pending)) || cJSON_GetArraySize(array) > WEREAD_SHELF_LIMIT)) err = ESP_ERR_INVALID_RESPONSE;
     if(err==ESP_OK)err=validate_books(array);
+    if(err==ESP_OK)err=validate_detail_queue(s);
     if (err == ESP_OK) err = sort_shelf(s);
     if (err == ESP_OK) { weread_shelf_clear(); s_shelf = s;load_checked(); }
     else cJSON_Delete(s);
@@ -307,12 +360,18 @@ static size_t id_slot(const char **seen,const char *id){
     size_t slot=hash&2047u;while(seen[slot]&&strcmp(seen[slot],id))slot=(slot+1)&2047u;
     return slot;
 }
+static bool native_removed(const cJSON *response,const char *id){
+    return find(cJSON_GetObjectItemCaseSensitive(response,"removed"),id)||find(cJSON_GetObjectItemCaseSensitive(response,"lectureBooks"),id);
+}
+static bool native_readable(const cJSON *response,const cJSON *entry){
+    const char *id=item_id(entry);const cJSON *detail=find(books((cJSON *)response),id);
+    return !number(entry,"type")&&!native_removed(response,id)&&(!detail||readable(detail));
+}
 static esp_err_t sync_begin(bool full){
     weread_shelf_sync_discard();s_sync_done=s_sync_total=s_sync_skipped=0;
     if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
-    bool forced=full;
-    // key0仍核对完整成员集合；已提交批次按账号与本次目标key续用。/ Check full membership for key0; resume committed details only for the same owner and target key.
-    if(!weread_shelf_synckey())full=true;
+    bool forced=full,legacy=wr_owner_matches(s_shelf)&&!detail_queue(s_shelf)&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s_shelf,"syncPending"));
+    if(!weread_shelf_synckey()||(legacy&&(!number(s_shelf,"syncTarget")||number(s_shelf,"syncTarget")==weread_shelf_synckey())))full=true;
     s_sync.base_key=full?0:weread_shelf_synckey();
     char endpoint[160];snprintf(endpoint,sizeof(endpoint),"/shelf/sync?synckey=%" PRIu64 "&onlyBookid=1%s",s_sync.base_key,full?"&lectureSynckey=0":"");
     esp_err_t err=wr_request_json(endpoint,NULL,&s_sync.response);
@@ -327,104 +386,133 @@ static esp_err_t sync_begin(bool full){
         if(change&&change->child)unchanged=false;
     }
     if(err==ESP_OK&&unchanged){err=save_checked(s_sync.key);weread_shelf_sync_discard();return err;}
-    if(!has_books&&err==ESP_OK)err=ESP_ERR_INVALID_RESPONSE;
+    if(!has_books&&err==ESP_OK&&(full||(!(detail_queue(s_shelf)&&s_sync.base_key==s_sync.key)&&!cJSON_HasObjectItem(r,"bookProgress")&&!cJSON_HasObjectItem(r,"removed")&&!cJSON_HasObjectItem(r,"lectureBooks"))))err=ESP_ERR_INVALID_RESPONSE;
     if(err!=ESP_OK)return err;
-    bool resume=!forced&&s_sync.key&&wr_owner_matches(s_shelf)&&number(s_shelf,"syncTarget")==s_sync.key&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s_shelf,"syncPending"));
+    bool resume=!forced&&legacy&&s_sync.key&&number(s_shelf,"syncTarget")==s_sync.key;
     s_sync.next=wr_owner_matches(s_shelf)?cJSON_Duplicate(s_shelf,true):cJSON_CreateObject();
     if(!s_sync.next)return ESP_ERR_NO_MEM;
     if(!books(s_sync.next)&&!cJSON_AddArrayToObject(s_sync.next,"books"))return ESP_ERR_NO_MEM;
-    cJSON *array=books(s_sync.next);
-    s_sync.pending=cJSON_CreateArray();if(!s_sync.pending)err=ESP_ERR_NO_MEM;
-    // 临时索引只用于查重，pending仍按服务端顺序构造。/ A temporary dedup index preserves server order in pending.
-    enum { ID_SLOTS=2048 };
-    const char **seen=NULL;size_t unique=0;
-    if(err==ESP_OK&&cJSON_GetObjectItemCaseSensitive(r,"bookIds")&&cJSON_GetObjectItemCaseSensitive(r,"bookIds")->child){
-        seen=wr_alloc(ID_SLOTS*sizeof(*seen));if(!seen)err=ESP_ERR_NO_MEM;
+    if(!detail_queue(s_sync.next)&&!cJSON_AddArrayToObject(s_sync.next,"detailPending"))return ESP_ERR_NO_MEM;
+    cJSON *array=books(s_sync.next),*pending=detail_queue(s_sync.next);
+    const char *removals[]={"lectureBooks","removed"};
+    for(unsigned k=0;k<2&&err==ESP_OK;++k)cJSON_ArrayForEach(v,cJSON_GetObjectItemCaseSensitive(r,removals[k])){
+        const char *id=item_id(v);if(!wr_valid_id(id)){err=ESP_ERR_INVALID_RESPONSE;break;}remove_id(array,id);remove_id(pending,id);
     }
     if(err==ESP_OK)cJSON_ArrayForEach(v,cJSON_GetObjectItemCaseSensitive(r,"bookIds")){
         const char *id=item_id(v);if(!wr_valid_id(id)){err=ESP_ERR_INVALID_RESPONSE;break;}
-        if(number(v,"type")!=0||find(cJSON_GetObjectItemCaseSensitive(r,"lectureBooks"),id)){remove_id(array,id);continue;}
-        size_t slot=id_slot(seen,id);
-        if(!seen[slot]){
-            if(unique++==WEREAD_SHELF_LIMIT){err=ESP_ERR_INVALID_SIZE;break;}
-            seen[slot]=id;
-            if(resume&&number(find(array,id),"syncBatch")==s_sync.key){++s_sync.reused;continue;}
-            cJSON *value=cJSON_CreateString(id);
-            if(!value||!cJSON_AddItemToArray(s_sync.pending,value)){cJSON_Delete(value);err=ESP_ERR_NO_MEM;break;}
-            ++s_sync.count;
-        }
+        if(!native_readable(r,v)){remove_id(array,id);remove_id(pending,id);}
+    }
+    if(err==ESP_OK)cJSON_ArrayForEach(v,books(r)){
+        const char *id=item_id(v);if(!cJSON_IsObject(v)||!wr_valid_id(id)){err=ESP_ERR_INVALID_RESPONSE;break;}
+        if(!readable(v)||native_removed(r,id)){remove_id(array,id);remove_id(pending,id);}
+    }
+    // 第一半索引去重持久队列，第二半是本次完整成员集合；均为临时PSRAM。
+    // Temporary PSRAM indexes separately track queued IDs and native membership.
+    bool has_members=cJSON_GetArraySize(cJSON_GetObjectItemCaseSensitive(r,"bookIds"))||cJSON_GetArraySize(books(r));
+    const char **indices=err==ESP_OK&&has_members?wr_alloc(4096*sizeof(*indices)):NULL;
+    if(err==ESP_OK&&has_members&&!indices)err=ESP_ERR_NO_MEM;
+    const char **queued=indices,**members=indices?indices+2048:NULL;size_t membership=0;
+    const char *sets[]={"bookIds","books"};
+    for(unsigned k=0;k<2&&err==ESP_OK;++k)cJSON_ArrayForEach(v,cJSON_GetObjectItemCaseSensitive(r,sets[k])){
+        if(k?(!readable(v)||native_removed(r,item_id(v))):!native_readable(r,v))continue;
+        const char *id=item_id(v);size_t slot=id_slot(members,id);
+        if(!members[slot]){if(membership++==WEREAD_SHELF_LIMIT){err=ESP_ERR_INVALID_SIZE;break;}members[slot]=id;}
     }
     if(full&&err==ESP_OK){
-        cJSON *entry=array->child;
-        while(entry){cJSON *next=entry->next;const char *id=item_id(entry);
-            if((!seen||!seen[id_slot(seen,id)])&&!find(books(r),id))cJSON_Delete(cJSON_DetachItemViaPointer(array,entry));
-            entry=next;
+        cJSON *arrays[]={array,pending};
+        for(unsigned k=0;k<2;++k){cJSON *entry=arrays[k]->child;
+            while(entry){cJSON *next=entry->next;const char *id=item_id(entry);
+                if(!members||!members[id_slot(members,id)])cJSON_Delete(cJSON_DetachItemViaPointer(arrays[k],entry));entry=next;
+            }
         }
     }
-    free(seen);
-    if(err==ESP_OK)err=merge_response(array,r);
-    s_sync_total=unique;s_sync_done=s_sync.reused;s_sync.at=s_sync.pending?s_sync.pending->child:NULL;
+    size_t queued_count=(size_t)cJSON_GetArraySize(pending);
+    if(err==ESP_OK&&queued)cJSON_ArrayForEach(v,pending){const char *id=item_id(v);queued[id_slot(queued,id)]=id;}
+    if(err==ESP_OK)cJSON_ArrayForEach(v,cJSON_GetObjectItemCaseSensitive(r,"bookIds")){
+        if(!native_readable(r,v))continue;
+        const char *id=item_id(v);size_t slot=id_slot(queued,id);
+        if(queued[slot]||(resume&&number(find(array,id),"syncBatch")==s_sync.key))continue;
+        if(queued_count++==WEREAD_SHELF_LIMIT){err=ESP_ERR_INVALID_SIZE;break;}
+        cJSON *value=cJSON_CreateString(id);
+        if(!value||!cJSON_AddItemToArray(pending,value)){cJSON_Delete(value);err=ESP_ERR_NO_MEM;break;}
+        queued[slot]=value->valuestring;
+    }
+    free(indices);
+    if(err==ESP_OK)cJSON_ArrayForEach(v,books(r)){
+        if(native_removed(r,item_id(v)))continue;
+        err=merge_book(array,v);if(err!=ESP_OK)break;
+    }
+    if(err==ESP_OK)err=merge_progress(array,r);
+    if(err==ESP_OK)err=resolve_pending(s_sync.next,r);
+    if(err==ESP_OK)err=pending_progress(s_sync.next,r);
+    s_sync.pending=cJSON_CreateArray();if(!s_sync.pending)err=ESP_ERR_NO_MEM;
+    if(err==ESP_OK)cJSON_ArrayForEach(v,pending){
+        cJSON *value=cJSON_CreateString(item_id(v));
+        if(!value||!cJSON_AddItemToArray(s_sync.pending,value)){cJSON_Delete(value);err=ESP_ERR_NO_MEM;break;}
+        ++s_sync.count;
+    }
+    s_sync_total=s_sync.count;s_sync.at=s_sync.pending?s_sync.pending->child:NULL;
     return err;
 }
 static esp_err_t sync_advance(size_t batch_limit,bool publish){
     if(!s_sync.next)s_sync.next=cJSON_Duplicate(s_shelf,true);
     if(!s_sync.next)return ESP_ERR_NO_MEM;
-    cJSON *array=books(s_sync.next),*detail=NULL,*req=NULL;
-    esp_err_t err=ESP_OK;size_t end=s_sync.cursor+batch_limit;if(end>s_sync.count)end=s_sync.count;
+    cJSON *array=books(s_sync.next),*pending=detail_queue(s_sync.next),*detail=NULL,*req=NULL;
+    esp_err_t err=ESP_OK;size_t end=s_sync.cursor;
     cJSON *next=s_sync.at;
-    if(s_sync.cursor<end){
-        req=cJSON_CreateObject();cJSON *batch=cJSON_AddArrayToObject(req,"bookIds");
+    if(next){
+        req=cJSON_CreateObject();cJSON *batch=cJSON_AddArrayToObject(req,"bookIds");size_t requested=0;
         if(!req||!batch||!cJSON_AddArrayToObject(req,"albumIds"))err=ESP_ERR_NO_MEM;
-        for(size_t j=s_sync.cursor;j<end&&err==ESP_OK;++j){
-            if(!next||!cJSON_AddItemReferenceToArray(batch,next))err=ESP_ERR_NO_MEM;
-            else next=next->next;
+        while(next&&requested<batch_limit&&err==ESP_OK){
+            cJSON *item=next;next=next->next;++end;
+            if(!find(pending,item_id(item)))continue;
+            if(!cJSON_AddItemReferenceToArray(batch,item))err=ESP_ERR_NO_MEM;
+            else ++requested;
         }
-        if(err==ESP_OK)err=wr_request_json("/shelf/syncbook",req,&detail);
-        if(err==ESP_OK&&!cJSON_IsArray(books(detail)))err=ESP_ERR_INVALID_RESPONSE;
-        if(err==ESP_OK)err=merge_response(array,detail);
+        if(err==ESP_OK&&requested)err=wr_request_json("/shelf/syncbook",req,&detail);
+        if(err==ESP_OK&&requested&&!cJSON_IsArray(books(detail)))err=ESP_ERR_INVALID_RESPONSE;
+        if(err==ESP_OK&&requested)err=merge_response(array,detail);
+        if(err==ESP_OK&&requested)err=resolve_pending(s_sync.next,detail);
         cJSON *entry;
         cJSON_ArrayForEach(entry,batch){
             if(err!=ESP_OK)break;
-            const char *id=item_id(entry);
-            // 旧缓存不能代替本轮详情；明确不可读的详情已由merge_book移除。/ Old cache is not this batch's detail; merge_book already removes explicit unsupported formats.
-            if(!find(books(detail),id)){
-                if(publish)++s_sync.skipped;else err=ESP_ERR_INVALID_RESPONSE;
-            }else{
-                cJSON *cached=find(array,id);
-                if(cached&&!wr_set_copy(cached,"syncBatch",cJSON_GetObjectItemCaseSensitive(s_sync.response,"synckey")))err=ESP_ERR_NO_MEM;
-            }
+            if(!find(books(detail),item_id(entry))){if(publish)++s_sync.skipped;else err=ESP_ERR_INVALID_RESPONSE;}
         }
     }
     cJSON_Delete(req);cJSON_Delete(detail);
-    if(err==ESP_OK)err=merge_progress(array,s_sync.response);
     const char *remove_keys[]={"lectureBooks","removed"};
     for(unsigned k=0;k<2&&err==ESP_OK;++k){cJSON *v;
         cJSON_ArrayForEach(v,cJSON_GetObjectItemCaseSensitive(s_sync.response,remove_keys[k])){
-            const char *id=item_id(v);if(!wr_valid_id(id)){err=ESP_ERR_INVALID_RESPONSE;break;}remove_id(array,id);
+            const char *id=item_id(v);if(!wr_valid_id(id)){err=ESP_ERR_INVALID_RESPONSE;break;}remove_id(array,id);remove_id(pending,id);
         }
     }
     if(err==ESP_OK){
-        bool pending=end!=s_sync.count||s_sync.skipped;
+        size_t unresolved=(size_t)cJSON_GetArraySize(pending);
+        if(!unresolved){end=s_sync.count;next=NULL;}
+        if(end==s_sync.count)s_sync.skipped=unresolved;
         cJSON_DeleteItemFromObject(s_sync.next,"syncPending");
         cJSON_DeleteItemFromObject(s_sync.next,"syncTarget");
         cJSON_DeleteItemFromObject(s_sync.next,"syncRetryAt");
-        if(pending&&(!cJSON_AddBoolToObject(s_sync.next,"syncPending",true)||!wr_set_copy(s_sync.next,"syncTarget",cJSON_GetObjectItemCaseSensitive(s_sync.response,"synckey"))))err=ESP_ERR_NO_MEM;
-        if(!pending){cJSON *cached;cJSON_ArrayForEach(cached,array)cJSON_DeleteItemFromObject(cached,"syncBatch");}
+        if(unresolved&&!cJSON_AddBoolToObject(s_sync.next,"syncPending",true))err=ESP_ERR_NO_MEM;
+        cJSON *cached;cJSON_ArrayForEach(cached,array)cJSON_DeleteItemFromObject(cached,"syncBatch");
+        // 成员变化、进度和完整待补队列同事务提交后，原生游标不再被单本缺详情拖住。
+        // Native membership/progress and the complete unresolved queue commit together, independently of missing details.
         cJSON_DeleteItemFromObject(s_sync.next,"synckey");
-        if(!cJSON_AddNumberToObject(s_sync.next,"synckey",(double)(end==s_sync.count&&!s_sync.skipped?s_sync.key:s_sync.base_key))||!wr_set_owner(s_sync.next))err=ESP_ERR_NO_MEM;
+        if(!cJSON_AddNumberToObject(s_sync.next,"synckey",(double)s_sync.key)||!wr_set_owner(s_sync.next))err=ESP_ERR_NO_MEM;
         time_t now=time(NULL);
-        if(err==ESP_OK&&end==s_sync.count&&s_sync.skipped&&now>=1700000000&&!cJSON_AddNumberToObject(s_sync.next,"syncRetryAt",(double)now+300))err=ESP_ERR_NO_MEM;
-        if(err==ESP_OK&&end==s_sync.count&&!s_sync.skipped&&now>=1700000000){
+        if(err==ESP_OK&&end==s_sync.count&&unresolved&&now>=1700000000&&!cJSON_AddNumberToObject(s_sync.next,"syncRetryAt",(double)now+300))err=ESP_ERR_NO_MEM;
+        if(err==ESP_OK&&end==s_sync.count&&!unresolved&&now>=1700000000){
             cJSON_DeleteItemFromObject(s_sync.next,"checkedAt");
             if(!cJSON_AddNumberToObject(s_sync.next,"checkedAt",(double)now))err=ESP_ERR_NO_MEM;
         }
     }
+    if(err==ESP_OK)err=validate_detail_queue(s_sync.next);
     if(err==ESP_OK)err=sort_shelf(s_sync.next);
     if(err==ESP_OK&&(publish||end==s_sync.count)){
         err=persist(s_sync.next);
         if(err==ESP_OK){cJSON_Delete(s_shelf);s_shelf=s_sync.next;s_sync.next=NULL;s_checked_at=s_checked_key=0;}
     }
-    if(err==ESP_OK){s_sync.cursor=end;s_sync.at=next;s_sync_done=s_sync.reused+end;s_sync_skipped=s_sync.skipped;}
+    if(err==ESP_OK){s_sync.cursor=end;s_sync.at=next;s_sync_done=end;s_sync_skipped=s_sync.skipped;}
     if(err!=ESP_OK||end==s_sync.count)weread_shelf_sync_discard();
     return err;
 }
@@ -450,6 +538,10 @@ esp_err_t weread_shelf_refresh_book(const char *id){WR_GUARD;
     if(err==ESP_OK&&!find(books(response),id))err=ESP_ERR_INVALID_RESPONSE;
     if(err==ESP_OK){next=cJSON_Duplicate(s_shelf,true);if(!next)err=ESP_ERR_NO_MEM;}
     if(err==ESP_OK)err=merge_response(books(next),response);
+    if(err==ESP_OK)err=resolve_pending(next,response);
+    if(err==ESP_OK&&detail_queue(next)&&!detail_queue(next)->child){
+        cJSON_DeleteItemFromObject(next,"syncPending");cJSON_DeleteItemFromObject(next,"syncRetryAt");
+    }
     cJSON_Delete(req);cJSON_Delete(response);
     if(err==ESP_OK)err=persist(next);
     if(err==ESP_OK){cJSON_Delete(s_shelf);s_shelf=next;next=NULL;}

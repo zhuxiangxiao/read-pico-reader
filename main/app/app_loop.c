@@ -968,7 +968,8 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
 // Save the current page first, then settle a clock-free static frame so shutdown never leaves a misleading frozen time.
 // 锁屏前先由页面保存进度，再持久化一次恢复上下文；不在翻页或点击时写入。
 // Flush page progress before persisting one lock checkpoint; never write it on page turns or taps.
-static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
+static bool prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
+    if(app_index_of(current)==1&&!app_book_prepare_leave(ctx)){app_present(ctx,current,APP_REDRAW_PAGE);return false;}
 #if KIIKO_BOARD_METALIO47
     const int64_t started_at = esp_timer_get_time();
 #endif
@@ -989,9 +990,10 @@ static void prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedbac
 #else
     (void)pico_boot_save_resume(&resume);
 #endif
+    return true;
 }
 static void run_power_action(app_ctx_t *ctx, const app_desc_t *current, bool restart) {
-    prepare_lock(ctx, current, false);
+    if(!prepare_lock(ctx,current,false))return;
     ui_power_final_draw(ctx->fb, restart);
     guard_draw_result(ctx->hl, update_display_full(ctx->hl));
     app_lock_wait_key_idle(800);
@@ -1413,7 +1415,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         power_dialog_open = false;
                         ui_power_dialog_end();
                         ui_power_dialog_reset(&power_dialog, false);
-                        prepare_lock(&ctx, current, true);
+                        if(!prepare_lock(&ctx,current,true)){last_input_ms=ctx.now_ms;continue;}
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
@@ -1621,7 +1623,7 @@ void app_loop_run(const app_loop_config_t* config) {
                     bool reader_power_lock = !menu_open && current == &app_book &&
                         app_book_reader_body_visible() && app_settings_reader_power_turn();
                     if (reader_power_lock) {
-                        prepare_lock(&ctx, current, true);
+                        if(!prepare_lock(&ctx,current,true)){last_input_ms=ctx.now_ms;continue;}
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp, true);
                         (void)ble_pt_take_standby();
@@ -1669,7 +1671,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         present_page(&ctx, current, &gesture, power_redraw);
                         ctx.consumed = true;
                     } else {
-                        prepare_lock(&ctx, current, true);
+                        if(!prepare_lock(&ctx,current,true)){last_input_ms=ctx.now_ms;continue;}
                         extern const app_desc_t app_book;
                         main_lock_boundary();
                         enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
@@ -1844,7 +1846,7 @@ void app_loop_run(const app_loop_config_t* config) {
             cancel_gesture(&ctx, current, &gesture);
             if (menu_pressed >= 0) menu_feedback(&ctx, current, menu_leaf, menu_pressed, false, &feedback);
             menu_pressed = UI_MENU_HIT_NONE;
-            prepare_lock(&ctx, current, remote_lock);
+            if(!prepare_lock(&ctx,current,remote_lock)){last_input_ms=ctx.now_ms;continue;}
             extern const app_desc_t app_book;
             main_lock_boundary();
             enter_lock_and_sleep(ctx.hl, &s_lock_ignore_until_ms, ctx.acc, ctx.tp,
@@ -1892,6 +1894,10 @@ void app_loop_run(const app_loop_config_t* config) {
         // 只有完成/跳过已成功持久化，才允许引导请求主页；防止按键/菜单捷径绕过。
         // Only a successfully persisted Finish/Skip may leave setup for the Home page.
         setup_navigation_guard(&ctx,current);
+        if((ctx.request_return||ctx.request_app||ctx.request_menu)&&app_index_of(current)==1&&!app_book_prepare_leave(&ctx)){
+            ctx.request_return=ctx.request_menu=false;ctx.request_app=NULL;ctx.consumed=true;
+            app_present(&ctx,current,APP_REDRAW_PAGE);
+        }
         if (!power_dialog_open && (ctx.request_return || ctx.request_app || ctx.request_menu)) {
             if (!ui_click_feedback_nav_pending() && ui_click_feedback_release(ctx.fb, &click_area))
                 click_present(&ctx, current, click_area);

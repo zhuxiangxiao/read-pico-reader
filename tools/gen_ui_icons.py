@@ -620,6 +620,8 @@ def main() -> None:
             raise SystemExit('missing vendored sources: ' + ', '.join(missing))
         masks = {name: pack_4bpp(render_icon(name)) for name in ICONS}
         emit_header(masks)
+        from pack_ui_icons import generate as pack_generated_icons
+        pack_generated_icons(board)
         emit_preview(masks)
         print(f"{HEADER.relative_to(ROOT)}: {len(masks)} icons, "
               f"{len(masks) * len(next(iter(masks.values())))} bytes of mask data")

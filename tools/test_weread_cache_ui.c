@@ -36,7 +36,9 @@ static weread_result_t mock_result;
 static struct{weread_job_t job;char id[64],value[600];} starts[256];
 static int nstarts,nsync;
 static weread_auth_session_t mock_session={.vid="123"};
-const weread_auth_session_t *weread_auth_get_current_session(void){return &mock_session;}
+static bool mock_authenticated=true;
+const weread_auth_session_t *weread_auth_get_current_session(void){return mock_authenticated?&mock_session:NULL;}
+bool weread_auth_is_authenticated(void){return mock_authenticated;}
 static void wr_display_copy(char *out,size_t cap,const char*value){snprintf(out,cap,"%s",value?value:"");}
 static bool wr_copy(char *out,size_t cap,const char *in){if(!in||strlen(in)>=cap)return false;memcpy(out,in,strlen(in)+1);return true;}
 static void *wr_alloc(size_t n){if(fail_alloc)return NULL;return calloc(n,1);}
@@ -109,8 +111,11 @@ bool weread_runtime_start(weread_job_t job,const char*id,const char*value){
     starts[nstarts].job=job;snprintf(starts[nstarts].id,64,"%s",id?id:"");snprintf(starts[nstarts].value,600,"%s",value?value:"");nstarts++;if(job==WR_JOB_SYNC)nsync++;mock_busy=true;return true;
 }
 bool weread_runtime_busy(void){return mock_busy;}
+bool weread_runtime_idle(uint64_t now){(void)now;return false;}
+weread_progress_state_t weread_progress_state(const weread_progress_t*p){return p->sync_conflict?WR_PROGRESS_CONFLICT:p->position_pending?WR_PROGRESS_PENDING:p->last_report_ms?WR_PROGRESS_SYNCED:WR_PROGRESS_LOCAL;}
 bool weread_runtime_poll(weread_result_t*out){if(!mock_ready)return false;*out=mock_result;memset(&mock_result,0,sizeof(mock_result));mock_ready=false;return true;}
 void weread_runtime_result_free(weread_result_t*r){free(r->books);free(r->cover);memset(r,0,sizeof(*r));}
+void weread_runtime_cancel(void){}
 void weread_runtime_cancel_join(void){mock_busy=false;}
 void weread_runtime_stop(void){mock_busy=false;if(mock_ready)weread_runtime_result_free(&mock_result);mock_ready=false;}
 void weread_runtime_media_lost(void){weread_runtime_stop();mock_epoch++;}
@@ -120,11 +125,11 @@ bool weread_shelf_sync_pending(void){return mock_pending;}
 bool weread_runtime_choose(const char*id,const weread_progress_t*p,bool cloud){return true;}
 #include "cover.inc"
 #include "production.inc"
-static void complete(weread_result_t r){assert(mock_busy&&!mock_ready);mock_result=r;mock_busy=false;mock_ready=true;}
+static void complete(weread_result_t r){assert(mock_busy&&!mock_ready);mock_authenticated=r.authenticated;mock_result=r;mock_busy=false;mock_ready=true;}
 static weread_shelf_item_t *books(int n,bool reverse){weread_shelf_item_t*b=calloc((size_t)n,sizeof(*b));assert(b);for(int i=0;i<n;i++){int j=reverse?n-i-1:i;snprintf(b[i].book_id,sizeof(b[i].book_id),"id_%d",j);snprintf(b[i].title,sizeof(b[i].title),"Book %d",j);char url[80];snprintf(url,sizeof(url),"https://cdn.qq.com/s_%d.jpg",j);b[i].read_update_time=(uint64_t)(n-i);b[i].has_cover=true;b[i].cover_key=weread_cover_key(b[i].book_id,url);}return b;}
 static app_ctx_t ctx={.now_ms=10000};
-static void reset(void){release_covers();free(s_books);free(s_matches);s_books=NULL;s_matches=NULL;s_count=s_visible=0;s_page=0;s_query[0]=s_requested[0]=s_message[0]=0;s_owner=0;s_epoch=0;s_sync_not_before=0;s_more_sync=false;s_next_action=s_next_sync=s_sync_check=0;s_cover_remote=s_force_cover=false;fail_alloc=mock_keyboard_done=false;s_order=1;s_style=mock_style=6;s_sort_menu=s_more_menu=false;weread_runtime_stop();memset(starts,0,sizeof(starts));nstarts=nsync=0;mock_fresh=true;mock_pending=false;ctx=(app_ctx_t){.now_ms=10000};}
-static void initialized(int n){enter(&ctx);assert(nstarts==1&&starts[0].job==WR_JOB_INIT);complete((weread_result_t){.job=WR_JOB_INIT,.authenticated=true,.books=books(n,false),.count=(size_t)n});assert(tick(&ctx)==APP_REDRAW_PAGE);assert(nsync==0);}
+static void reset(void){mock_authenticated=true;release_covers();free(s_books);free(s_matches);s_books=NULL;s_matches=NULL;s_count=s_visible=0;s_page=0;s_query[0]=s_requested[0]=s_message[0]=0;s_owner=0;s_epoch=0;s_sync_not_before=0;s_more_sync=false;s_next_action=s_next_sync=s_sync_check=0;s_cover_remote=s_force_cover=false;fail_alloc=mock_keyboard_done=false;s_order=1;s_style=mock_style=6;s_sort_menu=s_more_menu=false;weread_runtime_stop();memset(starts,0,sizeof(starts));nstarts=nsync=0;mock_fresh=true;mock_pending=false;ctx=(app_ctx_t){.now_ms=10000};}
+static void initialized(int n){enter(&ctx);assert(nstarts==1&&starts[0].job==WR_JOB_INIT);complete((weread_result_t){.job=WR_JOB_INIT,.authenticated=true,.books=books(n,false),.count=(size_t)n});assert(tick(&ctx)==APP_REDRAW_PAGE);assert(nsync==0);s_preconnected=true;}
 static void run_cover_batch(void){
     for(int i=0;i<6;i++){
         ctx.now_ms+=10;int prev=nstarts;assert(tick(&ctx)==APP_REDRAW_NONE);assert(nstarts==prev+1&&starts[prev].job==WR_JOB_COVER&&!starts[prev].value[0]);

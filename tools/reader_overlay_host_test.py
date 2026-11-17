@@ -19,6 +19,7 @@ unit = r'''
 #define UI_LOCK_WIDTH 684
 #define UI_LOCK_HEIGHT 1216
 #define UI_GRAY_WHITE 255
+#define UI_GRAY_BLACK 0
 #define UI_NAV_BACKGROUND_GRAY 0xe0
 #define UI_GRAY_LIGHT 192
 #define READER_TOOL_ICON_PX 40
@@ -79,6 +80,7 @@ static void ui_fill_round_rect(uint8_t *fb,EpdRect r,int radius,int color){if(ra
 static void ui_text_vc(uint8_t *fb,int x,int y,int px,const char *text,int align,bool inverse){(void)fb;(void)x;(void)y;(void)px;(void)text;(void)align;(void)inverse;}
 static bool reader_chapter_undo_visible(void){return false;}
 static EpdRect reader_chapter_undo_rect(void){return(EpdRect){0,0,20,20};}
+static void ui_draw_round_rect(uint8_t *fb,EpdRect r,int radius,int color){(void)radius;ui_fill_rect_fast(r,color,fb);}
 static void ui_draw_control_frame(uint8_t *fb,EpdRect r,int radius,int color){(void)fb;(void)r;(void)radius;(void)color;}
 static void ui_text_box(uint8_t *fb,EpdRect r,int px,const char *text,int align,bool inverse){(void)fb;(void)r;(void)px;(void)text;(void)align;(void)inverse;}
 static void draw_reader_panel(uint8_t *fb){

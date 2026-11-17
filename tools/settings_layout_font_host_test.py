@@ -74,6 +74,9 @@ static char s_reset_notice[96];
 static char s_font_sync_path[192],s_notice[96],s_ble_notice[96],s_ble_feedback[96];
 static int font_scans,profile_edits,wifi_requests;
 static bool home_full;
+static bool shelf_badges;
+static bool app_settings_shelf_progress_badges(void){return shelf_badges;}
+static bool app_settings_set_shelf_progress_badges(bool v){if(write_fail)return false;shelf_badges=v;return true;}
 static uint8_t wake_presses=1;
 static uint8_t app_settings_wake_presses(void){return wake_presses;}
 static void app_settings_set_wake_presses(uint8_t n){wake_presses=n;}
@@ -106,16 +109,17 @@ int main(void){
    assert(SETTINGS_DISPLAY_Y>SETTINGS_WIRELESS_Y+3*SETTINGS_ROW_H);
    assert(SETTINGS_PERSONAL_Y>SETTINGS_DISPLAY_Y+6*SETTINGS_ROW_H);
    const int tops[]={SETTINGS_WIRELESS_Y,SETTINGS_DISPLAY_Y,SETTINGS_PERSONAL_Y,SETTINGS_MAINTENANCE_Y};
-   const int counts[]={3,7,4,5};
+   const int counts[]={3,7,5,5};
    const int destinations[][7]={{-1,SETTINGS_BLUETOOTH,SETTINGS_TIME},
      {SETTINGS_SYSTEM_FONT,SETTINGS_SYSTEM_CONTRAST,SETTINGS_MAIN_REFRESH,-2,SETTINGS_AUTO_LOCK,-2,SETTINGS_POWER_SLEEP},
-     {SETTINGS_SHELF_STYLE,SETTINGS_LOCK_STYLE,SETTINGS_LOCK_PIN,-3},
+     {SETTINGS_SHELF_STYLE,-6,SETTINGS_LOCK_STYLE,SETTINGS_LOCK_PIN,-3},
      {SETTINGS_UPGRADE,SETTINGS_CONFIG,-4,SETTINGS_BOOT,SETTINGS_FACTORY_RESET}};
    for(int group=0;group<4;++group)for(int i=0;i<counts[group];++i){
      s_page=SETTINGS_MAIN;int center=tops[group]+i*SETTINGS_ROW_H+SETTINGS_ROW_H/2;s_main_scroll=center-500;ctx.request_app=NULL;
-     main_tap(&ctx,300,500);
+     bool badges_before=shelf_badges;main_tap(&ctx,300,500);
      if(destinations[group][i]>=0)assert((int)s_page==destinations[group][i]);
      else if(destinations[group][i]==-1)assert(ctx.request_app==&app_transfer);
+     else if(destinations[group][i]==-6)assert(s_page==SETTINGS_MAIN&&shelf_badges!=badges_before);
      else if(destinations[group][i]==-2)assert(s_page==SETTINGS_MAIN);
      else if(destinations[group][i]==-3)assert(profile_edits>0);
      else assert(s_panel_repair_pending&&s_page==SETTINGS_MAIN);
@@ -125,6 +129,7 @@ int main(void){
    int last=SETTINGS_MAINTENANCE_Y+SETTINGS_MAINTENANCE_ROWS*SETTINGS_ROW_H-1-s_main_scroll;
    assert(last<UI_NAV_TOP&&main_tap(&ctx,300,last)==APP_REDRAW_PAGE&&s_page==SETTINGS_FACTORY_RESET);
  }
+ s_page=SETTINGS_MAIN;s_main_scroll=SETTINGS_PERSONAL_Y+SETTINGS_ROW_H+SETTINGS_ROW_H/2-500;bool old_badges=shelf_badges;write_fail=true;s_notice[0]=0;assert(main_tap(&ctx,300,500)==APP_REDRAW_PAGE&&shelf_badges==old_badges&&s_notice[0]);write_fail=false;
  scale=100;s_page=SETTINGS_SYSTEM_FONT;s_font_page=0;s_main_scroll=0;s_font_sync_confirm=false;
  for(int i=0;i<11;++i){EpdRect r=system_font_layout().size;assert(font_tap(300,r.y+r.height/2)==APP_REDRAW_PAGE);assert(scale==((i+1)%11)*10+100);}
  EpdRect r=system_font_item_rect(1);
@@ -140,7 +145,7 @@ int main(void){
  write_fail=true;unsigned before=system_activations;r=system_font_item_rect(2);
  assert(font_tap(300,r.y+r.height/2)==APP_REDRAW_PAGE&&!s_font_sync_confirm&&system_activations==before&&!strcmp(system_path,fonts[0].path));
  write_fail=false;assert(font_tap(300,r.y+r.height+7)==APP_REDRAW_NONE);
- puts("PASS: 11 scales, all 16 destinations, reachable final row, font-size cycle, modal isolation, opt-in sync, no reading-font load and failed-save retry");
+ puts("PASS: 11 scales, all 20 destinations including progress badges, reachable final row, font-size cycle, modal isolation, opt-in sync, no reading-font load and failed-save retry");
 }
 '''
 with tempfile.TemporaryDirectory() as folder:

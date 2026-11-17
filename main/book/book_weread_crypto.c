@@ -15,6 +15,12 @@
 #pragma GCC optimize("Os")
 #endif
 
+#if defined(ESP_PLATFORM) || defined(WEREAD_USE_PLATFORM_CRYPTO)
+#include "aes/esp_aes.h"
+#include "esp_rom_md5.h"
+#define WR_PLATFORM_CRYPTO 1
+#endif
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,6 +58,7 @@ static uint64_t be64(const uint8_t *p) {
 
 /* ---- AES-128-CBC 解密 / AES-128-CBC Decryption ---------------------------- */
 
+#if !defined(WR_PLATFORM_CRYPTO)
 static const uint8_t kAesSbox[256] = {
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -153,22 +160,32 @@ static void aes128_decrypt_block(const uint8_t in[16], uint8_t out[16], const ui
             out[c * 4 + r] = s[r][c];
 }
 
+#endif
+
 static bool aes128_cbc_decrypt_pkcs7(const uint8_t key[16], const uint8_t iv[16],
                                      const uint8_t *ct, size_t ct_len,
                                      uint8_t *out, size_t out_cap, size_t *out_len) {
     if (!ct || ct_len == 0 || (ct_len % 16u) != 0 || !out || !out_len) return false;
-    uint8_t rk[11][16];
-    aes128_expand_key(key, rk);
-    uint8_t prev[16];
-    memcpy(prev, iv, 16);
     uint8_t *plain = WR_ALLOC(ct_len);
     if (!plain) return false;
+#if defined(WR_PLATFORM_CRYPTO)
+    esp_aes_context aes;
+    uint8_t chained_iv[16];memcpy(chained_iv,iv,sizeof(chained_iv));
+    esp_aes_init(&aes);
+    int err=esp_aes_setkey(&aes,key,128);
+    if(!err)err=esp_aes_crypt_cbc(&aes,ESP_AES_DECRYPT,ct_len,chained_iv,ct,plain);
+    esp_aes_free(&aes);
+    if(err){free(plain);return false;}
+#else
+    uint8_t rk[11][16];
+    aes128_expand_key(key, rk);
+    uint8_t prev[16];memcpy(prev,iv,16);
     for (size_t off = 0; off < ct_len; off += 16u) {
-        uint8_t dec[16];
-        aes128_decrypt_block(ct + off, dec, rk);
+        uint8_t dec[16];aes128_decrypt_block(ct + off, dec, rk);
         for (size_t i = 0; i < 16u; ++i) plain[off + i] = dec[i] ^ prev[i];
         memcpy(prev, ct + off, 16);
     }
+#endif
     uint8_t pad = plain[ct_len - 1];
     bool valid = pad >= 1 && pad <= 16 && pad <= ct_len;
     for (size_t i = 0; valid && i < pad; ++i) {
@@ -852,6 +869,16 @@ esp_err_t book_weread_unpack_tar_file(FILE *f, book_weread_archive_chunk_fn sink
 
 /* ---- RFC 1321 MD5（供 Web ID 混淆使用）/ RFC 1321 MD5 --------------------- */
 
+#if defined(WR_PLATFORM_CRYPTO)
+static void md5_hex(const char *in,size_t len,char out_hex[33]){
+    md5_context_t md5;uint8_t digest[16];esp_rom_md5_init(&md5);
+    while(len){uint32_t chunk=len>UINT32_MAX?UINT32_MAX:(uint32_t)len;esp_rom_md5_update(&md5,in,chunk);in+=chunk;len-=chunk;}
+    esp_rom_md5_final(digest,&md5);
+    static const char hex[]="0123456789abcdef";
+    for(unsigned i=0;i<16;++i){out_hex[i*2]=hex[digest[i]>>4];out_hex[i*2+1]=hex[digest[i]&15];}
+    out_hex[32]=0;
+}
+#else
 static void md5_transform(uint32_t state[4], const uint8_t block[64]) {
     static const uint32_t k[64] = {
         0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
@@ -917,6 +944,8 @@ static void md5_hex(const char *in, size_t len, char out_hex[33]) {
     }
     out_hex[32] = 0;
 }
+
+#endif
 
 /* ---- Web `/web/book/read` 签名 / Web Progress Obfuscation & Signing ------- */
 

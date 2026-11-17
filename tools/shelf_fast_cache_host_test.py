@@ -56,11 +56,17 @@ static void book_cover_jobs_cancel(unsigned g){(void)g;}
 static bool fast=true,alloc_fail;
 static size_t free_psram=4*1024*1024,allocated_bytes;
 static void release_guard_cache(void){}
-static void book_shelf_page_pause(void){}
+static __attribute__((unused)) void book_shelf_page_pause(void){}
 static bool s_shelf_page_key_valid,s_shelf_page_loading,s_shelf_page_cached,s_shelf_page_cache_allowed;
 static unsigned allocations,s_cover_pending_mask,s_cover_decode_mask,s_cover_warm_mask,s_cover_dirty_mask,s_cover_present_mask;
 static struct {int index;uint8_t *gray,*fast_bits;unsigned width,height;uint8_t fast_contrast,fast_phase;bool fast_white_edge;} s_covers[BOOK_ROWS];
 static int app_settings_shelf_style(void){return style;}
+static unsigned s_shelf_no_artwork_mask;
+static uint8_t s_cover_retry_count[BOOK_ROWS];
+static int64_t s_cover_retry_ms[BOOK_ROWS];
+static void app_book_shelf_prefetch_cancel(void){}
+static void metalio_cover_cache_clear(void){}
+static int shelf_order_mode(void){return 0;}
 static int shelf_rows(void){return rows;}
 static bool app_settings_main_fast_refresh(void){return fast;}
 static uint8_t app_settings_system_contrast(void){return contrast;}
@@ -77,6 +83,7 @@ static void* heap_caps_calloc(size_t count,size_t bytes,unsigned caps){
     return remember(calloc(count,bytes),bytes);
 }
 static EpdRect row_rect(int row){return (EpdRect){36+(row%3)*210+phase_shift,224+(row/3)*282,192,260};}
+static EpdRect ui_shelf_cover(int kind,int row){EpdRect r=row_rect(row);if(kind==5)return(EpdRect){48,r.y,51,70};return(EpdRect){r.x+(r.width-164)/2,r.y,164,214};}
 '''
 unit += function('ui_contrast_gray', ROOT / 'main/ui/ui_kit.c') + '\n'
 unit += function('book_cover_crop', ROOT / 'main/book/book_cover.c') + '\n'

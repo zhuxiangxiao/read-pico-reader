@@ -487,6 +487,24 @@ bool read_pico_sd_needs_recovery(void) {
     portEXIT_CRITICAL(&state_lock);
     return needed;
 }
+
+bool read_pico_sd_media_id(uint8_t out[READ_PICO_SD_MEDIA_ID_BYTES]) {
+    if(!out)return false;
+    memset(out,0,READ_PICO_SD_MEDIA_ID_BYTES);
+    portENTER_CRITICAL(&state_lock);
+    bool ready=!suspended&&probe_state!=1&&cached_info.mounted&&!media_invalidated&&card;
+    if(ready){
+        const uint32_t fields[]={ (uint32_t)card->cid.mfg_id,(uint32_t)card->cid.oem_id,
+            (uint32_t)card->cid.revision,(uint32_t)card->cid.serial,(uint32_t)card->cid.date };
+        for(unsigned i=0;i<5;++i)for(unsigned b=0;b<4;++b)out[i*4+b]=(uint8_t)(fields[i]>>(b*8));
+        memcpy(out+20,card->cid.name,8);
+        uint8_t any=0;for(unsigned i=0;i<READ_PICO_SD_MEDIA_ID_BYTES;++i)any|=out[i];
+        ready=any!=0;
+    }
+    portEXIT_CRITICAL(&state_lock);
+    return ready;
+}
+
 bool read_pico_sd_io_ready(void) {
     portENTER_CRITICAL(&state_lock);
     bool ready = !suspended && probe_state != 1 && cached_info.mounted && !media_invalidated;

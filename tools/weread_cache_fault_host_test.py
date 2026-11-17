@@ -49,6 +49,7 @@ void wr_release(void*slot){void*p=NULL;memcpy(&p,slot,sizeof(p));free(p);memset(
 bool wr_owner_matches(const cJSON*j){(void)j;return true;}
 static esp_err_t persist(cJSON*j){(void)j;++persist_calls;if(fail_persist){cJSON_Hooks h={.malloc_fn=deny_alloc,.free_fn=free};cJSON_InitHooks(&h);return ESP_ERR_NO_MEM;}return ESP_OK;}
 static uint32_t book_weread_uid(size_t i){(void)i;return 1;}
+static const char*bound_resource(const char*root){(void)root;return NULL;}
 esp_err_t weread_chapter_directory(const char*id,uint32_t uid,char*out,size_t cap){(void)id;(void)uid;if(fault==9){fault=0;return ESP_FAIL;}snprintf(out,cap,"%s",root_dir);return ESP_OK;}
 esp_err_t weread_chapter_resource_directory(const char*id,char*out,size_t cap){(void)id;if(fault==8){fault=0;return ESP_ERR_NO_MEM;}snprintf(out,cap,"%s",root_dir);return ESP_OK;}
 static bool consume(unsigned kind){if(fault!=kind)return false;fault=0;errno=EIO;return true;}

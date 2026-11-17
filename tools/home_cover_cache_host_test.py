@@ -3,6 +3,7 @@ SPDX-License-Identifier: Apache-2.0
 """
 from pathlib import Path
 import re
+import json
 import subprocess
 import tempfile
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,9 @@ if __name__ == '__main__':
     home = ROOT / 'main/apps/app_dashboard.c'
     source = home.read_text()
     types = source[source.index('typedef struct {'):source.index('static int s_cover_next;')]
-    unit = r'''
+    view_marker=ROOT/'.kiiko-source-view.json'
+    board=json.loads(view_marker.read_text())['board'] if view_marker.exists() else 'metalio47'
+    unit = '#define HOME_EPUB_ARTWORK_ONLY '+str(int(board=='metalio47'))+'\n'+r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -79,7 +82,7 @@ static bool book_weread_cover(const char *path,uint8_t *out,size_t cap){assert(b
 static unsigned s_cover_generation;static bool s_cover_waiting;
 static book_cover_job_t job_requests[9];
 unsigned book_cover_jobs_begin(void){return 1;}
-bool book_cover_jobs_submit(unsigned generation,unsigned slot,const book_cover_job_t *q){assert(generation==1&&slot<9);job_requests[slot]=*q;return true;}
+bool book_cover_jobs_submit(unsigned generation,unsigned slot,const book_cover_job_t *q){assert(generation==1&&slot<9);assert(q->list&&q->natural&&q->contrast==100&&q->phase==17);job_requests[slot]=*q;return true;}
 int book_cover_jobs_take(unsigned generation,unsigned slot,book_cover_result_t *result){
  (void)generation;book_cover_job_t *q=&job_requests[slot];struct stat st;
  if(stat(q->path,&st)||heap_caps_get_free_size(3)<512u*1024u+42240u)return -1;
@@ -134,7 +137,7 @@ int main(void){
     asset_allowed=true;book(0,0);strcpy(book_at(0)->path,"/book0.TXT");
     assert(load_cover(book_at(0),0)&&!job_requests[0].artwork_only&&book_at(0)->cover);
     clear_cover_cache();book(0,0);
-    assert(load_cover(book_at(0),0)&&job_requests[0].artwork_only);
+    assert(load_cover(book_at(0),0)&&job_requests[0].artwork_only==HOME_EPUB_ARTWORK_ONLY);
     clear_cover_cache();
     book(0,0);strcpy(book_at(0)->path,"weread://test_book_101");
     for(unsigned mode=0;mode<2;++mode){

@@ -180,6 +180,8 @@ static esp_err_t read_json(const char *path, cJSON **out) {
     return *out ? ESP_OK : wr_memory_failed()?ESP_ERR_NO_MEM:ESP_ERR_INVALID_RESPONSE;
 }
 
+esp_err_t wr_read_json_primary(const char *path,cJSON **out){return read_json(path,out);}
+
 esp_err_t wr_read_json(const char *path, cJSON **out) {
     esp_err_t err = read_json(path, out);
     if (err == ESP_OK || err == ESP_ERR_NO_MEM) return err;

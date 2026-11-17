@@ -169,6 +169,12 @@ esp_err_t esp_http_client_get_header(esp_http_client_handle_t client, const char
 {
     if (!client || !key || !value) return ESP_ERR_INVALID_ARG;
     *value = NULL;
+    for (size_t i = 0; i < client->req_header_count; ++i) {
+        if (strcasecmp(client->req_headers[i].key, key) == 0) {
+            *value = client->req_headers[i].value;
+            return ESP_OK;
+        }
+    }
     for (size_t i = 0; i < client->resp_header_count; ++i) {
         if (strcasecmp(client->resp_headers[i].key, key) == 0) {
             *value = client->resp_headers[i].value;
@@ -261,6 +267,8 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t client, int write_len)
     const char *m = method_str(client->method);
     const char *path = client->path ? client->path : "/";
     const char *host = client->host ? client->host : "127.0.0.1";
+    char *assigned_host = NULL;
+    if (esp_http_client_get_header(client, "Host", &assigned_host) == ESP_OK && assigned_host) host = assigned_host;
 
     offset += (size_t)snprintf(req + offset, sizeof(req) - offset,
                               "%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n",
@@ -275,6 +283,7 @@ esp_err_t esp_http_client_open(esp_http_client_handle_t client, int write_len)
 
     // Append custom request headers
     for (size_t i = 0; i < client->req_header_count; ++i) {
+        if (!strcasecmp(client->req_headers[i].key, "Host")) continue;
         offset += (size_t)snprintf(req + offset, sizeof(req) - offset,
                                   "%s: %s\r\n",
                                   client->req_headers[i].key,

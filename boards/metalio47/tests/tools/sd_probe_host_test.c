@@ -47,8 +47,26 @@ static sdmmc_card_t test_card = {
 #include "../components/read_pico/read_pico_sd.c"
 #undef mkdir
 
+// Lifecycle owners must close snapshot admission before replacing/freeing the card.
+static void assert_cid_lifecycle_closed(void) {
+    uint8_t id[READ_PICO_SD_MEDIA_ID_BYTES];
+    memset(id, 0xa5, sizeof(id));
+    assert(!read_pico_sd_media_id(id));
+    for (size_t i = 0; i < sizeof(id); ++i) assert(id[i] == 0);
+}
+
 int64_t esp_timer_get_time(void){return 0;}
 esp_err_t sdmmc_get_status(sdmmc_card_t *c){assert(c==&test_card || (raw_mode && c==usb_card));return ESP_OK;}
+
+// Backend-only cleanup probes model the public caller's reserved transition state.
+// Driver entry points still exercise their own begin_operation()/publication logic.
+static esp_err_t test_close_card(void) {
+    int previous = probe_state;
+    probe_state = 1;
+    esp_err_t result = close_card();
+    probe_state = previous;
+    return result;
+}
 static FATFS test_fat={.free_clst=1};
 BYTE ff_diskio_get_pdrv_card(const sdmmc_card_t *c){assert(c==&test_card);return 0;}
 int f_opendir(FF_DIR *root,const char *path){assert(!strcmp(path,"0:"));root->obj.fs=&test_fat;return FR_OK;}
@@ -99,6 +117,7 @@ esp_err_t esp_vfs_fat_sdmmc_mount(const char* path, const sdmmc_host_t* host,
                                   const sdmmc_slot_config_t* slot,
                                   const esp_vfs_fat_sdmmc_mount_config_t* config,
                                   sdmmc_card_t** out) {
+    assert_cid_lifecycle_closed();
     assert(!strcmp(path,"/sdcard") && host->slot==0);
     assert((slot->width==4||slot->width==1) && slot->clk==GPIO_NUM_24 && slot->cmd==GPIO_NUM_25 && slot->d0==GPIO_NUM_20);
     if(slot->width==4)assert(slot->d1==GPIO_NUM_21&&slot->d2==GPIO_NUM_22&&slot->d3==GPIO_NUM_23);
@@ -122,6 +141,7 @@ esp_err_t esp_vfs_fat_sdmmc_mount(const char* path, const sdmmc_host_t* host,
     return ESP_OK;
 }
 esp_err_t esp_vfs_fat_sdcard_unmount(const char* path, sdmmc_card_t* mounted) {
+    assert_cid_lifecycle_closed();
     (void)path;
     assert(mounted == &test_card);
     ++unmount_calls;
@@ -246,7 +266,7 @@ int main(void) {
     test_present=false;before_space=space_calls;
     assert(read_pico_sd_refresh_space()==ESP_ERR_NOT_FOUND&&space_calls==before_space);
     assert(read_pico_sd_get_info(&info)==ESP_ERR_NOT_FOUND&&!info.mounted&&!info.space_valid);
-    assert(close_card()==ESP_OK&&!sd_dma_buffer&&!test_dma_live&&test_dma_allocs==test_dma_frees);
+    assert(test_close_card()==ESP_OK&&!sd_dma_buffer&&!test_dma_live&&test_dma_allocs==test_dma_frees);
     test_present=true;before=mount_calls;
     test_dma_fail_alloc=true;
     assert(mount_card(false)==ESP_ERR_NO_MEM&&mount_calls==before&&!sd_dma_buffer);
@@ -266,7 +286,7 @@ int main(void) {
     assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+2&&s_sd_last_profile==4);
     assert(clock_history[before]==10000&&clock_history[before+1]==5000);
     // SDK mount success alone is insufficient: failed real reads must cleanly fall back.
-    assert(close_card()==ESP_OK);test_fail_above_khz=0;verified_fail_above_khz=10000;
+    assert(test_close_card()==ESP_OK);test_fail_above_khz=0;verified_fail_above_khz=10000;
     s_sd_last_profile=-1;s_sd_sleep_profile=0;before=mount_calls;int prior_unmounts=unmount_calls;unsigned prior_reads=verified_reads;
     assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+4);
     assert(read_pico_sd_get_info(&info)==ESP_OK&&info.mounted&&s_sd_last_profile==3);
@@ -284,12 +304,12 @@ int main(void) {
     assert(clock_history[before]==5000&&clock_history[before+1]==1000);
     // 深睡只接受有界RTC提示；冷启/异常复位和损坏索引回原档，所有失败最多8次。
     // Deep wake accepts a bounded RTC hint; cold/abnormal reset or corrupt indices start high, with at most8 attempts.
-    assert(close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;test_reset_reason=ESP_RST_DEEPSLEEP;
+    assert(test_close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;test_reset_reason=ESP_RST_DEEPSLEEP;
     before=mount_calls;assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+1&&clock_history[before]==1000&&width_history[before]==1);
-    assert(close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;s_sd_sleep_profile=SD_PROFILE_COOKIE|255u;
+    assert(test_close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;s_sd_sleep_profile=SD_PROFILE_COOKIE|255u;
     test_need_single=false;test_fail_above_khz=0;before=mount_calls;
     assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+1&&clock_history[before]==40000);
-    assert(close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;s_sd_sleep_profile=SD_PROFILE_COOKIE|7u;test_reset_reason=0;
+    assert(test_close_card()==ESP_OK);s_sd_profile_loaded=false;s_sd_last_profile=-1;s_sd_sleep_profile=SD_PROFILE_COOKIE|7u;test_reset_reason=0;
     before=mount_calls;assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+1&&clock_history[before]==40000&&width_history[before]==4);
     test_fail_above_khz=1;s_sd_last_profile=6;s_sd_sleep_profile=SD_PROFILE_COOKIE|6u;before=mount_calls;
     assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED&&mount_calls==before+8);
@@ -327,7 +347,7 @@ int main(void) {
     space_busy=false;assert(read_pico_sd_invalidate_io()==ESP_OK&&card&&unmount_calls==before&&!read_pico_sd_io_ready());
     assert(read_pico_sd_needs_recovery()&&read_pico_sd_start_recovery()==ESP_OK);
     assert(read_pico_sd_io_ready()&&unmount_calls==before+1&&format_calls==old_formats);
-    assert(close_card()==ESP_OK&&!sd_dma_buffer&&test_dma_allocs==test_dma_frees);
+    assert(test_close_card()==ESP_OK&&!sd_dma_buffer&&test_dma_allocs==test_dma_frees);
     // 真正调用共享驱动的MSC路径：降频/单线、内部DMA和失败所有权。
     // Exercise the actual shared MSC driver: fallback, internal DMA and failed-cleanup ownership.
     defer_manual=false;assert(read_pico_sd_remount()==ESP_ERR_NOT_FINISHED);
@@ -357,7 +377,7 @@ int main(void) {
     work=queued_resume;queued_resume=NULL;work(queued_resume_arg);
     assert(read_pico_sd_get_info(&info)==ESP_OK && info.mounted && mount_calls==before+1);
     assert(read_pico_sd_resume()==ESP_OK && !queued_resume && mount_calls==before+1);
-    assert(close_card()==ESP_OK && test_dma_allocs==test_dma_frees);
+    assert(test_close_card()==ESP_OK && test_dma_allocs==test_dma_frees);
     puts("PASS: SD profiles/RTC and DMA, asynchronous manual recovery from failed/paused/removal states, lifecycle owners/OOM/unmount failure/retry/no autoformat/256GiB");
     return 0;
 }

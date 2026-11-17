@@ -36,6 +36,14 @@ static sdmmc_card_t test_card = {
 #include "../components/read_pico/read_pico_sd.c"
 #undef mkdir
 
+// Lifecycle owners must close snapshot admission before replacing/freeing the card.
+static void assert_cid_lifecycle_closed(void) {
+    uint8_t id[READ_PICO_SD_MEDIA_ID_BYTES];
+    memset(id, 0xa5, sizeof(id));
+    assert(!read_pico_sd_media_id(id));
+    for (size_t i = 0; i < sizeof(id); ++i) assert(id[i] == 0);
+}
+
 static FATFS test_fat={.free_clst=1};
 BYTE ff_diskio_get_pdrv_card(const sdmmc_card_t *c){assert(c==&test_card);return 0;}
 int f_opendir(FF_DIR *root,const char *path){assert(!strcmp(path,"0:"));root->obj.fs=&test_fat;return FR_OK;}
@@ -80,6 +88,7 @@ esp_err_t esp_vfs_fat_sdmmc_mount(const char* path, const sdmmc_host_t* host,
                                   const sdmmc_slot_config_t* slot,
                                   const esp_vfs_fat_sdmmc_mount_config_t* config,
                                   sdmmc_card_t** out) {
+    assert_cid_lifecycle_closed();
     (void)path; (void)host; (void)slot; (void)config;
     assert(mount_calls < 64);
     clock_history[mount_calls++] = host->max_freq_khz;
@@ -91,6 +100,7 @@ esp_err_t esp_vfs_fat_sdmmc_mount(const char* path, const sdmmc_host_t* host,
     return ESP_OK;
 }
 esp_err_t esp_vfs_fat_sdcard_unmount(const char* path, sdmmc_card_t* mounted) {
+    assert_cid_lifecycle_closed();
     (void)path;
     assert(mounted == &test_card);
     ++unmount_calls;

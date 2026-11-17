@@ -87,6 +87,7 @@ static int update_display_area_diff_with(EpdiyHighlevelState *h,const int *w,int
  ++pushes;if(!result)memcpy(back,frame,sizeof(frame));return result;
 }
 '''
+unit += '#include "'+str(ROOT/'main/ui/ui_icon_unpack.inc')+'"\n'
 for name in ('ui_read_pixel','icon_nibble','ui_draw_icon','ui_contrast_gray'):
     unit += function(name,ROOT/'main/ui/ui_kit.c')+'\n'
 unit += function('epd_draw_circle',ROOT/'components/epdiy/src/epdiy.c')+'\n'

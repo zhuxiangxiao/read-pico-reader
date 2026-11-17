@@ -17,6 +17,10 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <time.h>
+#if defined(ESP_PLATFORM)
+#include "esp_timer.h"
+#endif
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
 #include "esp_http_client.h"
@@ -43,10 +47,17 @@ static void http_lock(void) {
     xSemaphoreTake(s_http_mutex, portMAX_DELAY);
 }
 static void http_unlock(void) { xSemaphoreGive(s_http_mutex); }
+static bool http_try_lock(void) {
+    portENTER_CRITICAL(&s_http_init);
+    if (!s_http_mutex) s_http_mutex = xSemaphoreCreateMutexStatic(&s_http_mutex_buffer);
+    portEXIT_CRITICAL(&s_http_init);
+    return xSemaphoreTake(s_http_mutex, 0) == pdTRUE;
+}
 #else
 static pthread_mutex_t s_http_mutex = PTHREAD_MUTEX_INITIALIZER;
 static void http_lock(void) { pthread_mutex_lock(&s_http_mutex); }
 static void http_unlock(void) { pthread_mutex_unlock(&s_http_mutex); }
+static bool http_try_lock(void) { return pthread_mutex_trylock(&s_http_mutex) == 0; }
 #endif
 static void http_active(esp_http_client_handle_t client) { http_lock(); s_active_http = client; http_unlock(); }
 static void http_cleanup(esp_http_client_handle_t client) {
@@ -56,7 +67,9 @@ static void http_cleanup(esp_http_client_handle_t client) {
 #endif
 void weread_client_abort_active(void) {
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-    http_lock();
+    // 清理已持锁时没有仍需shutdown的句柄，不能让UI等待TLS释放。
+    // Cleanup already owns the closing handle; UI cancellation must not wait for TLS teardown.
+    if (!http_try_lock()) return;
     int fd = s_active_http ? esp_http_client_get_socket(s_active_http) : -1;
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
     http_unlock();
@@ -66,17 +79,23 @@ static weread_timeout_fn s_timeout_budget;
 static void *s_timeout_ctx;
 void weread_client_set_timeout_budget(weread_timeout_fn fn, void *ctx) { s_timeout_budget=fn;s_timeout_ctx=ctx; }
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-static int request_timeout_ms(const char *url) {
+static int request_default_timeout_ms(const char *url) {
     const char *authority=strstr(url,"://");
     const char *path=authority?strchr(authority+3,'/'):NULL;
     // 实际扫码接口长轮询约55秒；普通API仍使用15秒。/ The real QR endpoint long-polls for about55s; ordinary APIs retain15s.
-    int ms=path&&!strncmp(path,"/web/getlogininfo",17)&&(path[17]==0||path[17]=='?')?65000:15000;
+    return path&&!strncmp(path,"/web/getlogininfo",17)&&(path[17]==0||path[17]=='?')?65000:15000;
+}
+static int request_timeout_ms(const char *url) {
+    int ms=request_default_timeout_ms(url);
     int budget=s_timeout_budget?s_timeout_budget(s_timeout_ctx):0;
     return budget>0&&budget<ms?budget:ms;
 }
 #endif
 static weread_network_fn s_network;
 static void *s_network_ctx;
+static bool s_background,s_polling;
+void weread_client_set_background(bool enabled) { s_background=enabled; }
+void weread_client_set_polling(bool enabled) { s_polling=enabled; }
 void weread_client_set_network(weread_network_fn fn, void *ctx) { s_network = fn; s_network_ctx = ctx; }
 
 static weread_http_transport_fn s_transport = NULL;
@@ -390,6 +409,31 @@ static esp_err_t login_header(esp_http_client_event_t *event) {
     return ESP_OK;
 }
 #endif
+static uint64_t client_now_ms(void) {
+#if defined(ESP_PLATFORM)
+    return (uint64_t)esp_timer_get_time()/1000;
+#else
+    struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
+    return (uint64_t)now.tv_sec*1000+(uint64_t)now.tv_nsec/1000000;
+#endif
+}
+#if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
+#include "weread_http_poll.inc"
+#endif
+#if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
+static void request_timing(const char *url,const uint64_t phase[7],esp_err_t result,int status,size_t bytes) {
+    static unsigned sequence,native,web,auth;
+    const char *base=weread_client_get_base_url();
+    unsigned route=strstr(url,"/weblogin")?3:!strncmp(url,base,strlen(base))?1:2;
+    if(route==1)++native;else if(route==3)++auth;else ++web;
+    // connect包含DNS/TCP/TLS；不要把SDK一次连接事件解释成三个独立指标。
+    // Connect includes DNS/TCP/TLS; one SDK event cannot separate those stages.
+    ESP_LOGI("weread","HTTP timing n=%u route=%u native=%u web=%u auth=%u network=%u dns=%u connect=%u response=%u body=%u cleanup=%u total=%u bytes=%u status=%d result=%d",
+        ++sequence,route,native,web,auth,(unsigned)(phase[1]-phase[0]),phase[2]?(unsigned)(phase[2]-phase[1]):0,(unsigned)(phase[3]-(phase[2]?phase[2]:phase[1])),
+        (unsigned)(phase[4]-phase[3]),(unsigned)(phase[5]-phase[4]),(unsigned)(phase[6]-phase[5]),
+        (unsigned)(phase[6]-phase[0]),(unsigned)bytes,status,(int)result);
+}
+#endif
 static esp_err_t weread_client_dispatch_raw(
     const char *url,
     const char *method,
@@ -397,18 +441,25 @@ static esp_err_t weread_client_dispatch_raw(
     const char *body,
     char **out_resp,
     size_t *out_len,
-    int *out_status
+    int *out_status,
+    bool background
 ) {
+    uint64_t phase[7]={client_now_ms(),0,0,0,0,0,0};
     weread_secure_zero(&s_login_cookies,sizeof(s_login_cookies));
     if (weread_client_cancelled()) return ESP_ERR_INVALID_STATE;
     if (s_network) { esp_err_t ready = s_network(s_network_ctx); if (ready != ESP_OK) {
         ESP_LOGW("weread", "network preparation failed result=%d", (int)ready); return ready;
     } }
+    phase[1]=client_now_ms();
     if (s_transport) {
         return s_transport(url, method, headers, body, out_resp, out_len, out_status, s_transport_user_ctx);
     }
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
+    http_poll_t *poll __attribute__((cleanup(wr_release)))=NULL;
+    esp_err_t prepared=http_poll_prepare(url,background,NULL,NULL,&poll);
+    if(prepared!=ESP_OK)return prepared;
+    if(poll)phase[2]=client_now_ms();
     const char *authority_end=strstr(url,"://");
     const char *url_path=authority_end?strchr(authority_end+3,'/'):NULL;
     bool login = weread_client_is_trusted_url(url) && url_path && !strncmp(url_path,"/weblogin",9) &&
@@ -423,6 +474,7 @@ static esp_err_t weread_client_dispatch_raw(
         .disable_auto_redirect = true,
         .event_handler = login_header, .user_data = &login,
     };
+    http_poll_config(poll,&config);
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         return ESP_FAIL;
@@ -472,17 +524,22 @@ static esp_err_t weread_client_dispatch_raw(
         }
     }
 
+    if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
     // 按流读取含 chunked 的响应；禁止跨域自动重定向凭据。/ Read streamed/chunked bodies; never redirect credentials automatically.
-    http_active(client);
+    // 轮询传输仅由worker关闭，避免SDK内部重连与跨线程shutdown的fd复用竞态。
+    // The polling worker owns close/reconnect; cancellation polls avoid cross-thread fd reuse races.
+    http_active(poll?NULL:client);
     size_t body_len = body ? strlen(body) : 0;
-    esp_err_t err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : esp_http_client_open(client, (int)body_len);
+    esp_err_t err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : http_poll_open(client, (int)body_len,poll);
+    phase[3]=client_now_ms();
     size_t sent = 0;
     while (err == ESP_OK && sent < body_len) {
-        int n = esp_http_client_write(client, body + sent, (int)(body_len - sent));
-        if (n <= 0) { err = ESP_FAIL; break; }
+        int n = http_poll_write(client, body + sent, (int)(body_len - sent),poll);
+        if (n <= 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         sent += (size_t)n;
     }
-    if (err == ESP_OK && esp_http_client_fetch_headers(client) < 0) err = ESP_FAIL;
+    if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+    phase[4]=client_now_ms();
     if (out_status) *out_status = esp_http_client_get_status_code(client);
     const size_t limit = 2u * 1024u * 1024u;
     size_t used = 0, capacity = 4096;
@@ -492,8 +549,8 @@ static esp_err_t weread_client_dispatch_raw(
     while (err == ESP_OK) {
         if (weread_client_cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
         char chunk[2048];
-        int n = esp_http_client_read(client, chunk, sizeof(chunk));
-        if (n < 0) { err = ESP_FAIL; break; }
+        int n = http_poll_read(client, chunk, sizeof(chunk),poll);
+        if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         if (!n) {
             if (!esp_http_client_is_complete_data_received(client)) err = ESP_ERR_INVALID_RESPONSE;
             break;
@@ -524,10 +581,11 @@ static esp_err_t weread_client_dispatch_raw(
             (int)err,esp_http_client_get_status_code(client),(unsigned)used,tls,flags);
     }
 #endif
-    http_cleanup(client);
+    phase[5]=client_now_ms();http_cleanup(client);phase[6]=client_now_ms();
+    request_timing(url,phase,err, out_status?*out_status:0,used);
     return err;
 #else
-    return ESP_ERR_INVALID_STATE;
+    (void)phase;(void)background;return ESP_ERR_INVALID_STATE;
 #endif
 }
 
@@ -612,7 +670,7 @@ static esp_err_t weread_client_request_internal(
     size_t resp_len = 0;
     int status = 0;
 
-    esp_err_t err = weread_client_dispatch_raw(url, method, final_headers, body, &resp, &resp_len, &status);
+    esp_err_t err = weread_client_dispatch_raw(url, method, final_headers, body, &resp, &resp_len, &status,s_polling);
     release_headers(&final_headers);
 
     if (out_status) {
@@ -644,7 +702,7 @@ static esp_err_t weread_client_request_internal(
 
     bool is_weblogin = (strstr(url, "/weblogin") != NULL);
 
-    if (!weread_client_cancelled() && err == ESP_OK && is_expired && !is_weblogin && weread_client_is_trusted_url(url) &&
+    if (!s_background && !weread_client_cancelled() && err == ESP_OK && is_expired && !is_weblogin && weread_client_is_trusted_url(url) &&
         weread_auth_is_authenticated()) {
         if (allow_replay) {
             // Renew session
@@ -699,6 +757,61 @@ esp_err_t weread_client_request(
     );
 }
 
+typedef struct { char headers[4096];weread_client_identity_t identity; } request_snapshot_t;
+static bool identity_matches(const weread_client_identity_t *identity) {
+    const weread_auth_session_t *session=weread_auth_get_current_session();
+    return session&&!strcmp(identity->root,weread_auth_get_storage_root())&&!strcmp(identity->vid,session->vid)&&
+        !strcmp(identity->token,session->access_token)&&!strcmp(identity->refresh,session->refresh_token)&&!strcmp(identity->device,session->device_id);
+}
+bool weread_client_identity_get(weread_client_identity_t *out) { WR_GUARD;
+    if(!out)return false;
+    memset(out,0,sizeof(*out));
+    const weread_auth_session_t *s=weread_auth_get_current_session();
+    return s&&wr_copy(out->root,sizeof(out->root),weread_auth_get_storage_root())&&wr_copy(out->vid,sizeof(out->vid),s->vid)&&
+        wr_copy(out->token,sizeof(out->token),s->access_token)&&wr_copy(out->refresh,sizeof(out->refresh),s->refresh_token)&&
+        wr_copy(out->device,sizeof(out->device),s->device_id);
+}
+static void release_snapshot(request_snapshot_t **p) {
+    if (*p) { weread_secure_zero(*p, sizeof(**p)); free(*p); *p = NULL; }
+}
+static esp_err_t request_captured(const char *url, const char *method,
+    const char *custom_headers, const char *body, char **out_resp, size_t *out_len, int *out_status,const weread_client_identity_t *expected) {
+    if (out_resp) *out_resp = NULL;
+    if (out_len) *out_len = 0;
+    if (out_status) *out_status = 0;
+    if (!url || !method || !weread_client_is_trusted_url(url)) return ESP_ERR_INVALID_ARG;
+    request_snapshot_t *snapshot __attribute__((cleanup(release_snapshot))) = wr_alloc(sizeof(*snapshot));
+    if (!snapshot) return ESP_ERR_NO_MEM;
+    {
+        WR_GUARD;
+        if(weread_client_cancelled()||(expected&&!identity_matches(expected))||!weread_client_identity_get(&snapshot->identity))return ESP_ERR_INVALID_STATE;
+        if(!request_headers(url,custom_headers,snapshot->headers))return ESP_ERR_NO_MEM;
+    }
+    // 网络只使用拥有的凭据；本地读取和保存不等待后台HTTP。/ Transport owns its credentials so local reads/saves do not wait for background HTTP.
+    char *response = NULL; size_t bytes = 0; int status = 0;
+    esp_err_t err = weread_client_dispatch_raw(url, method, snapshot->headers, body, &response, &bytes, &status,true);
+    {
+        WR_GUARD;
+        if(weread_client_cancelled()||!identity_matches(&snapshot->identity)) {
+            free(response); return ESP_ERR_INVALID_STATE;
+        }
+    }
+    // 后台失效响应不续期、不清会话；调用方保留待同步记录。/ Background expiry never renews or clears login; the caller retains pending work.
+    if (out_resp) *out_resp = response; else free(response);
+    if (out_len) *out_len = bytes;
+    if (out_status) *out_status = status;
+    return err;
+}
+esp_err_t weread_client_request_snapshot(const char *url,const char *method,const char *headers,
+    const char *body,char **out,size_t *bytes,int *status) {
+    return request_captured(url,method,headers,body,out,bytes,status,NULL);
+}
+esp_err_t weread_client_request_bound(const char *url,const char *method,const char *headers,
+    const char *body,char **out,size_t *bytes,int *status,const weread_client_identity_t *expected) {
+    if(!expected){if(out)*out=NULL;if(bytes)*bytes=0;if(status)*status=0;return ESP_ERR_INVALID_ARG;}
+    return request_captured(url,method,headers,body,out,bytes,status,expected);
+}
+
 void weread_client_set_download_transport(weread_download_transport_fn fn, void *ctx) {
     s_download_transport = fn; s_download_ctx = ctx;
 }
@@ -725,10 +838,14 @@ static esp_err_t download_event(esp_http_client_event_t *event) {
 }
 static esp_err_t download_raw(const char *url, const char *headers, FILE *file, size_t limit,
     weread_cancel_fn cancel, void *ctx, weread_download_info_t *info, char **redirect) {
+    http_poll_t *poll __attribute__((cleanup(wr_release)))=NULL;
+    esp_err_t prepared=http_poll_prepare(url,s_polling,cancel,ctx,&poll);
+    if(prepared!=ESP_OK)return prepared;
     download_event_t event = {.info = info, .redirect = redirect};
     esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
         .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
         .event_handler = download_event, .user_data = &event};
+    http_poll_config(poll,&cfg);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (!client) return ESP_ERR_NO_MEM;
     const char *p = headers;
@@ -746,9 +863,10 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         }
         p = *end ? end + 1 : end;
     }
-    http_active(client);
-    esp_err_t err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : esp_http_client_open(client, 0);
-    if (err == ESP_OK && esp_http_client_fetch_headers(client) < 0) err = ESP_FAIL;
+    if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
+    http_active(poll?NULL:client);
+    esp_err_t err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : http_poll_open(client,0,poll);
+    if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
     info->status = esp_http_client_get_status_code(client);
     if (event.invalid) err = ESP_ERR_INVALID_RESPONSE;
     // 跳转体不属于最终文件；URL和凭据仍由外层逐跳校验。/ Redirect bodies are not file data; the outer loop still validates every URL and its credentials.
@@ -759,8 +877,8 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     char buffer[2048];
     while (err == ESP_OK) {
         if (cancel && cancel(ctx)) { err = ESP_ERR_INVALID_STATE; break; }
-        int n = esp_http_client_read(client, buffer, sizeof(buffer));
-        if (n < 0) { err = ESP_FAIL; break; }
+        int n = http_poll_read(client,buffer,sizeof(buffer),poll);
+        if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         if (!n) {
             if (!esp_http_client_is_complete_data_received(client)) err = ESP_ERR_INVALID_RESPONSE;
             break;
@@ -818,6 +936,7 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         }
         if (!weread_client_is_trusted_url(current) ||
             (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
+        if(s_background)return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
             if (attempt && code == -2013) weread_auth_clear_session();
             return ESP_FAIL;
