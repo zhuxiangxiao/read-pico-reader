@@ -17,10 +17,13 @@ typedef struct {
 esp_err_t weread_progress_load(const char *id, weread_progress_t *out);
 /// 返回云端候选但不替用户覆盖冲突位置；网络失败仍返回本地快照。/ Return a cloud candidate without overwriting conflicts; keep a local snapshot on network errors.
 esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict);
+esp_err_t weread_progress_sync_version(const char *id,weread_progress_t *local,weread_progress_t *cloud,bool *conflict,uint32_t *fresh_version,uint32_t *last_chapter_index);
 /// 显式选择云端或本地后保存；本地选择继续标脏。/ Persist an explicit cloud/local selection; local choices stay dirty.
 esp_err_t weread_progress_select(const char *id, const weread_progress_t *choice, bool from_cloud);
 esp_err_t weread_progress_checkpoint(const char *id,const weread_progress_t *progress);
 esp_err_t weread_progress_note_time(const char *id,uint32_t seconds,uint64_t timestamp);
+/// 一次读盘应用采样，先持久化再报告，并返回最终已持久化状态。/ Load once, persist a sample before reporting, and return the final durable state.
+esp_err_t weread_progress_update(const char *id,weread_progress_t *sample,bool moved,bool force,uint64_t now_ms,uint64_t timestamp,bool *noted);
 esp_err_t weread_progress_note(const char *id, uint32_t uid, uint32_t index, uint32_t offset,
     uint32_t percent, uint32_t seconds, unsigned pages, const char *summary, uint64_t timestamp);
 /// 非强制上报等候 60 秒或十页；失败保持磁盘 dirty。/ Nonforced reports wait 60 seconds or ten pages; errors retain on-disk dirty state.

@@ -12,6 +12,13 @@ typedef struct {
     uint32_t book_version, total_words, progress;
     uint64_t read_update_time, update_time;
 } weread_book_t;
+/// 界面快照只保留展示字段和封面身份，URL留在worker元数据中。/ UI snapshots retain display fields and cover identity; URLs stay in worker metadata.
+typedef struct {
+    char book_id[64],title[256],author[128];
+    uint64_t cover_key;
+    uint32_t progress;
+    bool has_cover;
+} weread_shelf_item_t;
 
 /// 同步成功并落盘后才替换内存；失败保留离线书架。/ Publish only after persistence; retain offline data on errors.
 esp_err_t weread_shelf_sync(bool full);
@@ -26,8 +33,11 @@ esp_err_t weread_shelf_load(void);
 void weread_shelf_clear(void);
 size_t weread_shelf_count(void);
 bool weread_shelf_get(size_t index, weread_book_t *out);
+/// 单遍导出当前快照，输出数组归调用者。/ Export an owned snapshot in one list traversal.
+esp_err_t weread_shelf_snapshot(weread_shelf_item_t **out,size_t *count);
 bool weread_shelf_find(const char *book_id, weread_book_t *out);
 uint32_t weread_shelf_book_version(const char *id);
+esp_err_t weread_shelf_set_version(const char *id,uint32_t version);
 uint64_t weread_shelf_synckey(void);
 bool weread_shelf_cache_fresh(uint64_t now_seconds);
 uint64_t weread_cover_key(const char *book_id,const char *raw_url);

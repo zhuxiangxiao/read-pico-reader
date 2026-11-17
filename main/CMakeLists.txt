@@ -393,7 +393,8 @@ set(weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_rea
     book_index_cache.c settings.c app_device_settings.c app_files.c app_transfer.c
     app_cloud_sync.c ui_keyboard.c book_title.c app_book.c ota_online.c ota_release.c app_onboarding.c
     boot_state.c app_registry.c app_boot_recovery.c ota_update.c
-    app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c book_weread_cover.c)
+    app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c book_weread_cover.c
+    ui_ime.c book_toc.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c)
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)

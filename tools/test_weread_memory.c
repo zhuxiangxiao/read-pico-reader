@@ -74,6 +74,10 @@ int main(void){
         visible=weread_shelf_count();
     }
     assert(visible==800);
+    weread_shelf_item_t *items=NULL;size_t item_count=0;
+    assert(weread_shelf_snapshot(&items,&item_count)==ESP_OK&&item_count==800&&sizeof(*items)<512);
+    weread_book_t first;assert(weread_shelf_get(0,&first)&&!strcmp(items[0].book_id,first.book_id)&&!strcmp(items[0].title,first.title));
+    assert(items[0].cover_key==weread_cover_key(first.book_id,first.cover));heap_caps_free(items);
     assert(weread_shelf_sync(false)==ESP_OK&&weread_shelf_load()==ESP_OK);
     assert(weread_toc_sync("memory_0")==ESP_OK);weread_toc_t toc={0};
     assert(weread_toc_load("memory_0",&toc)==ESP_OK&&toc.count==3000);weread_toc_free(&toc);

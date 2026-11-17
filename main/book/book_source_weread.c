@@ -16,6 +16,7 @@
 #include "weread_store.h"
 #include "weread_position.h"
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,8 @@ static weread_toc_t s_toc;
 static bool s_txt;
 static char s_prepared_id[64],s_prepared_owner[32];
 static weread_toc_t s_prepared_toc;
+static struct {char *text,*roots;size_t len;} s_css;
+static void clear_css(void){free(s_css.text);free(s_css.roots);memset(&s_css,0,sizeof(s_css));}
 void book_weread_clear_prepared(void){WR_GUARD;weread_toc_free(&s_prepared_toc);s_prepared_id[0]=s_prepared_owner[0]=0;}
 bool book_weread_prepared(const char *id){WR_GUARD;
     const weread_auth_session_t *s=weread_auth_get_current_session();
@@ -42,16 +45,25 @@ bool book_weread_cached_version(const char *id,uint32_t *version){WR_GUARD;
     return false;
 }
 esp_err_t book_weread_prepare_open(const char *id){WR_GUARD;
+    uint32_t known=weread_shelf_book_version(id);
+    if(book_weread_prepared(id)&&(!known||known==s_prepared_toc.book_version))return ESP_OK;
     book_weread_clear_prepared();
     if(!wr_valid_id(id)||!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
     esp_err_t err=weread_toc_load(id,&s_prepared_toc);
     if(err!=ESP_OK){err=weread_toc_sync(id);if(err==ESP_OK)err=weread_toc_load(id,&s_prepared_toc);}
     if(err==ESP_OK&&!s_prepared_toc.count)err=ESP_ERR_NOT_FOUND;
+    if(err==ESP_OK&&known&&s_prepared_toc.book_version!=known)err=WEREAD_ERR_VERSION;
     if(err!=ESP_OK){book_weread_clear_prepared();return err;}
     strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);return ESP_OK;
 }
+void book_weread_adopt_prepared(const char *id,weread_toc_t *toc){WR_GUARD;
+    book_weread_clear_prepared();s_prepared_toc=*toc;memset(toc,0,sizeof(*toc));
+    strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);
+}
 esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version){WR_GUARD;
     if(!version||!book_weread_prepared(id))return ESP_ERR_INVALID_STATE;
+    uint32_t known=weread_shelf_book_version(id);
+    if(known&&known!=s_prepared_toc.book_version)return WEREAD_ERR_VERSION;
     size_t i=0;
     while(i<s_prepared_toc.count&&s_prepared_toc.chapters[i].uid!=uid)++i;
     if(i==s_prepared_toc.count||(index&&index!=s_prepared_toc.chapters[i].index))return WEREAD_ERR_POSITION;
@@ -100,7 +112,7 @@ bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
     return true;
 }
 bool book_weread_is_open(void) { return s_id[0] != 0; }
-void book_weread_close(void) { WR_GUARD; s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
+void book_weread_close(void) { WR_GUARD; clear_css();s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
 esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_id)) return ESP_ERR_INVALID_ARG;
     if (!weread_auth_is_authenticated()) {
@@ -118,6 +130,8 @@ esp_err_t book_weread_open(const char *uri) { WR_GUARD;
         if (err == ESP_OK) err = weread_toc_load(uri + 9, &toc);
     }
     if (err != ESP_OK) return err;
+    uint32_t known=weread_shelf_book_version(uri+9);
+    if(known&&toc.book_version!=known){weread_toc_free(&toc);return WEREAD_ERR_VERSION;}
     if (!toc.count) { weread_toc_free(&toc); return ESP_ERR_NOT_FOUND; }
     book_weread_close(); s_toc = toc;
     strcpy(s_id, uri + 9); s_txt = !strcasecmp(b.format, "txt");
@@ -144,39 +158,54 @@ uint32_t book_weread_offset(size_t index) {
 }
 uint32_t book_weread_total(void) { return book_weread_offset(s_toc.count); }
 
-static bool collect_css(const char *dir, char *css, size_t *used, size_t cap, unsigned depth) {
+static bool collect_css(const char *dir, char **css, size_t *used, size_t cap, unsigned depth) {
     if (depth > 8) return true;
-    DIR *d = opendir(dir); if (!d) return true;
+    DIR *d = opendir(dir); if (!d) return false;
     char *path __attribute__((cleanup(wr_release)))=wr_alloc(1024);
     if(!path){closedir(d);return false;}
     bool ok=true;
     struct dirent *e;
-    while ((e = readdir(d))) {
+    for(;;){
+        errno=0;e=readdir(d);if(!e){if(errno)ok=false;break;}
         if (*e->d_name == '.') continue;
         int n = snprintf(path, 1024, "%s/%s", dir, e->d_name);
         if (n < 0 || n >= 1024) continue;
-        struct stat st; if (lstat(path, &st)) continue;
+        struct stat st; if (lstat(path, &st)) {ok=false;break;}
         if (S_ISDIR(st.st_mode)) {if(!collect_css(path,css,used,cap,depth+1)){ok=false;break;}continue;}
         const char *ext = strrchr(e->d_name, '.');
         if (!S_ISREG(st.st_mode) || !ext || strcasecmp(ext, ".css") || st.st_size < 0 || (uint64_t)st.st_size + 2 > cap - *used) continue;
-        FILE *f = fopen(path, "rb"); if (!f) continue;
+        if(!st.st_size)continue;
+        if(!*css){*css=wr_alloc(cap);if(!*css){ok=false;break;}}
+        FILE *f = fopen(path, "rb"); if (!f) {ok=false;break;}
         size_t len = (size_t)st.st_size;
-        if (fread(css + *used, 1, len, f) == len) { *used += len; css[(*used)++] = '\n'; }
-        fclose(f);
+        if (fread(*css + *used, 1, len, f) == len&&!ferror(f)) { *used += len; (*css)[(*used)++] = '\n'; }
+        else ok=false;
+        if(fclose(f))ok=false;
+        if(!ok)break;
     }
-    closedir(d); css[*used] = 0;return ok;
+    closedir(d); if(*css)(*css)[*used] = 0;return ok;
 }
-static char *chapter_css(size_t i, size_t *used) {
+static const char *chapter_css(size_t i,const char *validated_root,size_t *used) {
     const size_t cap = 256u * 1024u;
-    char *css = wr_alloc(cap); *used = 0;
-    if (!css) return NULL;
-    css[0] = 0;
-    char resource[512], chapter[512];
-    bool have_res = weread_chapter_resource_directory(s_id, resource, sizeof(resource)) == ESP_OK;
-    bool have_ch = weread_chapter_directory(s_id, book_weread_uid(i), chapter, sizeof(chapter)) == ESP_OK;
-    if ((have_res&&!collect_css(resource,css,used,cap,0)) ||
-        (have_ch&&(!have_res||strcmp(resource,chapter))&&!collect_css(chapter,css,used,cap,0))) {free(css);return NULL;}
-    return css;
+    *used = 0;char resource[512]="", chapter[512]="";
+    esp_err_t res=weread_chapter_resource_directory(s_id,resource,sizeof(resource));
+    esp_err_t ch=validated_root?(wr_copy(chapter,sizeof(chapter),validated_root)?ESP_OK:ESP_ERR_INVALID_SIZE):weread_chapter_directory(s_id,book_weread_uid(i),chapter,sizeof(chapter));
+    if((res!=ESP_OK&&res!=ESP_ERR_NOT_FOUND)||ch!=ESP_OK)return NULL;
+    bool have_res=res==ESP_OK,have_ch=ch==ESP_OK;
+    if(!have_res)resource[0]=0;
+    if(!have_ch)chapter[0]=0;
+    if(s_css.roots&&!strcmp(s_css.roots,resource)&&!strcmp(s_css.roots+strlen(s_css.roots)+1,chapter)){*used=s_css.len;return s_css.text;}
+    // 缓存只保留当前资源代次的CSS，避免每次映射遍历全部图片。/ Keep only the current resource generation's CSS, avoiding image-directory scans on each mapping.
+    clear_css();char *css=NULL;
+    if ((have_res&&!collect_css(resource,&css,used,cap,0)) ||
+        (have_ch&&(!have_res||strcmp(resource,chapter))&&!collect_css(chapter,&css,used,cap,0))) {free(css);return NULL;}
+    if(!css)css=wr_alloc(1);
+    if(!css)return NULL;
+    size_t rlen=strlen(resource)+1,clen=strlen(chapter)+1;
+    s_css.roots=wr_alloc(rlen+clen);if(!s_css.roots){free(css);return NULL;}
+    memcpy(s_css.roots,resource,rlen);memcpy(s_css.roots+rlen,chapter,clen);
+    char *small=wr_realloc(css,*used+1);s_css.text=small?small:css;s_css.len=*used;
+    return s_css.text;
 }
 esp_err_t book_weread_load(size_t i, const char *anchor, size_t *offset, html_text_t *out) { WR_GUARD;
     if (!out || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
@@ -185,10 +214,10 @@ esp_err_t book_weread_load(size_t i, const char *anchor, size_t *offset, html_te
     esp_err_t err = weread_chapter_load_cached(s_id, book_weread_uid(i), &text, &len);
     if (err != ESP_OK) return err;
     if (s_txt) { out->utf8 = text; out->len = len; return ESP_OK; }
-    size_t used = 0; char *css = chapter_css(i, &used);
+    size_t used = 0; const char *css = chapter_css(i,NULL,&used);
     if (!css) { free(text); return ESP_ERR_NO_MEM; }
     err = html_to_blocks_with_css_anchor(text, len, css, used, anchor, offset, out);
-    free(css); free(text); return err;
+    free(text); return err;
 }
 typedef struct {
     const char *html;
@@ -214,6 +243,7 @@ esp_err_t book_weread_map(size_t i, bool to_cloud, uint32_t input, uint32_t *out
     if(!path)return ESP_ERR_NO_MEM;
     esp_err_t err = weread_chapter_directory(s_id, book_weread_uid(i), path, 1024);
     if (err != ESP_OK) return err;
+    size_t root_length=strlen(path);
     strcat(path,"/position.map");
     FILE *f = fopen(path, "rb"); if (!f) return ESP_ERR_NOT_FOUND;
     weread_position_header_t header = {0};
@@ -228,7 +258,9 @@ esp_err_t book_weread_map(size_t i, bool to_cloud, uint32_t input, uint32_t *out
         valid = points[j].byte <= header.bytes && points[j].unit <= header.units &&
             (!j || (points[j].byte >= points[j - 1].byte && points[j].unit >= points[j - 1].unit));
     if (!valid) { free(points); return ESP_ERR_INVALID_RESPONSE; }
-    err = weread_chapter_load_cached(s_id, book_weread_uid(i), &text, &len);
+    strcpy(path+root_length,"/body.html");
+    err=weread_chapter_read_validated(path,&text,&len);
+    path[root_length]=0;
     if (err == ESP_OK && len != header.bytes) err = ESP_ERR_INVALID_RESPONSE;
     position_mapper_t mapper = {.html = text, .points = points, .count = header.count, .goal = input, .to_cloud = to_cloud};
     html_text_t parsed = {0};
@@ -237,10 +269,9 @@ esp_err_t book_weread_map(size_t i, bool to_cloud, uint32_t input, uint32_t *out
             if (((unsigned char)text[at] & 0xc0) != 0x80) mapped_character(&mapper, at, at);
         parsed.len = len;
     } else if (err == ESP_OK) {
-        size_t css_len = 0; char *css = chapter_css(i, &css_len);
+        size_t css_len = 0; const char *css = chapter_css(i,path,&css_len);
         if (!css) err = ESP_ERR_NO_MEM;
         else err = html_to_blocks_mapped(text, len, css, css_len, mapped_character, &mapper, &parsed);
-        free(css);
     }
     if (err == ESP_OK) *output = mapper.found ? mapper.result : to_cloud ? header.units : (uint32_t)parsed.len;
     html_text_free(&parsed); free(text); free(points); return err;

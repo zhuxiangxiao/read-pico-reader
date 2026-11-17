@@ -7,11 +7,14 @@
 #pragma once
 #include "html_text.h"
 #include "book_weread_uri.h"
+#include "weread_toc.h"
 #include <sys/stat.h>
 bool book_weread_is_open(void);
 esp_err_t book_weread_open(const char *uri);
 void book_weread_close(void);
 esp_err_t book_weread_prepare_open(const char *id);
+/// 接管已校验的目录，不复制章节数组。/ Take ownership of a validated TOC without copying its chapter array.
+void book_weread_adopt_prepared(const char *id,weread_toc_t *toc);
 bool book_weread_prepared(const char *id);
 void book_weread_clear_prepared(void);
 bool book_weread_cached_version(const char *id,uint32_t *version);

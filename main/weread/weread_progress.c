@@ -11,6 +11,7 @@
 #include "weread_store.h"
 #include "weread_shelf.h"
 #include "weread_client.h"
+#include "weread_chapter.h"
 #include "book_weread_crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,8 +104,10 @@ static esp_err_t request(const char *url, const char *body, cJSON **out, int *st
     return err;
 }
 static bool fallback(const cJSON *r, int status) { return status == 401 || error_code(r) == -2012; }
-esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict) { WR_GUARD;
+esp_err_t weread_progress_sync_version(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict,uint32_t *known_version,uint32_t *last_chapter) { WR_GUARD;
     if (!wr_valid_id(id) || !local || !cloud || !conflict) return ESP_ERR_INVALID_ARG;
+    if(known_version)*known_version=0;
+    if(last_chapter)*last_chapter=0;
     bool have_local = weread_progress_load(id, local) == ESP_OK;
     memset(cloud, 0, sizeof(*cloud)); *conflict = false;
     // 原生syncbook同时返回完整进度，避免不兼容getProgress引发续期/重放/Web链。
@@ -115,8 +118,15 @@ esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_
     int status = 0; cJSON *r = NULL;
     esp_err_t err = request(url, body, &r, &status);
     if(err!=ESP_OK && (!status || err==ESP_ERR_NO_MEM)){cJSON_Delete(r);return err;}
-    const cJSON *book = NULL;
+    const cJSON *book = NULL;uint32_t fresh_version=0,last_index=0;
     if(err==ESP_OK){
+        const cJSON *detail=NULL,*entry;
+        cJSON_ArrayForEach(entry,cJSON_GetObjectItemCaseSensitive(r,"books")){
+            const char *saved_id=wr_string(entry,"bookId");
+            if(saved_id&&!strcmp(saved_id,id)){if(detail){cJSON_Delete(r);return ESP_ERR_INVALID_RESPONSE;}detail=entry;}
+        }
+        if(detail&&!field(detail,"bookVersion",&fresh_version,false)){cJSON_Delete(r);return ESP_ERR_INVALID_RESPONSE;}
+        if(detail&&!field(detail,"lastChapterIdx",&last_index,false))last_index=0;
         const cJSON *positions=cJSON_GetObjectItemCaseSensitive(r,"bookProgress"),*p;
         if(cJSON_IsArray(positions))cJSON_ArrayForEach(p,positions){
             const char *saved_id=wr_string(p,"bookId");
@@ -143,6 +153,13 @@ esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_
     }
     cJSON_Delete(r);
     if (err != ESP_OK) return err;
+    // 只有本次书籍元数据可证明当前版本；阅读位置快照不能回写旧版。/ Only fresh book metadata proves the current version; progress snapshots cannot restore an older version.
+    if(known_version)*known_version=fresh_version;
+    if(last_chapter)*last_chapter=last_index;
+    if(fresh_version){esp_err_t updated=weread_shelf_set_version(id,fresh_version);
+        if(updated!=ESP_OK&&updated!=ESP_ERR_NOT_FOUND)return updated;}
+    uint32_t version=fresh_version?fresh_version:weread_shelf_book_version(id);
+    if(version&&cloud->book_version&&version!=cloud->book_version)return WEREAD_ERR_VERSION;
     bool different = have_local && (local->chapter_uid != cloud->chapter_uid || local->chapter_offset != cloud->chapter_offset ||
         local->chapter_index != cloud->chapter_index || (local->book_version && cloud->book_version && local->book_version != cloud->book_version));
     if(have_local&&!different)local->progress=cloud->progress;
@@ -153,8 +170,16 @@ esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_
     }
     return err;
 }
+esp_err_t weread_progress_sync(const char *id,weread_progress_t *local,weread_progress_t *cloud,bool *conflict){
+    return weread_progress_sync_version(id,local,cloud,conflict,NULL,NULL);
+}
 esp_err_t weread_progress_checkpoint(const char *id,const weread_progress_t *p){WR_GUARD;
     if (!p || !p->chapter_uid || p->progress > 100 || !memchr(p->summary, 0, sizeof(p->summary))) return ESP_ERR_INVALID_ARG;
+    weread_progress_t old;
+    if(weread_progress_load(id,&old)==ESP_OK&&old.chapter_uid==p->chapter_uid&&old.chapter_index==p->chapter_index&&
+       old.chapter_offset==p->chapter_offset&&old.progress==p->progress&&old.book_version==p->book_version&&
+       old.reading_time==p->reading_time&&old.pending_pages==p->pending_pages&&old.updated_at==p->updated_at&&
+       old.last_report_ms==p->last_report_ms&&old.dirty==p->dirty&&old.position_pending==p->position_pending&&!strcmp(old.summary,p->summary))return ESP_OK;
     return save(id,p);
 }
 esp_err_t weread_progress_select(const char *id, const weread_progress_t *p, bool from_cloud) { WR_GUARD;
@@ -183,12 +208,11 @@ esp_err_t weread_progress_note(const char *id, uint32_t uid, uint32_t index, uin
     weread_book_t book; if (weread_shelf_find(id, &book)) p.book_version = book.book_version;
     return save(id, &p);
 }
-esp_err_t weread_progress_report(const char *id, bool force, uint64_t now) { WR_GUARD;
+static esp_err_t report_saved(const char *id,weread_progress_t *saved,bool force,uint64_t now){
     if (!wr_valid_id(id)) return ESP_ERR_INVALID_ARG;
+    weread_progress_t p=*saved;esp_err_t err=ESP_OK;
+    if (!p.dirty || !p.position_pending) return ESP_OK;
     if (!force && !strcmp(id, s_retry_id) && now >= s_retry_started && now < s_retry_at) return ESP_ERR_TIMEOUT;
-    weread_progress_t p;
-    esp_err_t err = weread_progress_load(id, &p);
-    if (err != ESP_OK || !p.dirty || !p.position_pending) return err;
     if (!force && p.pending_pages < 10 && now >= p.last_report_ms && now - p.last_report_ms < 60000) return ESP_OK;
     cJSON *body = encode(&p), *r = NULL;
     if (!body || !cJSON_AddStringToObject(body, "bookId", id)) { cJSON_Delete(body); return ESP_ERR_NO_MEM; }
@@ -217,5 +241,25 @@ esp_err_t weread_progress_report(const char *id, bool force, uint64_t now) { WR_
     }
     s_retry_id[0] = 0;
     p.dirty = p.position_pending = false; p.reading_time = 0; p.pending_pages = 0; p.last_report_ms = now;
-    return save(id, &p);
+    err=save(id, &p);if(err==ESP_OK)*saved=p;return err;
+}
+esp_err_t weread_progress_report(const char *id,bool force,uint64_t now){WR_GUARD;
+    weread_progress_t p;esp_err_t err=weread_progress_load(id,&p);
+    return err==ESP_OK?report_saved(id,&p,force,now):err;
+}
+esp_err_t weread_progress_update(const char *id,weread_progress_t *sample,bool moved,bool force,uint64_t now,uint64_t timestamp,bool *noted){WR_GUARD;
+    if(!sample||!noted||timestamp>9007199254740991ULL)return ESP_ERR_INVALID_ARG;
+    *noted=false;weread_progress_t p;
+    esp_err_t err=weread_progress_load(id,&p);if(err!=ESP_OK&&(!moved||err!=ESP_ERR_NOT_FOUND))return err;
+    if(moved){
+        if(!sample->chapter_uid||sample->progress>100||!memchr(sample->summary,0,sizeof(sample->summary)))return ESP_ERR_INVALID_ARG;
+        p.chapter_uid=sample->chapter_uid;p.chapter_index=sample->chapter_index;p.chapter_offset=sample->chapter_offset;p.progress=sample->progress;
+        wr_display_copy(p.summary,sizeof(p.summary),sample->summary);p.position_pending=true;
+        uint32_t version=weread_shelf_book_version(id);if(version)p.book_version=version;
+        p.pending_pages=sample->pending_pages>UINT32_MAX-p.pending_pages?UINT32_MAX:p.pending_pages+sample->pending_pages;
+    }
+    p.reading_time=sample->reading_time>UINT32_MAX-p.reading_time?UINT32_MAX:p.reading_time+sample->reading_time;
+    if(moved||sample->reading_time){p.updated_at=timestamp;p.dirty=true;err=save(id,&p);if(err!=ESP_OK)return err;}
+    *noted=true;*sample=p;
+    err=report_saved(id,&p,force,now);*sample=p;return err;
 }

@@ -11,6 +11,7 @@ Open **Shelf → 微信读书**. Pico and S31 share login, caching, UI and synch
   Fetch at most6 books for the first page, then up to20 per background batch. Show cached books immediately; opening interrupts background loading. Missing details retain visible books without advancing the sync cursor.
 - 默认网格，可切换列表；支持书名和作者搜索、分页、逐本封面加载。单击阅读，长按清理该书离线内容。清理保留阅读进度，退出登录删除所有凭据副本。
 - 书架缓存先上屏；完整同步后5分钟内重复进入不自动联网同步，过期后空闲1秒再后台增量检查。手动刷新立即检查；失败暂缓重试，首次/未完成书架继续分批加载。
+- 增量检查确认游标相同且所有变更集合为空时，保留原书架，仅原子更新很小的核对时间记录；部分同步、缺失详情、游标或账号变化仍走完整事务。
 - 当前页先读完本地封面点阵，再补远端缺图；切换列表/网格复用同组像素，书架重排按书号和封面版本转移。账号、书号、原图地址或点阵格式变化使对应缓存失效；失败封面短期负缓存，手动刷新可重试。
   Start in grid view and switch to a list if preferred; search titles/authors and load covers progressively. Tap to read or hold to clear that book's content while retaining progress. Logout removes every credential copy.
 - 普通开书先检查本机和云端位置；存在冲突时明确选择。离线保留书架、目录和已完整下载的章节，未缓存章节需要联网。
@@ -53,6 +54,14 @@ QR results allow65-second long polls (idle replies measured at about55s), includ
 Authentication accepts root/data aliases and trusted login Set-Cookie tokens, with a single renewal/replay. Non-HTTPS/non-qq.com destinations receive no credentials and redirects are disabled; loopback exceptions exist only in host tests.
 
 开书优先 fresh 请求 reMarkable 原生 `/shelf/syncbook` 的单书完整 `bookProgress`；精确匹配书号并要求 UID/目录序号/偏移/百分比四字段。缺失或不完整才走原生 `getProgress` 及其必要兼容回退，不能把缺字段伪造为未读。完整原生路径将进度读取降到一次请求。选择位置后复用刚同步目录；正文就绪即进入阅读，封面预热移到同一 worker 的阅读空闲期。
+
+目录按账号和书籍版本长期复用；本次原生书籍元数据确认同版本时不因时间自动失效。缺少可靠版本号或版本为0时，每24小时兜底核对；旧书架版本和阅读位置中的版本不作为本次确认。开书仍先取最新单书进度及原生版本元数据，版本变化、目标UID缺失、章节序号不匹配、最新章节索引超出缓存或无可用目录时刷新。同版本的有效原子恢复副本也可使用。服务端进度/目录/正文版本矛盾时拒绝继续，包括版本自愈失败后的冷恢复。缓存章节命中时把已校验的typed目录直接交给阅读器；未缓存章节在下载解压前释放该目录，维持峰值内存预算。进入阅读器复用本次已校验的账号/书架快照；换卡、冷入口仍重绑定。
+
+书架快照单遍导出，仅保留展示字段、封面身份和是否有封面，完整URL留在worker；800本单份快照减少约425KiB。目录和书架按ID排序查重，待补齐书号通过临时哈希表去重并保持服务端顺序，渐进批次通过节点游标推进。可见封面齐全或均处于退避时立即接续书架批次，缺图仍保留下载机会。每批提交的掉电恢复语义保持。CSS仅缓存当前资源代次，切书释放、资源根变化失效；目录/文件读取失败不发布缓存，无CSS章节不申请256KiB工作区。封面预热命中成品只检查文件，HTTPS跳转的中间响应体不写卡。
+
+同一次位置映射复用已经校验的章节根目录读取正文和CSS，保留正文大小、完整读取和最终位置校验；缓存章节命中后不再重复探测。解包复用本次已确认的父目录，但每个文件仍检查路径、冲突、CRC和取消。
+
+进度采样合并为一次读盘事务：先保存本次读秒/导航，再按原节流规则上报并返回最终持久化状态；清dirty落盘失败时仍返回待报状态。无变化的开书检查点不重复写盘。串口 `open timing` 分别记录进度、目录、章节及校验准备毫秒数，阅读页切换日志用于继续核对前台解析、排版和上屏耗时。
 Each open first fetches a fresh single-book native reMarkable `/shelf/syncbook` position, matching the book ID and requiring UID, ordinal, offset and percentage. Missing/incomplete records retain the native `getProgress` compatibility path; they are never invented as unread positions. Complete native positions need one request. Choices reuse the synchronized TOC; ready text opens immediately and the same worker warms covers during reader idle.
 
 开书在写入所选位置前验证最终目录的 UID/序号、原文偏移范围及映射文件完整性；旧版本的矛盾位置不会被直接改成本版或裁到章节边界。失败保留原本机 dirty 和待上报时长，并提示先在手机重新打开该书。
@@ -79,6 +88,7 @@ Root `/sdcard/.kiikoread/weread`:
 | --- | --- |
 | `auth.json` | 凭据 / Credentials |
 | `shelf.json` | 账号归属的离线书架 / Account-bound offline shelf |
+| `shelf-check.json` | 绑定账号和书架游标的核对时间 / Last check bound to owner and shelf key |
 | `cache/<id>/chapters.json` | 目录与版本 / TOC and version |
 | `cache/<id>/progress.json` | 账号归属的位置和dirty状态 / Account-bound position and dirty state |
 | `cache/<id>/chapter-<uid>.json`, `resources.json` | 完整目录提交指针 / Committed chapter/resource directories |
@@ -108,5 +118,5 @@ C tests use ASan/UBSan. Constrained-pool tests cover800 staged books,3000 chapte
 双板使用 `tools/build_firmware.py --board all` 独立构建与验证，产物仅放在ignored build目录。菜单调度和冷解析按体积编译，阅读绘制及图片热路径保持O2；没有扩大分区、删字库或改变波形/供电。保留正式版本号，不覆盖已发布下载、不自动刷机、不发布。
 Build/verify both boards independently with `tools/build_firmware.py --board all`; outputs stay under ignored build directories. Size-optimize menu dispatch/cold parsing while keeping reader/image paint hot paths atO2. Partitions, fonts, waveforms and power remain intact. Keep published version numbers without replacing downloads, flashing or publishing.
 
-Pico本轮用户已确认书架更流畅、从目录找回的位置退书重开后保持，自导入封面此前已确认正常；旧86%位置未做估算恢复。仍待长时验证：会话续期、手机与设备交替阅读、S31正文及封面实屏、慢网切章、拔卡/换卡、浅睡与深睡恢复。宿主测试不构成这些验收。
+Pico用户已确认书架更流畅、从目录找回的位置退书重开后保持；第一阶段性能版连续开同一本书的第二次明显更快且位置正确。第二阶段用户反馈功能正常，速度变化不明显；一次实测worker准备6243ms，其中云进度阶段5184ms（包含网络准备），不是两版对照耗时。自导入封面此前已确认正常；旧86%位置未做估算恢复。仍待长时验证：会话续期、手机与设备交替阅读、S31正文及封面实屏、慢网切章、拔卡/换卡、浅睡与深睡恢复。宿主测试不构成这些验收。
 Device acceptance remains: updated session renewal, phone/device positions both ways (including the reported86%-to-start mismatch), S31 text and both panels' covers, slow-network chapter changes, media loss/replacement and light/deep sleep. Host results do not constitute these checks.

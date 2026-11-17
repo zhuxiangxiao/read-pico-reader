@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 static unsigned version = 100, downloads;
+static unsigned toc_requests;
 static unsigned reports, reported_offset, reported_percent, reported_seconds;
 static bool selfheal, moved, corrupt, bad_offset, bad_index;
 static esp_err_t request(const char *url, const char *method, const char *headers, const char *body,
@@ -35,8 +36,10 @@ static esp_err_t request(const char *url, const char *method, const char *header
         reported_percent=(unsigned)cJSON_GetObjectItem(o,"progress")->valuedouble;
         reported_seconds=(unsigned)cJSON_GetObjectItem(o,"readingTime")->valuedouble;
         cJSON_Delete(o);strcpy(text,"{\"succ\":1}");
-    }else if (strstr(url, "/book/chapterInfos"))
+    }else if (strstr(url, "/book/chapterInfos")){
+        ++toc_requests;
         snprintf(text, sizeof(text), "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":%u,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"first\"},{\"chapterUid\":2,\"chapterIdx\":%u,\"title\":\"second\"}]}]}", version,moved&&version==101?67u:2u);
+    }
     else if (strstr(url, "/book/getProgress"))
         snprintf(text,sizeof(text),"{\"bookId\":\"test_book_101\",\"book\":{\"chapterUid\":2,\"chapterIdx\":%u,\"chapterOffset\":%u,\"progress\":86}}",bad_index?67u:2u,bad_offset?UINT32_MAX:20u);
     else snprintf(text, sizeof(text), "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"fixture\",\"format\":\"epub\",\"bookVersion\":%u}]}", version);
@@ -134,6 +137,12 @@ int main(int argc, char **argv) {
     chapter = 42; offset = 99;
     assert(weread_reader_resume(uri, &chapter, &offset) == ESP_OK && chapter == 1 && offset == 15);
     assert(downloads == (selfheal ? 2u : 1u));
-    book_weread_close(); weread_runtime_stop(); weread_shelf_clear();
+    book_weread_close();weread_runtime_stop();
+    unsigned before_toc=toc_requests;
+    assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));started=time(NULL);
+    while(weread_runtime_busy()){assert(time(NULL)-started<10);usleep(1000);}
+    assert(weread_runtime_poll(&result)&&result.open_ready&&result.error==ESP_OK&&!result.conflict);
+    assert(toc_requests==before_toc&&weread_reader_open_ready("weread://test_book_101")&&downloads==(selfheal?2u:1u));
+    weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
     puts(selfheal ? "Open-time version recovery passed." : "Updated-book open passed."); return 0;
 }

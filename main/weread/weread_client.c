@@ -751,6 +751,10 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     if (err == ESP_OK && esp_http_client_fetch_headers(client) < 0) err = ESP_FAIL;
     info->status = esp_http_client_get_status_code(client);
     if (event.invalid) err = ESP_ERR_INVALID_RESPONSE;
+    // 跳转体不属于最终文件；URL和凭据仍由外层逐跳校验。/ Redirect bodies are not file data; the outer loop still validates every URL and its credentials.
+    if(err==ESP_OK&&*redirect&&(info->status==301||info->status==302||info->status==303||info->status==307||info->status==308)){
+        http_cleanup(client);return ESP_OK;
+    }
     if (esp_http_client_get_content_length(client) > (int64_t)limit) err = ESP_ERR_INVALID_SIZE;
     char buffer[2048];
     while (err == ESP_OK) {

@@ -39,7 +39,7 @@
 #define MAIN_ACTION ((EpdRect){36,1050,292,72})
 #define SIDE_ACTION ((EpdRect){356,1050,292,72})
 extern const app_desc_t app_transfer;
-static weread_book_t *s_books;
+static weread_shelf_item_t *s_books;
 static size_t s_count, s_visible;
 static uint16_t *s_matches;
 static int s_page;
@@ -77,7 +77,7 @@ static void filter_page(bool reset) {
     else {int pages=(int)((s_visible+ROWS-1)/ROWS);if(s_page>=pages)s_page=pages?pages-1:0;}
 }
 static void filter(void){filter_page(true);}
-static weread_book_t *row_book(int row) {
+static weread_shelf_item_t *row_book(int row) {
     size_t i = (size_t)s_page * ROWS + (size_t)row;
     return s_matches && i < s_visible ? &s_books[s_matches[i]] : NULL;
 }
@@ -85,24 +85,30 @@ static bool covers_checked(void) {
     for(int i=0;i<ROWS;++i)if(row_book(i)&&!s_covers[i].checked)return false;
     return true;
 }
+static bool covers_waiting(uint64_t now){
+    for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);
+        if(b&&b->has_cover&&!s_covers[i].pixels&&(!s_covers[i].checked||now>=s_covers[i].retry.not_before_ms))return true;
+    }
+    return false;
+}
 static uint64_t page_signature(void) {
     uint64_t h=14695981039346656037ULL;
-    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b)break;
-        const char *fields[]={b->book_id,b->title,b->author,b->cover};
-        for(unsigned j=0;j<4;++j)for(const unsigned char *p=(const unsigned char *)fields[j];;p++){
+    for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(!b)break;
+        const char *fields[]={b->book_id,b->title,b->author};
+        for(unsigned j=0;j<3;++j)for(const unsigned char *p=(const unsigned char *)fields[j];;p++){
             h=(h^*p)*1099511628211ULL;if(!*p)break;
         }
-        h=(h^b->progress)*1099511628211ULL;
+        h=(h^b->progress^b->cover_key)*1099511628211ULL;
     }
     return h^s_visible^((uint64_t)s_page<<32);
 }
 static void adopt_books(weread_result_t *r) {
     row_cover_t old[ROWS];char ids[ROWS][64]={{0}};
     memcpy(old,s_covers,sizeof(old));memset(s_covers,0,sizeof(s_covers));
-    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b)strcpy(ids[i],b->book_id);}
+    for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b)strcpy(ids[i],b->book_id);}
     free(s_books);s_books=r->books;r->books=NULL;s_count=r->count;filter_page(false);
-    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b)continue;
-        uint64_t k=weread_cover_key(b->book_id,b->cover);
+    for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(!b)continue;
+        uint64_t k=b->cover_key;
         for(int j=0;j<ROWS;++j)if(!strcmp(ids[j],b->book_id)&&old[j].key==k){s_covers[i]=old[j];old[j].pixels=NULL;break;}
         s_covers[i].key=k;
     }
@@ -182,7 +188,7 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
     ui_draw_button(fb,(EpdRect){36,188,390,48},s_query[0]?s_query:"搜索书名 / 作者",false);
     ui_draw_button(fb,(EpdRect){450,188,198,48},s_grid?"切换列表":"切换网格",false);
     for (int i = 0; i < ROWS; ++i) {
-        weread_book_t *book = row_book(i); if (!book) break;
+        weread_shelf_item_t *book = row_book(i); if (!book) break;
         EpdRect r = row_rect(i), cover = s_grid ? (EpdRect){r.x+38,r.y+8,112,154} : (EpdRect){r.x+8,r.y+5,64,88};
         cover_draw(fb,cover,s_covers[i].pixels);
         EpdRect title = s_grid ? (EpdRect){r.x+4,r.y+170,r.width-8,66} : (EpdRect){r.x+90,r.y+8,498,48};
@@ -256,7 +262,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
         int target=s_page+(x<180?-1:x>500?1:0);
         if(target>=0&&target<pages&&target!=s_page){stop_job();s_page=target;release_covers();return APP_REDRAW_PAGE;}
     }
-    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b&&ui_rect_hit(row_rect(i),x,y)){
+    for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&ui_rect_hit(row_rect(i),x,y)){
         if(e->type==UI_GESTURE_LONG_PRESS){stop_job();strcpy(s_id,b->book_id);s_clear=true;}
         else open_id(b->book_id);
         return APP_REDRAW_PAGE;
@@ -305,7 +311,7 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             char uri[80];snprintf(uri,sizeof(uri),"weread://%s",r.id);
             if(app_book_request_open(uri)){s_keep_network=true;ctx->request_app=app_at(1);}
         }
-        if(r.job==WR_JOB_COVER){for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
+        if(r.job==WR_JOB_COVER){for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
             s_covers[i].checked=true;
             if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;}
             else if(s_cover_remote)weread_cover_retry_result(&s_covers[i].retry,
@@ -327,7 +333,7 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             else message("TF 卡不可用，请重新挂载后进入");
         }
         if(r.job==WR_JOB_SYNC){
-            s_syncing=false;s_more_sync=r.shelf_loading;s_next_sync=ctx->now_ms+800;
+            s_syncing=false;s_more_sync=r.shelf_loading;s_next_sync=ctx->now_ms+(covers_waiting(ctx->now_ms)?800:0);
             s_sync_check=ctx->now_ms+(r.error==ESP_OK?300000:60000);
             s_sync_not_before=r.error==ESP_OK?0:ctx->now_ms+60000;
             if(r.error!=ESP_OK)s_more_sync=false;
@@ -359,14 +365,14 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     }
     if(!s_auth&&s_uid[0]&&(uint64_t)ctx->now_ms>=s_next_poll){s_next_poll=ctx->now_ms+2000;start(WR_JOB_POLL,NULL,s_uid);return APP_REDRAW_NONE;}
     if(s_auth&&(uint64_t)ctx->now_ms>=s_next_action){
-        for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b||s_covers[i].pixels||s_covers[i].checked)continue;
-            s_covers[i].key=weread_cover_key(b->book_id,b->cover);s_cover_remote=false;
+        for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(!b||s_covers[i].pixels||s_covers[i].checked)continue;
+            s_covers[i].key=b->cover_key;s_cover_remote=false;
             start(WR_JOB_COVER,b->book_id,s_force_cover?"retry":NULL);s_next_action=ctx->now_ms+150;return APP_REDRAW_NONE;
         }
-        for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b||s_covers[i].pixels)continue;
-            char url[512];if(!b->cover[0]||weread_cover_retry_url(b->cover,&s_covers[i].retry,ctx->now_ms,url,sizeof(url))!=ESP_OK)continue;
+        for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(!b||s_covers[i].pixels)continue;
+            if(!b->has_cover||ctx->now_ms<s_covers[i].retry.not_before_ms)continue;
             if(!idle)continue;
-            s_cover_remote=true;start(WR_JOB_COVER,b->book_id,url);break;
+            s_cover_remote=true;start(WR_JOB_COVER,b->book_id,s_covers[i].retry.original?"original":"remote");break;
         }s_next_action=ctx->now_ms+150;
         if(covers_checked())s_force_cover=false;
     }

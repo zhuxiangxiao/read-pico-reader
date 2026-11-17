@@ -127,17 +127,25 @@ static esp_err_t read_file(const char *path, char **out, size_t *len) {
     if (!ok) { free(buf); return ESP_FAIL; }
     buf[n] = 0; *out = buf; *len = n; return ESP_OK;
 }
-typedef struct { char root[512], name[512]; FILE *file; esp_err_t error; } extract_t;
+esp_err_t weread_chapter_read_validated(const char *path,char **out,size_t *len){WR_GUARD;
+    if(!path||!out||!len)return ESP_ERR_INVALID_ARG;
+    return read_file(path,out,len);
+}
+typedef struct { char root[512], name[512],parent[1024]; FILE *file; esp_err_t error; } extract_t;
 static bool extract(void *ctx, const char *name, const uint8_t *bytes, size_t n, size_t offset, size_t total) {
     extract_t *x = ctx;
     if (cancelled()) return false;
     if (!offset) {
         if (x->file) { x->error = ESP_ERR_INVALID_RESPONSE; return false; }
-        char path[1024], parent[1024];
+        char path[1024];
         if (!strcmp(name, "body.html") || !strcmp(name, "position.map") || strchr(name, ':') ||
-            join(x->root, name, path, sizeof(path)) != ESP_OK || !wr_copy(parent, sizeof(parent), path)) return false;
-        char *slash = strrchr(parent, '/'); *slash = 0;
-        x->error = wr_mkdirs(parent); if (x->error != ESP_OK) return false;
+            join(x->root, name, path, sizeof(path)) != ESP_OK) return false;
+        char *slash = strrchr(path, '/'); *slash = 0;
+        if(strcmp(x->parent,path)){
+            x->error=wr_mkdirs(path);if(x->error!=ESP_OK){x->parent[0]=0;return false;}
+            if(!wr_copy(x->parent,sizeof(x->parent),path))return false;
+        }
+        *slash='/';
         struct stat st;
         if (!stat(path, &st)) { x->error = ESP_ERR_INVALID_RESPONSE; return false; }
         x->file = fopen(path, "wb"); if (!x->file) { x->error = ESP_FAIL; return false; }
@@ -289,15 +297,20 @@ static void release_chapter_work(chapter_download_work_t **p) {
     if(*p)weread_secure_zero(*p,sizeof(**p));
     wr_release(p);
 }
-esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_GUARD;
-    if (!wr_valid_id(id) || !uid) return ESP_ERR_INVALID_ARG;
+bool weread_chapter_cached(const char *id,uint32_t uid){WR_GUARD;
     char existing[512];
     if (weread_chapter_directory(id, uid, existing, sizeof(existing)) == ESP_OK) {
         char cache_path[600]; struct stat st; join(existing, "body.html", cache_path, sizeof(cache_path));
         bool body_ok = !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
         join(existing, "position.map", cache_path, sizeof(cache_path));
-        if (body_ok && !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size >= (off_t)sizeof(weread_position_header_t)) return ESP_OK;
+        if (body_ok && !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size >= (off_t)sizeof(weread_position_header_t)) return true;
     }
+    return false;
+}
+esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_GUARD;
+    if (!wr_valid_id(id) || !uid) return ESP_ERR_INVALID_ARG;
+    if(weread_chapter_cached(id,uid))return ESP_OK;
+    char existing[512];
     chapter_download_work_t *w __attribute__((cleanup(release_chapter_work)))=wr_alloc(sizeof(*w));
     if(!w)return ESP_ERR_NO_MEM;
     for (unsigned attempt = 0; attempt < 2; ++attempt) {
@@ -371,7 +384,8 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         if (err == ESP_OK) return ESP_OK;
         if (!published) remove_tree(w->root, 0);
         if (err != WEREAD_ERR_VERSION || attempt) return err;
-        err = weread_shelf_refresh_book(id); if (err == ESP_OK) err = weread_toc_sync(id);
+        book_weread_clear_prepared();
+        err = weread_shelf_refresh_book(id); if (err == ESP_OK) err = weread_toc_sync_version(id,weread_shelf_book_version(id));
         if (err != ESP_OK) return err;
     }
     return WEREAD_ERR_VERSION;

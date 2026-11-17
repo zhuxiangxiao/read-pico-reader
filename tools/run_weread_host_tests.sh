@@ -64,6 +64,15 @@ echo "Compiling and running production WeRead shelf/TOC tests..."
     tools/weread_stubs/cJSON.c -lm -o build/weread-tests/test_weread_shelf
 build/weread-tests/test_weread_shelf
 
+"${CC}" "${flags[@]}" -Dtime=toc_test_time tools/test_weread_toc_policy.c \
+    main/weread/weread_{shelf,toc,store,auth,client}.c \
+    tools/weread_stubs/cJSON.c -lm -o build/weread-tests/test_weread_toc_policy
+python3 - <<'PY'
+import subprocess,tempfile
+with tempfile.TemporaryDirectory(prefix='weread-toc-policy-') as cache:
+    subprocess.run(['build/weread-tests/test_weread_toc_policy',cache],check=True)
+PY
+
 python3 - <<'PY'
 import zipfile,random,runpy,json
 with zipfile.ZipFile('build/weread-tests/large.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
@@ -105,6 +114,17 @@ for mode in ('updated','selfheal','moved','corrupt','bad-offset','bad-index','pr
         subprocess.run(['build/weread-tests/test_weread_open_version',cache,mode],check=True)
 PY
 
+"${CC}" "${flags[@]}" tools/test_weread_open_cache.c \
+    main/book/book_weread_crypto.c main/book/book_source_weread.c main/book/html_text.c \
+    main/weread/weread_{runtime,chapter,position,progress,shelf,toc,store,auth,client}.c \
+    tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_open_cache
+python3 - <<'PY'
+import subprocess,tempfile
+for mode in ('warm','missing-uid','fresh-version','split-progress','split-toc','known-no-fresh','selfheal-split','append-same-version','reordered-same-version','stale-progress-version','hint-empty-unread'):
+    with tempfile.TemporaryDirectory(prefix='weread-open-cache-') as cache:
+        subprocess.run(['build/weread-tests/test_weread_open_cache',cache,mode],check=True)
+PY
+
 echo "Compiling and running production WeRead progress tests..."
 "${CC}" "${flags[@]}" \
     tools/test_weread_progress.c main/weread/weread_progress.c main/book/book_weread_crypto.c \
@@ -112,6 +132,22 @@ echo "Compiling and running production WeRead progress tests..."
     main/weread/weread_auth.c main/weread/weread_client.c \
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_progress
 build/weread-tests/test_weread_progress
+
+python3 - <<'PY'
+from pathlib import Path
+s=Path('main/weread/weread_store.c').read_text()
+Path('build/weread-tests/store-transaction.c').write_text(s.replace('esp_err_t wr_write_json(', 'esp_err_t actual_write_json(',1))
+PY
+"${CC}" "${flags[@]}" tools/test_weread_progress_transaction.c \
+    main/weread/weread_progress.c main/book/book_weread_crypto.c main/weread/weread_shelf.c \
+    build/weread-tests/store-transaction.c main/weread/weread_auth.c main/weread/weread_client.c \
+    tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_progress_transaction
+python3 - <<'PY'
+import subprocess,tempfile
+for mode in range(1,6):
+    with tempfile.TemporaryDirectory(prefix='weread-progress-transaction-') as cache:
+        subprocess.run(['build/weread-tests/test_weread_progress_transaction',cache,str(mode)],check=True)
+PY
 
 echo "WeRead host tests passed cleanly!"
 echo "Compiling and running constrained WeRead memory-pool tests..."
@@ -132,5 +168,9 @@ echo "Compiling and running bounded cache lifecycle tests..."
 build/weread-tests/test_weread_cache
 python3 tools/weread_cache_ui_host_test.py
 python3 tools/weread_cover_cache_host_test.py
+python3 tools/weread_cache_fault_host_test.py
+python3 tools/weread_shelf_noop_host_test.py
+python3 tools/weread_shelf_ids_host_test.py
+python3 tools/weread_io_cache_host_test.py
 
 python3 tools/weread_time_cancel_host_test.py

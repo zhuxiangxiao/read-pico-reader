@@ -60,7 +60,7 @@ static struct {
     uint64_t now;
     bool force, raw_position;
 } s_work;
-static struct { char id[64]; weread_progress_t progress; bool valid, resume_ready; } s_choice;
+static struct { char id[64]; weread_progress_t progress; uint32_t fresh_version,last_chapter;bool valid, resume_ready; } s_choice;
 static struct {
     char id[64], summary[256];
     size_t chapter, nav_chapter;
@@ -157,53 +157,68 @@ static void snapshot(void) {
     s_result.authenticated = weread_auth_is_authenticated();
     const weread_auth_session_t *session = weread_auth_get_current_session();
     if (session) wr_display_copy(s_result.nickname, sizeof(s_result.nickname), session->user_name);
-    s_result.count = weread_shelf_count();
-    if (s_result.count) {
-        s_result.books = wr_alloc(s_result.count * sizeof(*s_result.books));
-        if (!s_result.books) { s_result.count = 0; s_result.error = ESP_ERR_NO_MEM; return; }
-        for (size_t i = 0; i < s_result.count; ++i) weread_shelf_get(i, &s_result.books[i]);
-    }
+    esp_err_t err=weread_shelf_snapshot(&s_result.books,&s_result.count);
+    if(err!=ESP_OK)s_result.error=err;
 }
 static esp_err_t cover_job(const char *url);
 static esp_err_t prepare_open(bool choose, bool cloud) {
     WR_GUARD;
+    uint64_t phase[5]={now_ms(),0,0,0,0};
     weread_shelf_sync_discard();
-    weread_toc_t toc = {0};
-    esp_err_t synced = choose ? ESP_OK : weread_toc_sync(s_work.id);
-    // 同步失败保留原目录文件，之后只加载一次，避免同时保留两个大型目录。/ Failed sync retains disk cache; load once afterward instead of retaining duplicate TOCs.
-    esp_err_t cached = weread_toc_load(s_work.id, &toc);
-    if(choose && (cached!=ESP_OK || !toc.count)){
-        weread_toc_free(&toc);synced=weread_toc_sync(s_work.id);cached=weread_toc_load(s_work.id,&toc);
-    }
-    if (cached != ESP_OK || !toc.count) { weread_toc_free(&toc); return synced != ESP_OK ? synced : ESP_ERR_NOT_FOUND; }
+    book_weread_clear_prepared();weread_toc_t toc = {0};
     if (choose) {
         s_result.local = s_choice.progress;
     } else {
         bool conflict = false;
-        esp_err_t progress=weread_progress_sync(s_work.id, &s_result.local, &s_result.cloud, &conflict);(void)progress;
+        strcpy(s_choice.id,s_work.id);s_choice.valid=false;s_choice.fresh_version=s_choice.last_chapter=0;
+        esp_err_t progress=weread_progress_sync_version(s_work.id, &s_result.local, &s_result.cloud, &conflict,&s_choice.fresh_version,&s_choice.last_chapter);(void)progress;
         ESP_LOGI("weread","progress result=%d local=%u cloud=%u",(int)progress,(unsigned)s_result.local.progress,(unsigned)s_result.cloud.progress);
-        if(progress!=ESP_OK&&!s_result.local.chapter_uid){weread_toc_free(&toc);return progress;}
+        if(progress==WEREAD_ERR_VERSION||progress==ESP_ERR_NO_MEM||(progress!=ESP_OK&&!s_result.local.chapter_uid))return progress;
         if (conflict && !cancelled(NULL)) { s_result.conflict = true; weread_toc_free(&toc); return ESP_OK; }
     }
+    phase[1]=now_ms();
     weread_progress_t selected = choose ? s_choice.progress : s_result.local;
+    esp_err_t prepared=weread_toc_prepare(s_work.id,false,s_choice.fresh_version,&toc);
+    if(prepared!=ESP_OK||!toc.count){weread_toc_free(&toc);return prepared!=ESP_OK?prepared:ESP_ERR_NOT_FOUND;}
     uint32_t uid = selected.chapter_uid;
-    bool exists = false;
-    for (size_t i = 0; i < toc.count; ++i) if (toc.chapters[i].uid == uid) exists = true;
+    bool exists = false, moved=false;
+    for (size_t i = 0; i < toc.count; ++i) if (toc.chapters[i].uid == uid) {
+        exists=true;moved=selected.chapter_index&&selected.chapter_index!=toc.chapters[i].index;
+    }
+    if((uid&&(!exists||moved))||s_choice.last_chapter>toc.chapters[toc.count-1].index){
+        weread_toc_free(&toc);prepared=weread_toc_prepare(s_work.id,true,s_choice.fresh_version,&toc);
+        if(prepared!=ESP_OK||!toc.count){weread_toc_free(&toc);return prepared!=ESP_OK?prepared:ESP_ERR_NOT_FOUND;}
+        exists=moved=false;
+        for(size_t i=0;i<toc.count;++i)if(toc.chapters[i].uid==uid){
+            exists=true;moved=selected.chapter_index&&selected.chapter_index!=toc.chapters[i].index;
+        }
+        if(moved){weread_toc_free(&toc);return WEREAD_ERR_POSITION;}
+    }
     ESP_LOGI("weread","target p=%u uid=%u idx=%u off=%u choice=%d ok=%d",(unsigned)selected.progress,(unsigned)uid,(unsigned)selected.chapter_index,(unsigned)selected.chapter_offset,choose,exists);
     if(!exists&&uid){weread_toc_free(&toc);return ESP_ERR_INVALID_RESPONSE;}
     if (!exists) { uid = toc.chapters[0].uid; selected.chapter_uid = uid; selected.chapter_offset = 0; selected.chapter_index = toc.chapters[0].index; selected.book_version = toc.book_version; }
+    phase[2]=now_ms();
+    // 仅缓存命中保留typed目录；下载解压前释放，维持原峰值内存。/ Retain the typed TOC only on cache hits; release it before download/inflate to retain the memory budget.
+    bool chapter_hit=weread_chapter_cached(s_work.id,uid);
+    if(chapter_hit)book_weread_adopt_prepared(s_work.id,&toc);
     weread_toc_free(&toc);
-    esp_err_t err = cancelled(NULL) ? ESP_ERR_INVALID_STATE : weread_chapter_download(s_work.id, uid);
+    esp_err_t err = cancelled(NULL) ? ESP_ERR_INVALID_STATE : chapter_hit?ESP_OK:weread_chapter_download(s_work.id, uid);
+    phase[3]=now_ms();
     if (err == ESP_OK) {
         err=book_weread_prepare_open(s_work.id);
         if(err!=ESP_OK)return err;
         err=book_weread_validate_prepared(s_work.id,uid,selected.chapter_index,selected.chapter_offset,&selected.book_version);
-        if(err!=ESP_OK)return err;
+        if(err!=ESP_OK){book_weread_clear_prepared();return err;}
         err=choose?weread_progress_select(s_work.id,&selected,cloud):weread_progress_checkpoint(s_work.id,&selected);
-        if(err!=ESP_OK)return err;
+        if(err!=ESP_OK){book_weread_clear_prepared();return err;}
         if(choose){selected.dirty=selected.position_pending=!cloud;if(cloud)selected.pending_pages=selected.reading_time=0;}
         strcpy(s_choice.id, s_work.id); s_choice.progress = selected; s_choice.valid = true; s_result.open_ready = true;
     }
+    phase[4]=now_ms();
+    ESP_LOGI("weread","open timing progress=%u toc=%u chapter=%u verify=%u total=%u cached=%d",
+        (unsigned)(phase[1]-phase[0]),(unsigned)(phase[2]-phase[1]),(unsigned)(phase[3]-phase[2]),(unsigned)(phase[4]-phase[3]),(unsigned)(phase[4]-phase[0]),chapter_hit);
+    (void)phase;
+    if(err!=ESP_OK)book_weread_clear_prepared();
     weread_toc_free(&toc); return err;
 }
 static esp_err_t remove_cache(const char *path, unsigned depth) {
@@ -330,7 +345,13 @@ static void perform_job(void) {
             err = prepare_open(true, s_work.job == WR_JOB_CLOUD);
             break;
         case WR_JOB_COVER:
-            if(!strcmp(s_work.value,"warm")){
+            if(!strcmp(s_work.value,"remote")||!strcmp(s_work.value,"original")){
+                weread_book_t book;char url[512];weread_cover_retry_t retry={.original=!strcmp(s_work.value,"original")};
+                err=weread_shelf_find(s_work.id,&book)?weread_cover_retry_url(book.cover,&retry,0,url,sizeof(url)):ESP_ERR_NOT_FOUND;
+                if(err==ESP_OK)err=cover_job(url);
+            }else if(!strcmp(s_work.value,"warm")){
+                char ready[512];struct stat st;
+                if(weread_cover_cache_path(s_work.id,"gray",ready,sizeof(ready))==ESP_OK&&!stat(ready,&st)&&S_ISREG(st.st_mode)&&st.st_size==WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT)break;
                 err=cover_job(NULL);
                 weread_book_t b;char url[512];
                 if(err!=ESP_OK&&!s_result.cover_retry_seconds&&!cancelled(NULL)&&weread_shelf_find(s_work.id,&b)&&
@@ -348,20 +369,12 @@ static void perform_job(void) {
         case WR_JOB_NOTE: {
             uint32_t co = s_work.offset;
             err = s_work.raw_position?ESP_OK:book_weread_map(s_work.chapter, true, s_work.offset, &co);
-            if(err==ESP_OK&&s_work.raw_position)err=weread_progress_note_time(s_work.id,s_work.seconds,(uint64_t)time(NULL));
-            else if (err == ESP_OK) err = weread_progress_note(s_work.id, s_work.uid,
-                s_work.index, co, s_work.percent, s_work.seconds,
-                s_work.pages, s_work.summary, (uint64_t)time(NULL));
-            s_result.noted = err == ESP_OK;
-            if(s_result.noted){
+            if(err==ESP_OK&&!cancelled(NULL)){
                 s_result.local.chapter_uid=s_work.uid;s_result.local.chapter_index=s_work.index;
                 s_result.local.chapter_offset=co;s_result.local.progress=s_work.percent;
+                s_result.local.reading_time=s_work.seconds;s_result.local.pending_pages=s_work.pages;
                 wr_display_copy(s_result.local.summary,sizeof(s_result.local.summary),s_work.summary);
-            }
-            if (err == ESP_OK && !cancelled(NULL)) err = weread_progress_report(s_work.id, s_work.force, s_work.now);
-            if(s_result.noted){
-                s_result.local.dirty=true;
-                weread_progress_t saved;if(weread_progress_load(s_work.id,&saved)==ESP_OK)s_result.local=saved;
+                err=weread_progress_update(s_work.id,&s_result.local,!s_work.raw_position,s_work.force,s_work.now,(uint64_t)time(NULL),&s_result.noted);
             }
             break;
         }
@@ -547,6 +560,9 @@ esp_err_t weread_reader_prepare_open(const char *uri){
     if(!weread_runtime_start(WR_JOB_TOC,uri+9,NULL))return ESP_ERR_INVALID_STATE;
     join_job();return s_result.error;
 }
+bool weread_reader_open_ready(const char *uri){
+    return book_path_is_weread(uri)&&s_choice.valid&&!strcmp(s_choice.id,uri+9)&&book_weread_prepared(uri+9);
+}
 void weread_reader_begin(const char *uri, uint64_t now) {
     memset(&s_reader, 0, sizeof(s_reader));
     if (book_path_is_weread(uri)&&s_choice.resume_ready&&!strcmp(s_choice.id,uri+9)) {
@@ -578,6 +594,7 @@ esp_err_t weread_reader_resume(const char *uri, size_t *chapter, uint32_t *offse
     uint32_t version = 0;
     if (!book_weread_cached_version(uri + 9, &version) ||
         version != s_choice.progress.book_version) return ESP_ERR_INVALID_RESPONSE;
+    uint32_t known=weread_shelf_book_version(uri+9);if(known&&known!=version)return WEREAD_ERR_VERSION;
     size_t i = book_weread_index(s_choice.progress.chapter_uid);
     if (i == SIZE_MAX) return ESP_ERR_INVALID_RESPONSE;
     esp_err_t err = book_weread_map(i, false, s_choice.progress.chapter_offset, offset);

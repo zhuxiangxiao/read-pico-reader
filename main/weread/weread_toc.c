@@ -11,10 +11,12 @@
 #include "weread_toc.h"
 #include "weread_shelf.h"
 #include "weread_store.h"
+#include "weread_chapter.h"
 #include "esp_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static bool u32(const cJSON *v, const char *key, uint32_t *out) {
     uint64_t n;
@@ -36,6 +38,10 @@ static int compare(const void *a, const void *b) {
     if (x->index != y->index) return x->index < y->index ? -1 : 1;
     return x->uid == y->uid ? 0 : x->uid < y->uid ? -1 : 1;
 }
+static int compare_uid(const void *a,const void *b){
+    uint32_t x=((const weread_chapter_info_t *)a)->uid,y=((const weread_chapter_info_t *)b)->uid;
+    return x==y?0:x<y?-1:1;
+}
 void weread_toc_free(weread_toc_t *toc) {
     if (toc) { free(toc->chapters); memset(toc, 0, sizeof(*toc)); }
 }
@@ -44,6 +50,7 @@ static esp_err_t decode(const cJSON *root, weread_toc_t *out) {
     if (!wr_owner_matches(root) || !cJSON_IsArray(array) || !wr_uint(root, "synckey", &out->synckey) ||
         !u32(root, "bookVersion", &out->book_version)) return ESP_ERR_INVALID_RESPONSE;
     wr_uint(root, "updateTime", &out->update_time);
+    wr_uint(root,"checkedAt",&out->checked_at);
     int n = cJSON_GetArraySize(array);
     if (n > WEREAD_TOC_LIMIT) return ESP_ERR_INVALID_SIZE;
     if (!n) return ESP_OK;
@@ -53,10 +60,11 @@ static esp_err_t decode(const cJSON *root, weread_toc_t *out) {
     cJSON_ArrayForEach(v, array) {
         weread_chapter_info_t *c = &out->chapters[out->count];
         if (!chapter(v, c)) return ESP_ERR_INVALID_RESPONSE;
-        for (size_t i = 0; i < out->count; ++i)
-            if (out->chapters[i].uid == c->uid) return ESP_ERR_INVALID_RESPONSE;
         ++out->count;
     }
+    // 按UID查重不增加工作数组，大目录避免两两比较。/ Sort by UID to detect duplicates without another work array or quadratic scans.
+    qsort(out->chapters,out->count,sizeof(*out->chapters),compare_uid);
+    for(size_t i=1;i<out->count;++i)if(out->chapters[i-1].uid==out->chapters[i].uid)return ESP_ERR_INVALID_RESPONSE;
     qsort(out->chapters, out->count, sizeof(*out->chapters), compare);
     return ESP_OK;
 }
@@ -87,26 +95,26 @@ static cJSON *find(cJSON *a, uint32_t n) {
     cJSON_ArrayForEach(v, a) if (uid(v) == n) return v;
     return NULL;
 }
-esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
+static esp_err_t sync_toc(const char *id,uint32_t expected,weread_toc_t *out) {
     if (!wr_valid_id(id)) return ESP_ERR_INVALID_ARG;
     char path[512];
     esp_err_t err = wr_cache_path(id, "chapters.json", path, sizeof(path));
     if (err != ESP_OK) return err;
     cJSON *old = NULL, *req = cJSON_CreateObject(), *response = NULL, *next = NULL;
     if (!req) return ESP_ERR_NO_MEM;
-    uint64_t key = 0, time = 0;
+    uint64_t key = 0, updated_at = 0;
     weread_toc_t check = {0};
     if (wr_read_json(path, &old) != ESP_OK || decode(old, &check) != ESP_OK || !check.count ||
         !wr_string(old, "bookId") || strcmp(wr_string(old, "bookId"), id)) {
         cJSON_Delete(old); old = NULL;
-    } else { key = check.synckey; time = check.update_time; }
+    } else { key = check.synckey; updated_at = check.update_time; }
     weread_toc_free(&check);
     const char *ids[] = {id};
     cJSON *id_array = cJSON_CreateStringArray(ids, 1);
     cJSON *keys = cJSON_CreateArray(), *times = cJSON_CreateArray();
     if (!id_array || !keys || !times) err = ESP_ERR_NO_MEM;
     if (err == ESP_OK && (!cJSON_AddItemToArray(keys, cJSON_CreateNumber((double)key)) ||
-        !cJSON_AddItemToArray(times, cJSON_CreateNumber((double)time)))) err = ESP_ERR_NO_MEM;
+        !cJSON_AddItemToArray(times, cJSON_CreateNumber((double)updated_at)))) err = ESP_ERR_NO_MEM;
     if (id_array) cJSON_AddItemToObject(req, "bookIds", id_array);
     if (keys) cJSON_AddItemToObject(req, "synckeys", keys);
     if (times) cJSON_AddItemToObject(req, "updateTimes", times);
@@ -138,7 +146,7 @@ esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
         if (!copy) { err = ESP_ERR_NO_MEM; break; }
         if (existing) cJSON_ReplaceItemViaPointer(array, existing, copy);
         else cJSON_AddItemToArray(array, copy);
-        if (parsed.update_time > time) time = parsed.update_time;
+        if (parsed.update_time > updated_at) updated_at = parsed.update_time;
         if (cJSON_GetArraySize(array) > WEREAD_TOC_LIMIT) { err = ESP_ERR_INVALID_SIZE; break; }
     }
     if (err == ESP_OK) cJSON_ArrayForEach(v, removed) {
@@ -155,14 +163,36 @@ esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
         cJSON_DeleteItemFromObject(next, "synckey"); cJSON_DeleteItemFromObject(next, "updateTime");
         cJSON_DeleteItemFromObject(next, "bookVersion"); cJSON_DeleteItemFromObject(next, "bookId");
         if (!cJSON_AddNumberToObject(next, "synckey", (double)new_key) ||
-            !cJSON_AddNumberToObject(next, "updateTime", (double)time) ||
+            !cJSON_AddNumberToObject(next, "updateTime", (double)updated_at) ||
             !cJSON_AddNumberToObject(next, "bookVersion", version) ||
             !cJSON_AddStringToObject(next, "bookId", id) || !wr_set_owner(next)) err = ESP_ERR_NO_MEM;
     }
     cJSON_Delete(response);response=NULL;
+    time_t now=time(NULL);
+    if(err==ESP_OK&&now>=1700000000){
+        cJSON_DeleteItemFromObject(next,"checkedAt");
+        if(!cJSON_AddNumberToObject(next,"checkedAt",(double)now))err=ESP_ERR_NO_MEM;
+    }
     if (err == ESP_OK) err = decode(next, &check);
+    if(err==ESP_OK&&expected&&check.book_version!=expected)err=WEREAD_ERR_VERSION;
     if (err == ESP_OK) err = wr_write_json(path, next);
+    if(err==ESP_OK&&out){*out=check;memset(&check,0,sizeof(check));}
     weread_toc_free(&check);
     cJSON_Delete(old); cJSON_Delete(req); cJSON_Delete(response); cJSON_Delete(next);
     return err;
+}
+esp_err_t weread_toc_sync(const char *id){WR_GUARD;return sync_toc(id,0,NULL);}
+esp_err_t weread_toc_sync_version(const char *id,uint32_t expected){WR_GUARD;return sync_toc(id,expected,NULL);}
+esp_err_t weread_toc_prepare(const char *id,bool force,uint32_t expected,weread_toc_t *out){WR_GUARD;
+    if(!out)return ESP_ERR_INVALID_ARG;
+    uint32_t version=expected?expected:weread_shelf_book_version(id);uint64_t now=(uint64_t)time(NULL);
+    esp_err_t cached=weread_toc_load(id,out);
+    bool matching=cached==ESP_OK&&out->count&&(!version||version==out->book_version);
+    // 已知版本匹配不按时间过期；未知版本用一天兜底发现目录变化。/ Matching known versions do not expire; unknown versions get a daily recheck for catalog changes.
+    if(!force&&matching&&(expected||(out->checked_at>=1700000000&&now>=out->checked_at&&now-out->checked_at<86400)))return ESP_OK;
+    weread_toc_free(out);
+    esp_err_t err=sync_toc(id,version,out);if(err==ESP_OK)return err;
+    // 瞬时离线可复用同版本旧缓存，已知版本变化不能回退旧正文。/ Offline fallback retains a matching version, never a known older text revision.
+    if(err!=WEREAD_ERR_VERSION&&err!=ESP_ERR_NO_MEM&&err!=ESP_ERR_INVALID_STATE&&weread_toc_load(id,out)==ESP_OK&&out->count&&(!version||out->book_version==version))return ESP_OK;
+    weread_toc_free(out);return err;
 }

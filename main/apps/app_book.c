@@ -5961,7 +5961,7 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
         return false;
     }
     s_reader_return_home = false;
-    if (book_path_is_weread(path)) { weread_runtime_cancel_join(); weread_runtime_load_local(); }
+    if (book_path_is_weread(path)) { weread_runtime_cancel_join(); if(!weread_reader_open_ready(path))weread_runtime_load_local(); }
     if (book_path_is_weread(path) || !strncmp(path, "/sdcard/", 8)) {
         read_pico_sd_info_t sd = {0};
         read_pico_sd_get_info(&sd);

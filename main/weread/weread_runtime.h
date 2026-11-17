@@ -21,7 +21,7 @@ typedef struct {
     int qr_state, http_status;
     unsigned cover_retry_seconds;
     char id[64], uid[64], qr_url[256], nickname[64];
-    weread_book_t *books;
+    weread_shelf_item_t *books;
     size_t count;
     bool shelf_loading;
     size_t shelf_done,shelf_total,shelf_skipped;
@@ -47,6 +47,7 @@ esp_err_t weread_runtime_connect(void *ctx);
 /// 阅读器加载回调前由worker准备章节，前台只解析完整缓存。/ Let the worker prepare a chapter before foreground parsing.
 esp_err_t weread_reader_prepare(const char *uri, size_t chapter);
 esp_err_t weread_reader_prepare_open(const char *uri);
+bool weread_reader_open_ready(const char *uri);
 void weread_reader_begin(const char *uri, uint64_t now_ms);
 /// 仅成功翻页/跳转后调用；排版与首次显示不算导航。/ Mark committed navigation, never initial paint or reflow.
 void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary);
