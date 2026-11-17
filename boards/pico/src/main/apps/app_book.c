@@ -4936,9 +4936,13 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     bool clear_toc = chapter != s_chapter || (!anchor && source_offset == SIZE_MAX);
     html_text_t loaded = {0};
     size_t anchor_offset = 0;
-    esp_err_t err = book_path_is_weread(s_path) ? weread_reader_prepare(s_path,chapter) : ESP_OK;
+    bool wr_profile=book_path_is_weread(s_path);
+    int64_t wr_started=wr_profile?esp_timer_get_time():0;
+    esp_err_t err = wr_profile ? weread_reader_prepare(s_path,chapter) : ESP_OK;
+    int64_t wr_prepared=wr_profile?esp_timer_get_time():0;
     if (err == ESP_OK) err = book_chapter_load_blocks_target(chapter, anchor, source_offset,
                                                     &anchor_offset, &loaded);
+    int64_t wr_parsed=wr_profile?esp_timer_get_time():0;
     if (err != ESP_OK) {
         if(book_path_is_weread(s_path))book_weread_discard_loaded();
         ESP_LOGW(TAG, "chapter load failed: %s", esp_err_to_name(err));
@@ -5013,11 +5017,20 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     book_layout_set_image_dims(reader_image_dims, &s_reader_dims_ctx);
     book_layout_set_runs(loaded.runs, loaded.run_count);
     book_layout_set_inline_images(loaded.notes, loaded.note_count);
+    int64_t wr_layout_start=wr_profile?esp_timer_get_time():0;
     bool ok = book_layout_build_blocks(loaded.utf8, loaded.len, loaded.blocks, loaded.count, body_rect(), s_px);
     if(ok&&book_path_is_weread(s_path)){
         size_t actual=chapter;
         ok=book_weread_commit_loaded(&actual,&wr_content_version)==ESP_OK;
-        if(ok){chapter=actual;s_reader_dims_ctx.chapter=actual;}
+        if(ok){
+            chapter=actual;s_reader_dims_ctx.chapter=actual;
+            uint32_t identity=0;
+            if(book_weread_content_identity(s_path,&identity)&&identity!=s_file_size){
+                s_file_size=identity;clear_toc=true;s_selected_toc_offset=0;
+                s_bookmark_page=0;s_bookmark_selected=0;
+                s_bookmark_edit=s_bookmark_delete_confirm=s_bookmark_delete_error=false;
+            }
+        }
     }
     if (!ok) {
         if(book_path_is_weread(s_path))book_weread_discard_loaded();
@@ -5048,6 +5061,7 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
         copy_text(s_message, sizeof(s_message), "排版失败：内存不足或章节过长");
         return false;
     }
+    int64_t wr_laid_out=wr_profile?esp_timer_get_time():0;
     book_excerpt_offer(s_path, chapter, &loaded);
     free(s_text);
     free(s_blocks);
@@ -5081,6 +5095,10 @@ static bool load_chapter_at(app_ctx_t* ctx, size_t chapter, size_t offset,
     s_message[0] = 0;
     unlock_draw();
     prepare_inline_image();
+    if(wr_profile)ESP_LOGI(TAG,"weread chapter timing prepare=%u parse=%u heading=%u layout=%u finish=%u",
+        (unsigned)((wr_prepared-wr_started)/1000),(unsigned)((wr_parsed-wr_prepared)/1000),
+        (unsigned)((wr_layout_start-wr_parsed)/1000),(unsigned)((wr_laid_out-wr_layout_start)/1000),
+        (unsigned)((esp_timer_get_time()-wr_laid_out)/1000));
     // 开书这条链上有解析、解压和字体装载，栈曾经在这里溢出过；留一个可观测的水位。
     // 顺带量一下章节排完后的 PSRAM 余量：书内字体的装载预算要靠这个数来定，不能靠估。
     // Parsing, inflate and face loading all ride this chain, and it overflowed once before;
@@ -5097,10 +5115,13 @@ static bool load_chapter(app_ctx_t* ctx, size_t chapter, size_t offset, bool las
 }
 #include "book_weread_chapter.inc"
 bool app_book_prepare_leave(app_ctx_t *ctx){
-    if(!s_text||!book_path_is_weread(s_path))return true;
-    wr_chapter_cancel();weread_runtime_cancel_join();wr_reader_sample(ctx->now_ms,false);
+    bool reading=s_text&&book_path_is_weread(s_path);
+    if(!reading&&!weread_reader_pending_save())return true;
+    wr_chapter_cancel();weread_runtime_cancel_join();
+    if(reading)wr_reader_sample(ctx->now_ms,false);
     if(weread_reader_save(ctx->now_ms)==ESP_OK)return true;
     copy_text(s_reader_notice,sizeof(s_reader_notice),"位置未保存，请检查存储卡后重试");
+    if(!reading)copy_text(s_message,sizeof(s_message),"位置未保存，请插回原TF卡后重试");
     s_reader_notice_until=ctx->now_ms+3000;return false;
 }
 
@@ -8058,9 +8079,14 @@ static void book_on_media_lost(app_ctx_t* ctx) {
     s_du_count = 0;
     copy_text(s_storage, sizeof(s_storage), "TF 卡已移除");
     copy_text(s_message, sizeof(s_message), "TF 卡已移除");
+    if(weread_reader_pending_save())copy_text(s_message,sizeof(s_message),"TF 卡已移除；最新位置未保存，请勿关机");
 }
 static void book_on_media_ready(app_ctx_t* ctx) {
-    (void)ctx;
+    if(weread_reader_pending_save()){
+        weread_runtime_load_local();
+        copy_text(s_message,sizeof(s_message),weread_reader_save(ctx->now_ms)==ESP_OK?
+            "阅读位置已恢复保存":"位置未保存，请插回原TF卡后重试");
+    }
     s_shelf_cache_valid = false;
     if (s_view == SHELF) {
         s_scan_pending = true;

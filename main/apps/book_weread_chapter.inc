@@ -4,6 +4,14 @@
  * 中文：微信章节异步准备，局部接入双板阅读器；本地TXT/EPUB不经过此路径。
  * English: Asynchronous WeRead chapter preparation; local TXT/EPUB retain their existing path.
  */
+static esp_err_t wr_chapter_start(app_ctx_t *ctx){
+    wr_reader_sample(ctx->now_ms,false);
+    esp_err_t err=weread_reader_save(ctx->now_ms);
+    if(err!=ESP_OK)return err;
+    char uid[16];snprintf(uid,sizeof(uid),"%u",(unsigned)book_weread_uid(s_wr_jump.chapter));
+    s_wr_jump.started=weread_runtime_start(WR_JOB_CHAPTER,s_path+9,uid);
+    return s_wr_jump.started?ESP_OK:ESP_ERR_NO_MEM;
+}
 static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool last_page,const char *anchor,size_t source_offset){
     char *owned=NULL;
     if(anchor){size_t bytes=strlen(anchor)+1;owned=wr_alloc(bytes);if(!owned)return false;memcpy(owned,anchor,bytes);}
@@ -14,7 +22,10 @@ static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool la
     s_view=READING;s_reader_panel=READER_PANEL_NONE;
     copy_text(s_reader_notice,sizeof(s_reader_notice),"正在准备章节…");s_reader_notice_until=INT64_MAX;
     s_reader_text_frame=false;
-    (void)ctx;return true;
+    // 先启动worker再由主循环推反馈屏；不把物理刷新时间串到下载之前。
+    // Start the worker before feedback presentation rather than delaying downloads behind a physical refresh.
+    if(!weread_runtime_busy()&&!ctx->request_app)s_wr_jump.error=wr_chapter_start(ctx);
+    return true;
 }
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(!s_wr_jump.pending)return APP_REDRAW_NONE;
@@ -22,18 +33,12 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(weread_runtime_busy()||ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
     weread_result_t result={0};bool completed=weread_runtime_poll(&result);
     bool matching=completed&&result.job==WR_JOB_CHAPTER&&!strcmp(result.id,s_path+9)&&result.chapter_uid==book_weread_uid(s_wr_jump.chapter);
-    esp_err_t err=matching?result.error:ESP_OK;
+    esp_err_t err=matching?result.error:s_wr_jump.error;
     weread_runtime_result_free(&result);
     if(s_wr_jump.started&&!matching)return APP_REDRAW_NONE;
     if(!s_wr_jump.started){
-        wr_reader_sample(ctx->now_ms,false);
-        err=weread_reader_save(ctx->now_ms);
-        if(err==ESP_OK){
-            char uid[16];snprintf(uid,sizeof(uid),"%u",(unsigned)book_weread_uid(s_wr_jump.chapter));
-            s_wr_jump.started=weread_runtime_start(WR_JOB_CHAPTER,s_path+9,uid);
-            if(s_wr_jump.started)return APP_REDRAW_NONE;
-            err=ESP_ERR_NO_MEM;
-        }
+        if(err==ESP_OK)err=wr_chapter_start(ctx);
+        if(s_wr_jump.started)return APP_REDRAW_NONE;
     }else if(err==ESP_OK){
         s_wr_jump.committing=true;
         bool ok=load_chapter_at(ctx,s_wr_jump.chapter,s_wr_jump.offset,s_wr_jump.last_page,s_wr_jump.anchor,s_wr_jump.source_offset);

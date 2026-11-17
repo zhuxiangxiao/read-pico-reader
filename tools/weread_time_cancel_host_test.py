@@ -107,6 +107,7 @@ CONNECT = r'''
 static atomic_bool s_cancel;
 static atomic_uint_fast64_t s_deadline;
 static bool s_owns_network;
+static uint64_t s_network_active;
 static uint64_t now_ms(void){return mono/1000;}
 static void pause_ms(unsigned ms){mono+=(int64_t)ms*1000;}
 ''' + function(RUNTIME, 'cancelled') + r'''
@@ -117,21 +118,24 @@ typedef struct {bool network_ready;int mode,state,last_error;} read_pico_transfe
 typedef struct {int mode;bool network_only,cover_lookup;} read_pico_transfer_cfg_t;
 static time_t wall;
 static bool sync_cancel;
+static bool connect_starting,started;
 static int syncs,sync_error;
-static void read_pico_transfer_get_status(read_pico_transfer_status_t *out){*out=(read_pico_transfer_status_t){true,READ_PICO_TRANSFER_MODE_STA,READ_PICO_TRANSFER_READY,0};}
-static esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg){(void)cfg;assert(0);return ESP_FAIL;}
+static void read_pico_transfer_get_status(read_pico_transfer_status_t *out){*out=(read_pico_transfer_status_t){!connect_starting||started,READ_PICO_TRANSFER_MODE_STA,connect_starting&&!started?READ_PICO_TRANSFER_STOPPED:READ_PICO_TRANSFER_READY,0};}
+static esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg){assert(connect_starting&&!started&&cfg->mode==READ_PICO_TRANSFER_MODE_STA&&cfg->network_only);started=true;return ESP_OK;}
 static void read_pico_transfer_service_poll(void){}
 static esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc,bool(*check)(void*),void *ctx){++syncs;assert(ctx==NULL);for(int i=0;i<30;++i){mono+=100000;if(sync_cancel&&i==1)atomic_store(&s_cancel,true);if(check(ctx))return ESP_ERR_INVALID_STATE;}if(sync_error)return sync_error;*utc=wall=1800000000;return ESP_OK;}
 static time_t test_time(time_t *out){if(out)*out=wall;return wall;}
 #define time test_time
 ''' + function(RUNTIME, 'connect_network') + r'''
-static void reset(void){mono=0;wall=0;syncs=sync_error=0;sync_cancel=s_owns_network=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
+static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
 int main(void){
  reset();sync_cancel=true;assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==200000&&syncs==1);
  reset();atomic_store(&s_deadline,1800);assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==1800000&&syncs==1);
  reset();sync_error=ESP_ERR_TIMEOUT;assert(connect_network()==ESP_ERR_TIMEOUT);
  reset();assert(connect_network()==ESP_OK&&syncs==1&&wall==1800000000);assert(connect_network()==ESP_OK&&syncs==1);
  reset();atomic_store(&s_cancel,true);assert(connect_network()==ESP_ERR_INVALID_STATE&&!syncs);
+ reset();connect_starting=true;wall=1800000000;assert(connect_network()==ESP_OK&&started&&s_owns_network&&s_network_active==100);
+ mono+=600000;assert(connect_network()==ESP_OK&&s_network_active==700&&!syncs);
  puts("PASS: production WeRead connect propagates its cancel/deadline and time failure; first TLS calibration retained");
 }
 '''

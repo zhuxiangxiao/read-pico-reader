@@ -122,27 +122,44 @@ esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t ind
     *version=toc->book_version;return ESP_OK;
 }
 
-bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
-    if (!book_path_is_weread(uri) || !out) return false;
-    weread_book_t book;
-    if (!weread_shelf_find(uri + 9, &book)) return false;
-    memset(out, 0, sizeof(*out));
-    out->st_mode = S_IFREG | 0400;
-    // 账号、书号与版本组成身份，避免跨账号误用NVS进度。/ Bind NVS progress to account, book and version.
-    const weread_auth_session_t *session = weread_auth_get_current_session();
+static uint32_t content_identity(const char *owner,const char *id,uint32_t version) {
     uint32_t identity = 2166136261u;
-    const char *keys[] = {session ? session->vid : "", uri + 9};
+    const char *keys[] = {owner,id};
     for (unsigned k = 0; k < 2; ++k) {
         for (const unsigned char *p = (const unsigned char *)keys[k]; *p; ++p) identity = (identity ^ *p) * 16777619u;
         identity = (identity ^ 0xffu) * 16777619u;
     }
-    identity = (identity ^ book.book_version) * 16777619u;
+    identity = (identity ^ version) * 16777619u;
     identity &= INT32_MAX;
-    out->st_size = identity ? identity : 1;
-    out->st_mtime = (time_t)book.update_time;
+    return identity ? identity : 1;
+}
+bool book_weread_content_identity(const char *uri,uint32_t *identity) { WR_GUARD;
+    if (!identity) return false;
+    *identity = 0;
+    if (!book_path_is_weread(uri) || strcmp(uri + 9,s_id) || !binding_owned(s_loaded)) return false;
+    *identity = content_identity(s_loaded->owner,s_id,s_loaded->version);
+    return true;
+}
+bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
+    if (!book_path_is_weread(uri) || !out) return false;
+    weread_book_t book;
+    bool metadata = weread_shelf_find(uri + 9,&book);
+    uint32_t identity = 0;
+    // 书签跟随已显示正文；后台更新元数据不能提前替换阅读中的NVS身份。
+    // Bookmarks follow visible content; background metadata must not relabel the reader's NVS identity.
+    if (!book_weread_content_identity(uri,&identity)) {
+        if (!metadata) return false;
+        const weread_auth_session_t *session = weread_auth_get_current_session();
+        identity = content_identity(session ? session->vid : "",uri + 9,book.book_version);
+    }
+    memset(out,0,sizeof(*out));
+    out->st_mode = S_IFREG | 0400;
+    out->st_size = identity;
+    out->st_mtime = metadata ? (time_t)book.update_time : 0;
     return true;
 }
 bool book_weread_is_open(void) { return s_id[0] != 0; }
+bool book_weread_plain_text(void) { WR_GUARD; return s_id[0] && s_txt; }
 void book_weread_close(void) { WR_GUARD; binding_free(&s_loaded);binding_free(&s_candidate);clear_css();s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
 esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_id)) return ESP_ERR_INVALID_ARG;
@@ -347,51 +364,128 @@ static void mapped_character(void *ctx, size_t text_offset, size_t html_offset) 
         m->result = m->to_cloud ? m->unit : (uint32_t)text_offset; m->found = true;
     }
 }
-static esp_err_t map_bound(size_t i, bool to_cloud, uint32_t input, uint32_t *output,const loaded_chapter_t *bound) { WR_GUARD;
-    if (!output || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
-    if(bound&&bound->map_ready){
-        if(!to_cloud&&input>bound->source_units)return WEREAD_ERR_POSITION;
-        size_t lo=0,hi=bound->map_count;
-        while(lo<hi){size_t mid=lo+(hi-lo)/2;uint32_t key=to_cloud?bound->map[mid].byte:bound->map[mid].unit;if(key<input)lo=mid+1;else hi=mid;}
-        *output=lo<bound->map_count?(to_cloud?bound->map[lo].unit:bound->map[lo].byte):to_cloud?bound->source_units:bound->text_bytes;
-        return ESP_OK;
+static esp_err_t map_dense(const loaded_chapter_t *bound,bool to_cloud,uint32_t input,uint32_t *output) {
+    if (!bound || !bound->map_ready || !bound->map_count) return ESP_ERR_NOT_FOUND;
+    if (!to_cloud && input > bound->source_units) return WEREAD_ERR_POSITION;
+    size_t lo = 0,hi = bound->map_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        uint32_t key = to_cloud ? bound->map[mid].byte : bound->map[mid].unit;
+        if (key < input) lo = mid + 1;
+        else hi = mid;
     }
-    char *path __attribute__((cleanup(wr_release)))=wr_alloc(1100),*text=NULL;size_t len=0;
-    if(!path)return ESP_ERR_NO_MEM;
-    esp_err_t err = bound?(wr_copy(path,1024,bound->root)?ESP_OK:ESP_ERR_INVALID_SIZE):weread_chapter_directory(s_id, book_weread_uid(i), path, 1024);
-    if (err != ESP_OK) return err;
-    size_t root_length=strlen(path);
-    strcat(path,"/position.map");
-    FILE *f = fopen(path, "rb"); if (!f) return ESP_ERR_NOT_FOUND;
+    *output = lo < bound->map_count ? (to_cloud ? bound->map[lo].unit : bound->map[lo].byte) :
+        to_cloud ? bound->source_units : bound->text_bytes;
+    return ESP_OK;
+}
+esp_err_t book_weread_map_cached(size_t i,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output) { WR_GUARD;
+    if (!output) return ESP_ERR_INVALID_ARG;
+    if (!binding_owned(s_loaded) || s_loaded->index != i || s_loaded->version != version ||
+        i >= s_toc.count || s_toc.chapters[i].uid != s_loaded->uid) return ESP_ERR_INVALID_STATE;
+    if (!s_loaded->map_ready || !s_loaded->map_count) return ESP_ERR_NOT_FOUND;
+    if (input > (to_cloud ? s_loaded->text_bytes : s_loaded->source_units)) return WEREAD_ERR_POSITION;
+    return map_dense(s_loaded,to_cloud,input,output);
+}
+static esp_err_t map_files(const char *root,bool text_source,const char *css,size_t css_len,
+    bool to_cloud,uint32_t input,uint32_t *output,bool strict) {
+    char *path __attribute__((cleanup(wr_release))) = wr_alloc(1100);
+    if (!path) return ESP_ERR_NO_MEM;
+    int n = snprintf(path,1100,"%s/position.map",root);
+    if (n < 0 || n >= 1100) return ESP_ERR_INVALID_SIZE;
+    FILE *file = fopen(path,"rb");
+    if (!file) return ESP_ERR_NOT_FOUND;
     weread_position_header_t header = {0};
-    if (fread(&header, sizeof(header), 1, f) != 1 || header.magic != WEREAD_POSITION_MAGIC ||
-        !header.count || header.count > 16384) { fclose(f); return ESP_ERR_INVALID_RESPONSE; }
-    if(!to_cloud&&input>header.units){fclose(f);return WEREAD_ERR_POSITION;}
+    bool valid = fread(&header,sizeof(header),1,file) == 1 && header.magic == WEREAD_POSITION_MAGIC &&
+        header.count && header.count <= 16384 && header.bytes && header.bytes <= 4u * 1024u * 1024u;
+    if (!valid) { fclose(file); return ESP_ERR_INVALID_RESPONSE; }
+    if (!to_cloud && input > header.units) { fclose(file); return WEREAD_ERR_POSITION; }
     weread_position_point_t *points = wr_alloc(header.count * sizeof(*points));
-    if (!points) { fclose(f); return ESP_ERR_NO_MEM; }
-    bool valid = fread(points, sizeof(*points), header.count, f) == header.count && fgetc(f) == EOF;
-    fclose(f);
-    for (size_t j = 0; j < header.count && valid; ++j)
+    if (!points) { fclose(file); return ESP_ERR_NO_MEM; }
+    valid = fread(points,sizeof(*points),header.count,file) == header.count && fgetc(file) == EOF && !ferror(file);
+    if (fclose(file)) valid = false;
+    valid = valid && points[0].byte == 0 && points[0].unit == 0 &&
+        points[header.count-1].byte == header.bytes && points[header.count-1].unit == header.units;
+    for (size_t j = 0; j < header.count && valid; ++j) {
         valid = points[j].byte <= header.bytes && points[j].unit <= header.units &&
-            (!j || (points[j].byte >= points[j - 1].byte && points[j].unit >= points[j - 1].unit));
+            (!j || (points[j].byte >= points[j-1].byte && points[j].unit >= points[j-1].unit));
+    }
     if (!valid) { free(points); return ESP_ERR_INVALID_RESPONSE; }
-    strcpy(path+root_length,"/body.html");
-    err=weread_chapter_read_validated(path,&text,&len);
-    path[root_length]=0;
+    n = snprintf(path,1100,"%s/body.html",root);
+    char *text = NULL;size_t len = 0;
+    esp_err_t err = n < 0 || n >= 1100 ? ESP_ERR_INVALID_SIZE : weread_chapter_read_validated(path,&text,&len);
     if (err == ESP_OK && len != header.bytes) err = ESP_ERR_INVALID_RESPONSE;
-    position_mapper_t mapper = {.html = text, .points = points, .count = header.count, .goal = input, .to_cloud = to_cloud};
+    position_mapper_t mapper = {.html=text,.points=points,.count=header.count,.goal=input,.to_cloud=to_cloud};
     html_text_t parsed = {0};
-    if (err == ESP_OK && s_txt) {
-        for (size_t at = 0; at < len && !mapper.found; ++at)
-            if (((unsigned char)text[at] & 0xc0) != 0x80) mapped_character(&mapper, at, at);
+    if (err == ESP_OK && text_source) {
+        for (size_t at = 0; at < len && !mapper.found; ++at) {
+            if (((unsigned char)text[at] & 0xc0) != 0x80) mapped_character(&mapper,at,at);
+        }
         parsed.len = len;
     } else if (err == ESP_OK) {
-        size_t css_len = 0; const char *css = chapter_css(i,path,&css_len);
-        if (!css) err = ESP_ERR_NO_MEM;
-        else err = html_to_blocks_mapped(text, len, css, css_len, mapped_character, &mapper, &parsed);
+        err = html_to_blocks_mapped(text,len,css,css_len,mapped_character,&mapper,&parsed);
     }
+    if (err == ESP_OK && strict && to_cloud && input > parsed.len) err = WEREAD_ERR_POSITION;
     if (err == ESP_OK) *output = mapper.found ? mapper.result : to_cloud ? header.units : (uint32_t)parsed.len;
-    html_text_free(&parsed); free(text); free(points); return err;
+    html_text_free(&parsed);free(text);free(points);
+    return err;
+}
+static esp_err_t map_bound(size_t i,bool to_cloud,uint32_t input,uint32_t *output,const loaded_chapter_t *bound) { WR_GUARD;
+    if (!output || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
+    esp_err_t cached = map_dense(bound,to_cloud,input,output);
+    if (cached != ESP_ERR_NOT_FOUND) return cached;
+    char *resolved __attribute__((cleanup(wr_release))) = NULL;
+    const char *root = bound ? bound->root : NULL;
+    if (!root) {
+        resolved = wr_alloc(1024);
+        if (!resolved) return ESP_ERR_NO_MEM;
+        esp_err_t err = weread_chapter_directory(s_id,book_weread_uid(i),resolved,1024);
+        if (err != ESP_OK) return err;
+        root = resolved;
+    }
+    size_t css_len = 0;const char *css = s_txt ? "" : chapter_css(i,root,&css_len);
+    return css ? map_files(root,s_txt,css,css_len,to_cloud,input,output,false) : ESP_ERR_NO_MEM;
+}
+static esp_err_t detached_manifest(const char *id,uint32_t uid,uint32_t version,bool resource,
+    char *root,size_t cap,cJSON **manifest) {
+    char leaf[64],path[512];
+    if (resource) strcpy(leaf,"resources.json");
+    else snprintf(leaf,sizeof(leaf),"chapter-%u.json",(unsigned)uid);
+    esp_err_t err = wr_cache_path(id,leaf,path,sizeof(path));
+    if (err == ESP_OK) err = wr_read_json_primary(path,manifest);
+    uint64_t stored_version = 0,stored_uid = 0;
+    if (err == ESP_OK && (!wr_owner_matches(*manifest) || !wr_uint(*manifest,"bookVersion",&stored_version) ||
+        (!resource && (!wr_uint(*manifest,"chapterUid",&stored_uid) || stored_uid != uid)))) err = ESP_ERR_INVALID_RESPONSE;
+    if (err == ESP_OK && stored_version != version) err = WEREAD_ERR_VERSION;
+    const char *name = wr_string(*manifest,"root");
+    if (err == ESP_OK && (!name || !*name || name[0] == '/' || strstr(name,"..") || strchr(name,'\\'))) err = ESP_ERR_INVALID_RESPONSE;
+    if (err == ESP_OK) err = wr_cache_path(id,name,root,cap);
+    struct stat st;
+    if (err == ESP_OK && (stat(root,&st) || !S_ISDIR(st.st_mode))) err = ESP_ERR_INVALID_RESPONSE;
+    return err;
+}
+esp_err_t book_weread_map_detached(const char *id,uint32_t uid,uint32_t version,bool text_source,
+    uint32_t input,uint32_t *output) { WR_GUARD;
+    if (!wr_valid_id(id) || !uid || !output) return ESP_ERR_INVALID_ARG;
+    if (!weread_auth_is_authenticated()) return ESP_ERR_INVALID_STATE;
+    struct { char root[512],resources[512]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    if (!paths) return ESP_ERR_NO_MEM;
+    cJSON *manifest = NULL;
+    esp_err_t err = detached_manifest(id,uid,version,false,paths->root,sizeof(paths->root),&manifest);
+    cJSON_Delete(manifest);manifest = NULL;
+    if (err == ESP_OK && !text_source) {
+        esp_err_t res = detached_manifest(id,0,version,true,paths->resources,sizeof(paths->resources),&manifest);
+        if (res != ESP_OK && res != ESP_ERR_NOT_FOUND) err = res;
+        if (res == ESP_ERR_NOT_FOUND) paths->resources[0] = 0;
+        cJSON_Delete(manifest);
+    }
+    char *css __attribute__((cleanup(wr_release))) = NULL;size_t used = 0;
+    if (err == ESP_OK && !text_source) {
+        const size_t cap = 256u * 1024u;
+        if ((paths->resources[0] && !collect_css(paths->resources,&css,&used,cap,0)) ||
+            ((!paths->resources[0] || strcmp(paths->resources,paths->root)) && !collect_css(paths->root,&css,&used,cap,0))) err = ESP_ERR_NO_MEM;
+    }
+    if (err == ESP_OK) err = map_files(paths->root,text_source,css ? css : "",used,true,input,output,true);
+    return err;
 }
 esp_err_t book_weread_map_version(size_t i,uint32_t v,bool to_cloud,uint32_t input,uint32_t *output){WR_GUARD;
     loaded_chapter_t *bound=binding_owned(s_loaded)&&s_loaded->index==i&&s_loaded->version==v?s_loaded:NULL;

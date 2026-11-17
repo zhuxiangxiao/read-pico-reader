@@ -166,7 +166,8 @@ static esp_err_t read_json(const char *path, cJSON **out) {
     FILE *f = fopen(path, "rb");
     if (!f) return errno == ENOENT ? ESP_ERR_NOT_FOUND : ESP_FAIL;
     struct stat st;
-    if (fstat(fileno(f), &st) || st.st_size <= 0 || st.st_size > WEREAD_JSON_LIMIT) {
+    if(fstat(fileno(f),&st)){fclose(f);return ESP_FAIL;}
+    if (st.st_size <= 0 || st.st_size > WEREAD_JSON_LIMIT) {
         fclose(f); return ESP_ERR_INVALID_SIZE;
     }
     size_t len = (size_t)st.st_size;
@@ -177,6 +178,7 @@ static esp_err_t read_json(const char *path, cJSON **out) {
     buf[len] = 0;
     if (ok) *out = wr_parse_json(buf, len + 1);
     free(buf);
+    if(!ok)return ESP_FAIL;
     return *out ? ESP_OK : wr_memory_failed()?ESP_ERR_NO_MEM:ESP_ERR_INVALID_RESPONSE;
 }
 

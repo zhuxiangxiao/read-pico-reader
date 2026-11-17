@@ -28,16 +28,18 @@ static void wr_reader_sample(uint64_t now, bool active) {
     size_t offset = reader_page_offset(s_page);
     if (offset > s_text_len) offset = s_text_len;
     weread_progress_state_t before=weread_reader_state();
-    bool failed=weread_reader_save_failed(),pending=weread_reader_pending_save();
+    bool failed=weread_reader_save_failed(),pending=weread_reader_pending_save(),rescued=weread_reader_rescued();
     unsigned offline=weread_reader_offline();bool caching=weread_reader_caching(),space=weread_reader_storage_blocked();
     weread_reader_tick(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,now,active);
-    if(before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||
+    if(before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||rescued!=weread_reader_rescued()||
         offline!=weread_reader_offline()||caching!=weread_reader_caching()||space!=weread_reader_storage_blocked()){s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;}
 }
 static const char *wr_reader_status(void){
     if(!book_path_is_weread(s_path))return "";
     if(weread_reader_save_failed())return "保存失败 · ";
     if(weread_reader_pending_save())return "待保存 · ";
+    if(weread_reader_state()==WR_PROGRESS_CONFLICT)return "进度冲突，请重开 · ";
+    if(weread_reader_rescued())return "已暂存设备 · ";
     switch(weread_reader_state()){
         case WR_PROGRESS_PENDING:return "待同步 · ";
         case WR_PROGRESS_SYNCED:return "已同步 · ";
@@ -58,6 +60,7 @@ static void wr_reader_offline_caption(char *out,size_t cap){
 // 冷章只保存最新目标，旧正文保留到目标成功排版。/ Keep the old body until the latest cold target typesets successfully.
 static struct {
     bool pending, started, committing, last_page;
+    esp_err_t error;
     size_t chapter, offset, source_offset, toc;
     char *anchor;
 } s_wr_jump;

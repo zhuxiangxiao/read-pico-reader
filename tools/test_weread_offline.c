@@ -103,10 +103,12 @@ int main(int argc,char **argv){
     assert(book_weread_map_cache_bytes()>0&&book_weread_map_cache_bytes()<=65536);
     printf("exact map cache resident=%u bytes for%u UTF8 bytes\n",(unsigned)book_weread_map_cache_bytes(),(unsigned)text.len);
     unsigned before_maps=mapped_parses;
-    for(unsigned i=0;i<128;++i){uint32_t cloud=0;assert(book_weread_map_version(3,100,true,i%text.len,&cloud)==ESP_OK&&cloud==expected[i]);}
-    for(unsigned i=0;i<128;++i){uint32_t local=0;assert(book_weread_map_version(3,100,false,i%(end_units+1),&local)==ESP_OK&&local==expected_back[i]);}
+    for(unsigned i=0;i<128;++i){uint32_t cloud=0;assert(book_weread_map_version(3,100,true,i%text.len,&cloud)==ESP_OK&&cloud==expected[i]);assert(book_weread_map_cached(3,100,true,i%text.len,&cloud)==ESP_OK&&cloud==expected[i]);}
+    for(unsigned i=0;i<128;++i){uint32_t local=0;assert(book_weread_map_version(3,100,false,i%(end_units+1),&local)==ESP_OK&&local==expected_back[i]);assert(book_weread_map_cached(3,100,false,i%(end_units+1),&local)==ESP_OK&&local==expected_back[i]);}
     assert(mapped_parses==before_maps);html_text_free(&text);
     deny_map=true;assert(book_weread_load(3,NULL,NULL,&text)==ESP_OK&&book_weread_commit_loaded(&current,&actual_version)==ESP_OK);
+    before_maps=mapped_parses;uint32_t absent=99;
+    assert(book_weread_map_cached(3,100,true,0,&absent)==ESP_ERR_NOT_FOUND&&absent==99&&mapped_parses==before_maps);
     before_maps=mapped_parses;uint32_t cloud=0;assert(book_weread_map_version(3,100,true,0,&cloud)==ESP_OK&&cloud==expected[0]&&mapped_parses==before_maps+1);
     deny_map=false;html_text_free(&text);assert(!book_weread_map_cache_bytes());
     puts("PASS:256 exact bidirectional map queries match anchored parser oracle without reparsing; map-cache OOM falls back to complete mapping");
@@ -118,7 +120,11 @@ int main(int argc,char **argv){
         else if(i==6)assert(!text.image_count&&strstr(text.utf8,"装饰背景保留文字"));
         else assert(!text.image_count&&!text.len);
         assert(book_weread_map_cache_bytes()<=128u*1024u);
-        if(i==12)assert(!book_weread_map_cache_bytes());
+        if(i==12){
+            current=i;assert(book_weread_commit_loaded(&current,&actual_version)==ESP_OK&&!book_weread_map_cache_bytes());
+            before_maps=mapped_parses;
+            assert(book_weread_map_cached(i,100,true,100,&absent)==ESP_ERR_NOT_FOUND&&mapped_parses==before_maps);
+        }
         html_text_free(&text);
     }
     current=15;assert(book_weread_load(15,NULL,NULL,&text)==ESP_OK&&text.len==18000&&book_weread_commit_loaded(&current,&actual_version)==ESP_OK);
@@ -126,6 +132,40 @@ int main(int argc,char **argv){
     for(unsigned i=0;i<6000;i+=43){uint32_t cloud=0,local=0;assert(book_weread_map_version(15,100,true,i*3,&cloud)==ESP_OK&&cloud==15+i);assert(book_weread_map_version(15,100,false,cloud,&local)==ESP_OK&&local==i*3);}
     assert(mapped_parses==before_maps);html_text_free(&text);
     puts("PASS: typical6000-Han chapter uses48000 exact-map bytes;280 bidirectional save queries perform zero reparse");
+    // Detached recovery retains the rendered edition/UID even if newer shelf/TOC metadata appears.
+    uint32_t large_raw=0,recovered=0,identity=0;unsigned before_downloads=downloads;
+    assert(book_weread_map(12,true,100,&large_raw)==ESP_OK);
+    assert(book_weread_content_identity("weread://offline_book",&identity)&&!book_weread_plain_text());
+    size_t bound_bytes=book_weread_map_cache_bytes();
+    weread_auth_session_t other=s;strcpy(other.vid,"456");
+    assert(weread_auth_save_session(&other)==ESP_OK&&weread_auth_load_session(&other)==ESP_OK);
+    assert(!book_weread_content_identity("weread://offline_book",&recovered)&&!recovered);
+    assert(book_weread_map_cached(15,100,true,0,&recovered)==ESP_ERR_INVALID_STATE);
+    assert(weread_auth_save_session(&s)==ESP_OK&&weread_auth_load_session(&s)==ESP_OK);
+    char foreign_root[512];snprintf(foreign_root,sizeof(foreign_root),"%s/foreign-root",argv[1]);
+    assert(weread_auth_init(foreign_root)==ESP_OK&&weread_auth_save_session(&s)==ESP_OK&&weread_auth_load_session(&s)==ESP_OK);
+    assert(!book_weread_content_identity("weread://offline_book",&recovered)&&!recovered);
+    assert(book_weread_map_cached(15,100,true,0,&recovered)==ESP_ERR_INVALID_STATE);
+    assert(weread_auth_init(argv[1])==ESP_OK&&book_weread_map_cached(15,100,true,0,&recovered)==ESP_OK);
+    assert(book_weread_prepare_open("offline_book")==ESP_OK&&book_weread_prepared("offline_book"));
+    assert(book_weread_map_detached("offline_book",130,100,false,100,&recovered)==ESP_OK&&recovered==large_raw);
+    uint32_t still_identity=0;assert(book_weread_content_identity("weread://offline_book",&still_identity)&&still_identity==identity);
+    assert(book_weread_uid(15)==160&&book_weread_map_cache_bytes()==bound_bytes&&book_weread_prepared("offline_book")&&downloads==before_downloads);
+    book_weread_close();assert(!book_weread_content_identity("weread://offline_book",&still_identity)&&!still_identity);
+    assert(book_weread_map_cached(12,100,true,100,&recovered)==ESP_ERR_INVALID_STATE);
+    char toc_path[512];cJSON *original_toc=NULL;
+    assert(wr_cache_path("offline_book","chapters.json",toc_path,sizeof(toc_path))==ESP_OK&&wr_read_json_primary(toc_path,&original_toc)==ESP_OK);
+    cJSON *newer_toc=cJSON_Duplicate(original_toc,true);assert(newer_toc);
+    cJSON_SetNumberValue(cJSON_GetObjectItemCaseSensitive(newer_toc,"bookVersion"),101);
+    assert(wr_write_json(toc_path,newer_toc)==ESP_OK&&weread_shelf_set_version("offline_book",101)==ESP_OK);cJSON_Delete(newer_toc);
+    assert(book_weread_map_detached("offline_book",130,100,false,100,&recovered)==ESP_OK&&recovered==large_raw&&!book_weread_is_open());
+    assert(wr_write_json(toc_path,original_toc)==ESP_OK&&weread_shelf_set_version("offline_book",100)==ESP_OK);cJSON_Delete(original_toc);
+    recovered=UINT32_MAX;
+    assert(book_weread_map_detached("offline_book",130,101,false,100,&recovered)==WEREAD_ERR_VERSION&&recovered==UINT32_MAX);
+    assert(book_weread_map_detached("offline_book",130,100,false,UINT32_MAX,&recovered)==WEREAD_ERR_POSITION&&recovered==UINT32_MAX);
+    assert(book_weread_map_detached("offline_book",131,100,false,100,&recovered)==ESP_ERR_NOT_FOUND&&recovered==UINT32_MAX);
+    assert(downloads==before_downloads&&!book_weread_is_open());
+    puts("PASS: detached1MiB exact mapping after close, no source/prepared/cache mutation or network; UID/version/range mismatches retain caller output");
     char root[512],map_path[600];paths(40,root,map_path);
     FILE *f=fopen(map_path,"r+b");assert(f);weread_position_header_t h={0};assert(fread(&h,sizeof(h),1,f)==1);h.bytes++;rewind(f);assert(fwrite(&h,sizeof(h),1,f)==1&&!fclose(f));
     assert(!weread_chapter_cached("offline_book",40));

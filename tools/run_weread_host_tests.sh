@@ -16,7 +16,8 @@ else
 fi
 export UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1"
 
-CC="${CC:-/usr/bin/cc}"
+CC="${CC:-cc}"
+export CC
 
 flags=(
     -pthread
@@ -115,7 +116,7 @@ echo "Compiling and running new-open version binding tests..."
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_open_version
 python3 - <<'PY'
 import subprocess,tempfile
-for mode in ('updated','selfheal','moved','corrupt','bad-offset','bad-index','protection'):
+for mode in ('updated','selfheal','moved','corrupt','corrupt-fail','bad-offset','bad-index','protection'):
     with tempfile.TemporaryDirectory(prefix='weread-open-version-') as cache:
         subprocess.run(['build/weread-tests/test_weread_open_version',cache,mode],check=True)
 PY
@@ -155,7 +156,6 @@ for mode in range(1,6):
         subprocess.run(['build/weread-tests/test_weread_progress_transaction',cache,str(mode)],check=True)
 PY
 
-echo "WeRead host tests passed cleanly!"
 echo "Compiling and running constrained WeRead memory-pool tests..."
 "${CC}" "${flags[@]}" -DWEREAD_TEST_MEMORY \
     -Dmalloc=weread_test_malloc -Dcalloc=weread_test_calloc -Drealloc=weread_test_realloc -Dfree=weread_test_free \
@@ -177,7 +177,10 @@ python3 tools/weread_reader_input_host_test.py
 python3 tools/weread_chapter_transition_host_test.py
 python3 tools/weread_client_snapshot_host_test.py
 python3 tools/weread_client_cancel_cleanup_host_test.py
+python3 tools/weread_http_dns_host_test.py
+python3 tools/weread_http_poll_host_test.py
 python3 tools/test_weread_outbox.py
+python3 tools/test_weread_rescue.py
 python3 tools/weread_offline_host_test.py
 python3 tools/test_weread_window.py
 python3 tools/test_weread_runtime_save.py
@@ -186,6 +189,9 @@ python3 tools/weread_cover_cache_host_test.py
 python3 tools/weread_cache_fault_host_test.py
 python3 tools/weread_shelf_noop_host_test.py
 python3 tools/weread_shelf_ids_host_test.py
+python3 tools/weread_shelf_pending_host_test.py
 python3 tools/weread_io_cache_host_test.py
 
 python3 tools/weread_time_cancel_host_test.py
+python3 tools/weread_reader_lifecycle_host_test.py
+echo "All WeRead host tests passed cleanly!"

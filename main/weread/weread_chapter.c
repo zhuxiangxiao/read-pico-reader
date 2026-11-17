@@ -32,6 +32,7 @@
 #include <unistd.h>
 #if defined(ESP_PLATFORM)
 #include "esp_vfs_fat.h"
+#include "esp_timer.h"
 #else
 #include <sys/statvfs.h>
 #endif
@@ -475,7 +476,13 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         if (!archive) { remove_tree(w->root, 0); return ESP_FAIL; }
         snprintf(w->url, sizeof(w->url), "%s/book/chapterdownload?bookId=%s&chapters=%s%u&pf=wechat_wx-2001-android-100-weread&pfkey=pfKey&zoneId=1&bookVersion=%u&bookType=%s&release=1&stopAutoPayWhenBNE=1&preload=%u&preview=0&offline=0",
             weread_client_get_base_url(), id, common ? "0," : "", (unsigned)uid, (unsigned)v, w->b.format, preload ? 1u : 0u);
+#if defined(ESP_PLATFORM)
+        int64_t started=esp_timer_get_time();
+#endif
         err = weread_client_download(w->url, archive, ARCHIVE_LIMIT, s_cancel, s_cancel_ctx, &w->response);
+#if defined(ESP_PLATFORM)
+        int64_t downloaded=esp_timer_get_time();
+#endif
         int code = 0;
         if (err == ESP_OK && w->response.bytes < 4096) {
             rewind(archive); size_t n = fread(w->json, 1, sizeof(w->json) - 1, archive); w->json[n] = 0;
@@ -502,7 +509,13 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         if (fclose(archive) && err == ESP_OK) err = ESP_FAIL;
         unlink(w->path);
         if (err != ESP_OK && w->x.error != ESP_OK) err = w->x.error;
+#if defined(ESP_PLATFORM)
+        int64_t unpacked=esp_timer_get_time();
+#endif
         if (err == ESP_OK) err = assemble(w->root, id, uid, v, w->b.format);
+#if defined(ESP_PLATFORM)
+        int64_t assembled=esp_timer_get_time();
+#endif
         cJSON *m = NULL;
         if (err == ESP_OK) {
             m = cJSON_CreateObject();
@@ -520,6 +533,11 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
             wr_cache_path(id, manifest_leaf, w->path, sizeof(w->path)); err = wr_write_json(w->path, m);
         }
         cJSON_Delete(m);
+#if defined(ESP_PLATFORM)
+        ESP_LOGI("weread","chapter timing download=%u unpack=%u assemble=%u commit=%u result=%d preload=%d",
+            (unsigned)((downloaded-started)/1000),(unsigned)((unpacked-downloaded)/1000),
+            (unsigned)((assembled-unpacked)/1000),(unsigned)((esp_timer_get_time()-assembled)/1000),(int)err,preload);
+#endif
         if (err == ESP_OK) return ESP_OK;
         if (!published) remove_tree(w->root, 0);
         if (err != WEREAD_ERR_VERSION || attempt) return err;

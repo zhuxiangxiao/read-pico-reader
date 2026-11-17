@@ -98,7 +98,14 @@ int main(int argc, char **argv) {
     assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
     assert(book_weread_open("weread://txt_book_202")==ESP_OK);
     assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset==0);
+    html_text_t txt={0};assert(book_weread_load(0,NULL,NULL,&txt)==ESP_OK&&txt.len>3);
+    uint32_t txt_version=commit_chapter(0),txt_uid=book_weread_uid(0),txt_oracle=0;
+    assert(book_weread_plain_text()&&book_weread_map_version(0,txt_version,true,3,&txt_oracle)==ESP_OK);
+    html_text_free(&txt);
     book_weread_close();
+    unsigned txt_downloads=offline_downloads;weread_client_set_download_transport(offline,NULL);uint32_t txt_detached=UINT32_MAX;
+    assert(book_weread_map_detached("txt_book_202",txt_uid,txt_version,true,3,&txt_detached)==ESP_OK&&txt_detached==txt_oracle);
+    assert(!book_weread_is_open()&&offline_downloads==txt_downloads);weread_client_set_download_transport(NULL,NULL);
     control("{\"progress_data\":{\"test_book_101\":{\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":3,\"progress\":50,\"updateTime\":2000000000}}}");
     assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
     assert(result.error==ESP_OK&&result.conflict&&!result.open_ready);

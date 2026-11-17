@@ -3,6 +3,21 @@
 #include "test_weread_outbox.c"
 #undef main
 #include "test_weread_rescue_backend.h"
+static esp_err_t primary_error;
+static unsigned primary_fault;
+static unsigned switch_media_stage;
+static esp_err_t media_switch_transport(const char *url,const char *method,const char *headers,const char *body,char **out,size_t *len,int *status,void *ctx){
+    esp_err_t err=transport(url,method,headers,body,out,len,status,ctx);
+    if((switch_media_stage==1&&strstr(url,"/shelf/syncbook"))||(switch_media_stage==2&&strstr(url,"/book/read"))){
+        current_card[0]=2;switch_media_stage=0;
+    }
+    return err;
+}
+esp_err_t actual_read_json_primary(const char *path,cJSON **out);
+esp_err_t wr_read_json_primary(const char *path,cJSON **out){
+    if(primary_fault&&strstr(path,"progress.json")){--primary_fault;*out=NULL;return primary_error;}
+    return actual_read_json_primary(path,out);
+}
 
 static void block_tf(bool block){
     char path[1200];snprintf(path,sizeof(path),"%s/cache/%s/progress.json.tmp",weread_auth_get_storage_root(),id);
@@ -27,6 +42,17 @@ int main(int argc,char **argv){
         p=pending();assert(p.chapter_offset==30&&!p.dirty);puts("PASS cold process restores owner/CID-bound complete progress before ACK");return 0;
     }
     begin(argv[1]);before=pending();
+    if(!strncmp(mode,"cid-",4)){
+        // Clone coordinates/session/root deliberately match; the immutable physical CID is the only distinction.
+        char path[1200];snprintf(path,sizeof(path),"%s/cache/%s/progress.json",argv[1],id);uint64_t original=file_hash(path);
+        switch_media_stage=strstr(mode,"get")?1:2;weread_client_set_transport(media_switch_transport,NULL);
+        esp_err_t err=weread_progress_outbox_report(id,90000,1700000200,&p);
+        fprintf(stderr,"%s: result=%x GET=%u POST=%u dirty=%u card=%u\n",mode,(unsigned)err,reads,writes,p.dirty,current_card[0]);
+        assert(err==ESP_ERR_INVALID_STATE&&reads==1&&writes==(strstr(mode,"get")?0u:1u)&&current_card[0]==2);
+        assert(file_hash(path)==original&&pending().dirty&&pending().chapter_offset==20);
+        current_card[0]=1;assert(pending().dirty&&pending().chapter_offset==20&&pending().reading_time==5);
+        puts("PASS request-time CID handoff cannot POST an old card after GET or acknowledge it into a cloned replacement");return 0;
+    }
     if(!strcmp(mode,"ordinary")){
         assert(rescue_move(30,&before,&noted,&rescued)==ESP_OK&&noted&&!rescued&&!internal_writes);
         assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_OK&&!internal_writes);return 0;
@@ -54,7 +80,17 @@ int main(int argc,char **argv){
     assert(rescue_move(30,&before,&noted,&rescued)==ESP_OK&&noted&&rescued&&internal_writes==1);
     p=pending();assert(p.chapter_offset==30&&p.base_known&&p.base_offset==10&&p.reading_time==7);
     if(!strcmp(mode,"produce"))return 0;
-    if(!strcmp(mode,"legacy-rescue")){
+    if(!strncmp(mode,"restore-",8)){
+        block_tf(false);char path[1200];snprintf(path,sizeof(path),"%s/cache/%s/progress.json",argv[1],id);uint64_t original=file_hash(path);
+        primary_error=strstr(mode,"oom")?ESP_ERR_NO_MEM:strstr(mode,"io")?ESP_FAIL:
+            strstr(mode,"timeout")?ESP_ERR_TIMEOUT:ESP_ERR_INVALID_RESPONSE;
+        primary_fault=strstr(mode,"once")?1:UINT32_MAX;esp_err_t failed=weread_progress_outbox_report(id,90000,1700000200,&p);
+        fprintf(stderr,"%s: error=%x expected=%x conflict=%u retries=%u HTTP=%u/%u\n",mode,(unsigned)failed,(unsigned)primary_error,p.sync_conflict,p.retry_count,reads,writes);
+        assert(failed==primary_error&&p.dirty&&!p.sync_conflict&&p.chapter_offset==30&&p.retry_count==1&&!writes&&!reads);
+        if(!strstr(mode,"once"))assert(file_hash(path)==original);primary_fault=0;
+        assert(weread_progress_outbox_report(id,90001,1700000300,&p)==ESP_OK&&!p.dirty&&p.chapter_offset==30&&writes==1);
+        printf("PASS %s remains retryable, preserves TF and rescue, then recovers without explicit conflict choice\n",mode);return 0;
+    }else if(!strcmp(mode,"legacy-rescue")){
         assert(weread_progress_report(id,true,90000)==ESP_ERR_NOT_FINISHED&&!writes&&!reads);
         weread_progress_t delta={.reading_time=2};bool stored=false;
         assert(weread_progress_update(id,&delta,false,true,90000,1700000102,&stored)==ESP_ERR_NOT_FINISHED&&stored&&!writes&&!reads);

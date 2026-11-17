@@ -7,16 +7,17 @@ Open **微信读书** in the five-tab bar: Home / Shelf / WeRead / Files / Setti
 
 - 进入先从本地确认登录状态；此时显示书架加载状态，已登录不会闪出扫码页。确认未登录后立即尝试联网生成二维码，在手机上完成确认或验证码；可随时从底栏切换页面，网络失败可点「连接 WiFi」。凭据保存在当前 TF 卡。
   Entry checks local authentication first without flashing the login screen. A confirmed unauthenticated entry immediately requests a QR code. Confirm or complete verification on the phone; the bottom navigation remains available. Use Connect WiFi if needed. Credentials belong to the current TF card.
-- 首次先加载一批最多6本，显示后其余每批最多20本在后台补齐；已有缓存先显示，可直接点书中断后台加载并优先开书。部分详情缺失保留已显示书籍，未补齐时不前移同步游标。
-  Fetch at most6 books for the first batch, then up to20 per background batch. Show cached books immediately; opening interrupts background loading. Missing details retain visible books without advancing the sync cursor.
+- 首次先加载一批最多6本，显示后其余每批最多20本在后台补齐；已有缓存先显示，点书立即显示「正在准备阅读」，取消旧任务后只打开最后选择的书。缺失详情单独进入持久待补队列；原生成员变化、进度、待补队列与同步游标同一事务保存。
+  Fetch at most6 books initially, then up to20 per background batch. Show cached books immediately; a tap gives immediate preparation feedback and opens the latest choice after cancelling old work. Persist unresolved details together with native membership, progress and cursor in one transaction.
 - 与本地书架共用外观设置：深色书轨、亚克力、液态玻璃均为9宫格，列表每页8本；搜索时临时使用列表。封面尺寸、裁切、进度角标、搜索、分页和排序控件共用绘制组件。
 - 两个书架分别保留搜索、页码和排序，切换入口再回来恢复各自状态。云端排序使用书名、最近阅读、更新时间和进度；书目以云端为准。题头「更多」提供刷新书架、WiFi和退出登录；长按书籍清理其离线内容，保留进度。退出登录删除所有凭据副本并立即请求新二维码。
 - 从微信书架开书返回微信书架，从首页继续阅读返回首页，本地书籍返回本地书架；睡眠恢复保持阅读来源、位置和全屏状态。老固件保存的文件/设置页编号继续兼容。
-- 书架缓存先上屏；完整同步后5分钟内重复进入不自动联网同步，过期后空闲1秒再后台增量检查。手动刷新立即检查；失败暂缓重试，首次/未完成书架继续分批加载。
+- 书架缓存先上屏；完整同步后5分钟内重复进入不自动同步，过期后空闲1秒再后台增量检查。手动刷新立即检查；首次加载继续分批，最终仍缺失的详情延迟5分钟补取，已有书籍保持可读。
 - 增量检查确认游标相同且所有变更集合为空时，保留原书架，仅原子更新很小的核对时间记录；部分同步、缺失详情、游标或账号变化仍走完整事务。
-- 已确认详情按当前账号与本轮云端游标记入批次检查点。切页、开书或重启后先核对云端游标，同一轮只补未确认详情；云端游标变化则重新核对相应书目。旧缓存缺少确认标记时逐批补核对，已有书目保留可读。完整核对成功后清理临时批次标记。
-- 成功响应缺少部分书号只代表详情未取到，保留已成功书籍及旧同步游标，并独立延迟5分钟重试；云端目标游标相同时只请求仍缺失的书，目标游标变化则重新核对。明确不支持的格式直接跳过并允许该轮完成。
-- 当前页先读完本地封面点阵，再补远端缺图；切换列表/网格复用同组像素，书架重排按书号和封面版本转移。账号、书号、原图地址或点阵格式变化使对应缓存失效；失败封面短期负缓存，手动刷新可重试。
+- 后续只获取原生增量中发生变化的书及持久待补详情；阅读进度令全局游标变化时，不会把已成功详情全部重取。切页、开书或重启后继续使用已提交缓存。旧格式缓存安全迁移：已有完整缓存沿用增量，旧中断批次仅在目标游标相同且有确认标记时复用，否则重新核实。
+- 成功响应缺少书号仅表示详情尚未取到，不将其伪造成永久不可用。只有返回有效详情、明确不支持的格式、讲书或删除记录才从待补队列移除；尚无详情的新书也保存原生进度，后续补到详情时恢复。原子同步接口仍保持整轮失败不提交。
+- 当前页先读取本地点阵，再补远端缺图；切换列表/网格复用同组像素，书架重排按书号和封面版本转移。后台仅为翻页方向相邻的两本书预热磁盘已有原图，不提前下载邻页，也不常驻整页像素。远端封面完成按150ms合并刷新，隐形预热和预连接不刷新画面。账号、书号、原图地址或点阵格式变化使对应缓存失效；失败封面短期负缓存，手动刷新可重试。
+- 书架空闲时可提前准备网络；每次进入最多尝试一次。仅自己启动的WiFi在最近实际网络活动60秒后空闲关闭，关闭后不会在同一次进入反复重连；其他功能持有的网络连接不关闭。
   Both shelves share appearance and drawing components, with nine grid entries or eight list rows. Each retains its own query/page/order on tab switches. More provides refresh, WiFi and logout; hold a book to clear its content while retaining progress. Returning from reading follows its Home/local/WeRead origin, including sleep restoration.
 - 普通开书先检查本机和云端位置；存在冲突时明确选择。离线保留书架、目录和已完整下载的章节，未缓存章节需要联网。
   Normal opens compare local/cloud positions and ask when they conflict. Shelf, TOC and complete chapters remain available offline; uncached chapters require connectivity.
@@ -39,25 +40,33 @@ Register JSON hooks once at boot: JSON nodes/strings in `WR_GUARD` task scopes u
 
 - `weread_runtime_start` / `poll`：登录、书架同步、开书检查、封面、清理和退出；调用方通过 `weread_runtime_result_free` 释放未接管的结果。
   Dispatch login, shelf sync, opening checks, covers, cleanup and logout; release unclaimed result allocations with `weread_runtime_result_free`.
-- `weread_reader_prepare(uri, chapter)`：阅读器解析前由 worker 确保章节完整；前台只解析缓存，空闲时预读下一章。已载入的同章纯文字翻页允许进度任务用独立位置快照继续完成，旧快照结果不能覆盖更新的导航；图文、切章及释放资源前仍取消并等待。切章前提交离开章节的位置，目标章节成功显示后的真实导航由后续采样保存。
-  Ensure complete chapter content on the worker before foreground parsing and prefetch the next chapter during idle. Loaded same-chapter text turns may proceed while a progress worker owns its snapshot; stale completion cannot overwrite newer navigation. Image, chapter and resource-lifecycle boundaries still join. A chapter boundary flushes the departing position; committed navigation records the destination afterward.
-- `weread_reader_begin/resume/tick/flush/end`：保存本机位置，累计实际活跃读秒与翻页；普通上报按60秒或十页节流，切章、退书、锁屏对待报位置强制尝试。先保存 dirty/positionPending 再联网；必须收到成功业务响应 `succ=1/true` 才清标记，清标记写卡失败仍保留待报记录。强制请求有1800ms预算，但旧请求取消及DNS/TLS交接不构成同样严格的总耗时上限。
-  Track local position, active reading time and turns. Ordinary reports throttle at60 seconds or ten pages; chapter/exit/lock boundaries force an attempt for pending positions. Persist dirty/positionPending before networking and clear them only after a successful `succ=1/true` response; failed acknowledgement commits retain pending state. Forced requests use an1800ms budget, without a strict total bound on prior cancellation or DNS/TLS teardown.
-- 失败记录在当前书继续阅读时按15秒退避补报，睡眠恢复或重开并继续本机待报位置后也可重试。退书或锁屏后 worker 停止，没有跨书后台补报队列，也没有单独的“云端同步成功”界面状态；离线时不能承诺云端即时保存。无真实导航且无待报位置时不发位置请求，保留避免覆盖手机进度的保护。
-  Failed records retry with15-second backoff while reading the same book, or after resuming its pending local position. Exit/lock stops the worker; there is no cross-book retry queue or dedicated cloud-acknowledgement UI. Offline handoffs cannot promise immediate cloud persistence. No navigation and no pending position means no position write, retaining the phone-progress protection.
-- `cancel_join` / `stop` / `media_lost`：只 shutdown 自有 HTTP socket，等请求/解包完成退出后才释放媒体。WiFi 的启动与停止都归同一 worker；只关闭自己启动的射频会话。拔卡擦除内存账号，进入时重新绑定当前卡。
-  Shut down only the owned HTTP socket and join before releasing media. One worker starts/stops its own WiFi session, retaining any externally owned connection. Media loss wipes account memory, and entry rebinds to the current card.
+- `weread_reader_prepare(uri, chapter)`：已缓存章直接使用，纯文字阅读可与进度请求并行。冷章由页面异步排队；先保存旧位置，worker立即请求，随后推送准备提示。下载、解析、排版全部成功才接管目标；失败保留旧正文和位置。新目标、离页或锁屏取消旧目标，完成结果必须匹配书号和真实UID。图片及释放资源前仍等待所有者退出。
+  Cached chapters are immediately available and text reading may overlap immutable progress requests. Cold transitions persist the old position, start the worker before feedback presentation and commit only after download, parsing and layout succeed. Failures retain the old body. New targets, exit and lock cancel queued work; completions must match book and UID. Image/resource teardown still joins its owner.
+- `weread_reader_begin/resume/tick/flush/end`：真实导航和活跃读秒先存本地。普通位置上报按60秒或十页节流，切章后的真实导航优先补报；切章、退书和锁屏不再同步等待云端写入。只有业务响应明确 `succ=1/true` 才清除已确认代次的待报状态；确认写卡失败仍保留待报。睡眠只做可靠本地保存和有界取消，不为一次网络成功延长等待。
+  Persist real navigation and active reading time first. Ordinary position reports wait60 seconds or ten pages, with committed chapter changes prioritized. Chapter, exit and lock no longer synchronously wait for cloud writes. Only explicit `succ=1/true` acknowledges a revision; failed acknowledgement commits remain pending. Sleep saves locally and cancels work without waiting for a successful network exchange.
+- 持久outbox合并同一本书的新位置，书架空闲时也可补报已关闭书籍；单次扫描最多8个目录。失败按15、30秒递增退避，最长240秒，取消不增加退避。每次补报先取新鲜原生云端基线，核对账号、完整会话、实际版本和旧锚点；云端已变化或旧记录无可信基线时标冲突，要求重新开书显式选择，不能覆盖手机新位置。
+  A durable coalescing outbox drains closed books during shelf idle, scanning at most eight directories per slice. Failures back off from15 seconds to a240-second cap; cancellation does not penalize retries. Each send checks a fresh native cloud baseline, owner/session, actual edition and original anchor. Changed cloud positions or untrusted legacy baselines require an explicit reopen/choice rather than overwriting the phone.
+- 阅读页区分待保存、本地保存、待同步、已同步和进度冲突；状态变化合入既有800ms空闲页脚更新。写卡失败时可用设备内部两槽应急账本（每槽≤1280B），绑定卡CID、账号、书籍、设备与版本；显示「已暂存设备」，不等同云端成功。正常写卡不写该账本。恢复原卡后先以旧/新快照核对恢复TF，再联网。两槽已满或内部写失败时保留RAM并阻止普通退书/锁屏清掉位置；断电前仍须解决存储错误。
+  Footer states distinguish unsaved, local, pending, acknowledged and conflicting positions, coalesced into the existing800ms idle update. TF failures may use two device rescue slots of at most1280 bytes each, bound to card CID/owner/book/device/edition. “Saved on device” is not a cloud acknowledgement. Healthy TF writes never use rescue storage. Restore the original card with snapshot comparison before networking. Full slots/internal failures retain RAM and block ordinary exit/lock from discarding it; storage errors must be resolved before power loss.
+- `cancel_join` / `stop` / `media_lost`：网络轮询由worker退出并关闭自有句柄，资源释放前仍等待完成。WiFi启停归同一worker，只关闭自己启动的会话。拔卡在清账号前尝试抢救已验证位置；无法映射或两种存储均失败时保留待保存状态，不能报告成功；重新进入须绑定当前卡。
+  The polling worker closes its own handle; teardown joins before freeing resources. One worker owns WiFi lifecycle and leaves external sessions intact. Media loss attempts rescue before forgetting credentials; unavailable mappings or both storage failures remain unsaved rather than reporting success. Entry rebinds to the current card.
 
 `book_open("weread://<id>")` 使用 `BOOK_KIND_WEREAD`，共享 HTML/CSS、排版和图片接口。`book_file_path_supported()` 仍只用于本地扫描；只有明确打开/恢复目标使用虚拟 URI 门禁。虚拟 stat 身份包含账号、书号和版本，并限制在32位有符号范围内，避免跨账号进度复用。
 Virtual opens use `BOOK_KIND_WEREAD` with shared HTML/CSS, layout and image APIs. Local scans still use `book_file_path_supported()`; virtual targets are admitted only at explicit open/resume gates. Virtual stat identities bind account/book/version within signed32-bit bounds to isolate NVS progress.
 
+阅读中的虚拟身份只随后续成功接管的实际正文版本变化；书架元数据后台更新不提前重标书签。新版目录重排后旧版按序号保存的NVS书签不会当作新版书签；布局失败保留旧身份。长章缺少RAM映射又发生拔卡时，保留本次冻结的UID/序号/版本/解析类型；插回原卡后可独立深验原章节成品完成精确映射，不临时打开或覆盖另一书源。原版成品已损坏或被换版时继续保留待保存状态并报错。
+The virtual identity follows only successfully committed content, not background shelf metadata. Reordered new editions reject old ordinal-based NVS bookmarks; failed layout retains the old identity. If a long chapter lacks a RAM map when media disappears, retain its captured UID/ordinal/edition/parser. The original card can later supply a deeply validated detached mapping without opening or replacing a source. Missing, damaged or replaced original content remains an explicit unsaved error.
+
 ## 协议与缓存 / Protocol and caches
 
-扫码结果接口采用65秒长轮询预算（实测空闲约55秒返回），接受`scan:0/1`状态；普通请求15秒，有截止时间的上报仍按剩余预算缩短。退出/锁屏可中断当前socket，无须等长轮询结束。
-QR results allow65-second long polls (idle replies measured at about55s), including `scan:0/1` states. Ordinary requests use15 seconds; deadline-bound reports cap that wait. Exit/lock interrupts the active socket immediately.
+扫码结果接口采用65秒无进展预算（实测空闲约55秒返回），接受`scan:0/1`状态；普通请求与下载采用15秒无进展预算，成功读写后刷新，有独立截止时间的调用仍受硬截止约束，不因持续传输延长。WeRead唯一worker的HTTPS传输使用异步DNS及SDK异步open/write/header/read轮询；单次socket等待50ms，DNS、连接、响应头和正文阶段均检查取消。取消不必等待整段15/65秒预算，但证书解析等单次SDK内部CPU工作、SDK关闭与WiFi资源交接仍需真机计时，不能承诺整条退出流程严格50ms。
+QR polls retain a65-second no-progress budget; other requests/downloads use15 seconds, refreshed by successful I/O and capped by any caller hard deadline. The sole WeRead worker polls asynchronous DNS and SDK HTTPS operations with50ms socket waits, checking cancellation throughout. This avoids waiting for the full network timeout; certificate CPU work, cleanup and WiFi handoff still require hardware timing and do not have a claimed50ms total bound.
 
 认证支持顶层/data字段别名和受信任登录响应的 Set-Cookie 令牌，支持单次续期重放。非 HTTPS/非 qq.com 目标不携带凭据，禁止自动重定向；loopback 例外只存在于宿主测试。
 Authentication accepts root/data aliases and trusted login Set-Cookie tokens, with a single renewal/replay. Non-HTTPS/non-qq.com destinations receive no credentials and redirects are disabled; loopback exceptions exist only in host tests.
+
+数字IP仅用于连接，Host保留原authority，TLS的SNI、证书名称与证书bundle继续验证原域名；凭据是否允许发送也按原始HTTPS域名判断。DNS最多保留两个取消后的迟回调对象，每个≤384B内部RAM；端点固定部分≤704B及最长2048字节URL放在PSRAM，不新增网络线程。后台预读、封面或补报遇401保留凭据并返回失败，前台操作继续走原单次续期/撤销流程。网络日志只记匿名路由类别、请求计数、DNS/连接与响应头/正文/清理耗时、字节数和结果，不输出令牌或完整URL。
+Numeric peers preserve the original Host, SNI, certificate name/bundle and credential origin. DNS retains at most two late-callback contexts, each bounded to384 internal-RAM bytes; endpoint metadata (at most704 bytes) and URLs (at most2048 bytes) use PSRAM. No extra network worker is created. Background401 failures retain credentials; foreground calls retain their single renewal/revocation policy. Logs expose route categories, counts, phase timings, sizes and results without tokens or full URLs.
 
 开书优先 fresh 请求 reMarkable 原生 `/shelf/syncbook` 的单书完整 `bookProgress`；精确匹配书号并要求 UID/目录序号/偏移/百分比四字段。缺失或不完整才走原生 `getProgress` 及其必要兼容回退，不能把缺字段伪造为未读。完整原生路径将进度读取降到一次请求。选择位置后复用刚同步目录；正文就绪即进入阅读，封面预热移到同一 worker 的阅读空闲期。
 
@@ -67,7 +76,7 @@ Authentication accepts root/data aliases and trusted login Set-Cookie tokens, wi
 
 同一次位置映射复用已经校验的章节根目录读取正文和CSS，保留正文大小、完整读取和最终位置校验；缓存章节命中后不再重复探测。解包复用本次已确认的父目录，但每个文件仍检查路径、冲突、CRC和取消。
 
-进度采样合并为一次读盘事务：先保存本次读秒/导航，再按原节流规则上报并返回最终持久化状态；清dirty落盘失败时仍返回待报状态。无变化的开书检查点不重复写盘。串口 `open timing` 分别记录进度、目录、章节及校验准备毫秒数，阅读页切换日志用于继续核对前台解析、排版和上屏耗时。
+进度采样只保存本地，网络补报由独立任务消费同一持久记录；ACK不得清除较新导航。无变化的开书检查点不重复写盘。账号切换前原子归档旧账号进度，清内容缓存保留全部进度副本。串口 `open timing` 分别记录进度、目录、章节及校验准备毫秒数，阅读页日志区分绘制、推屏与前台等待。
 Each open first fetches a fresh single-book native reMarkable `/shelf/syncbook` position, matching the book ID and requiring UID, ordinal, offset and percentage. Missing/incomplete records retain the native `getProgress` compatibility path; they are never invented as unread positions. Complete native positions need one request. Choices reuse the synchronized TOC; ready text opens immediately and the same worker warms covers during reader idle.
 
 开书在写入所选位置前验证最终目录的 UID/序号、原文偏移范围及映射文件完整性；旧版本的矛盾位置不会被直接改成本版或裁到章节边界。失败保留原本机 dirty 和待上报时长，并提示先在手机重新打开该书。
@@ -77,6 +86,9 @@ Before persisting a choice, validate the final UID/ordinal, source bounds and co
 Shelf ID sync publishes the first6 books, then up to20 per batch, filters lectures and sorts by recent reading. Failed batches retain committed pages; the atomic sync API still preserves the prior complete snapshot on failure. Chapter-version recovery refreshes only that book. TOCs merge UIDs or replace on clearAll. Initial EPUB downloads include common chapter0; archives stream4KiB chunks with CRC/path/size/cancellation checks, handle Deflate input boundaries and assemble files in info.txt order. Validate manifest bookVersion only when present. Handle402/499 and retry version error-2063 once.
 
 `position.map` 记录属性重写前后的位置锚点，将排版 UTF8 字节与原文 HTML UTF16 坐标双向映射，覆盖标签、实体、代理对和多文件。禁止直接上传排版字节；映射失败不上传猜测位置。旧的无映射缓存须重取。协议位置仍需真实账号跨端核验。
+
+当前正文与待接管正文分别绑定真实资源目录、UID和版本；排版成功后才交接。精确映射表每份最多8192点（64KiB PSRAM），两份并发上限128KiB，正文过长或分配失败回到原有完整映射，不稀疏猜测位置。空闲预读按目录真实UID补齐后续3章；最多连续3次实际失败后停止，输入取消不计失败。后台缺章预留104MiB最坏事务空间，空间不足暂停预读，已有完整章继续可读。下载就绪、已缓存和已呈现分开，页脚不把下载完成说成已经显示。
+Active and staged content bind their actual directory, UID and edition, committing only after successful layout. Exact maps use at most8192 points/64KiB each,128KiB across two PSRAM bindings; long content/OOM uses the full mapping path without sparse guesses. Idle prefetch fills the next three real TOC UIDs, stops after three actual failures and does not count input cancellation. Missing background chapters reserve104MiB of worst-case transaction space; insufficient space pauses prefetch while complete cached chapters remain readable. Download readiness, offline availability and presentation are distinct states.
 
 恢复时保留经校验的原始协议坐标、百分比和摘要。首次显示、字体/排版重排不算位置变化；仅阅读时间先存本地，等真实导航再合并上传，避免只读秒覆盖手机刚移动的位置。位置待报标志独立持久化，旧dirty记录仍可补报。成功翻页、目录/书签或章内跳转在提交时冻结新位置，之后的重排不改待上报目标。无新位置且无待报位置时，开书再退出不发位置请求。书架缓存有效期不影响开书时重新获取单书云端进度。
 `position.map` anchors before/after attribute rewriting map normalized UTF8 bytes to original HTML UTF16 coordinates, including markup, entities, surrogate pairs and multiple files. Never upload normalized bytes or guessed mappings. Old caches without maps require downloading again. Cross-device coordinates still require real-account validation.
@@ -93,10 +105,11 @@ Root `/sdcard/.kiikoread/weread`:
 | 路径 / Path | 用途 / Purpose |
 | --- | --- |
 | `auth.json` | 凭据 / Credentials |
-| `shelf.json` | 账号归属的离线书架 / Account-bound offline shelf |
+| `shelf.json` | 账号归属的离线书架、原生游标及`detailPending`待补详情队列 / Account-bound shelf, native cursor and unresolved-detail queue |
 | `shelf-check.json` | 绑定账号和书架游标的核对时间 / Last check bound to owner and shelf key |
 | `cache/<id>/chapters.json` | 目录与版本 / TOC and version |
 | `cache/<id>/progress.json` | 账号归属的位置和dirty状态 / Account-bound position and dirty state |
+| `cache/<id>/progress.json.<vid>` | 切账号前保存的独立进度；内容清理保留 / Atomic owner archive, retained by content cleanup |
 | `cache/<id>/chapter-<uid>.json`, `resources.json` | 完整目录提交指针 / Committed chapter/resource directories |
 | 目录内 `body.html`, `position.map` | 组装正文与原文坐标锚点 / Assembled body and coordinate anchors |
 | `cache/<id>/cover.img`, `cover.gray` | 原图与176×240成品点阵 / Source art and176×240 raster |
@@ -107,16 +120,23 @@ Directory creation accepts existing directories before mkdir, including FatFS mo
 自导入封面允许最多三次显式 HTTPS 跳转到腾讯云等存储域；每跳重建头，外域剥离会话凭据，拒绝降级、循环超限和过长地址。支持 PNG/JPEG/WebP，HTTP200但解码失败也进入退避，避免重复下载阻塞其他任务。
 Imported covers may follow at most three explicit HTTPS redirects to storage hosts. Every hop rebuilds headers and strips credentials outside qq.com; downgrade, excessive loops and oversized URLs fail. PNG/JPEG/WebP are accepted; decode failures back off even after HTTP200.
 
-上限：JSON2MiB、书架1024本、目录20000章、下载32MiB、单条目8MiB、展开总量64MiB、正文4MiB、CSS256KiB、位置锚点16384。旧完整目录由清理操作回收。
-Limits:2MiB JSON,1024 shelf books,20000 chapters,32MiB downloads,8MiB entries,64MiB expanded data,4MiB body,256KiB CSS and16384 anchors. Explicit cleanup reclaims older committed directories.
+上限：JSON2MiB、书架与待补详情的书号并集1024本、目录20000章、下载32MiB、单条目8MiB、展开总量64MiB、正文4MiB、CSS256KiB、位置锚点16384。书架成员和队列去重使用临时16KiB目标PSRAM索引，在详情HTTP之前释放；无成员变化时不分配。旧完整目录由清理操作回收。
+Limits:2MiB JSON,1024 distinct IDs across cached books and unresolved details,20000 chapters,32MiB downloads,8MiB entries,64MiB expanded data,4MiB body,256KiB CSS and16384 anchors. Temporary shelf deduplication indexes use16KiB of target PSRAM, are released before detail HTTP and are omitted without membership changes. Explicit cleanup reclaims older committed directories.
+
+微信EPUB的纯空正文内联背景图可提升为首屏插图；真正空章节仍保留空页语义，混合图文不强制改成整页图。仅处理有界扫描能明确证明的样式，不新增通用外部CSS背景渲染。旧已组装的背景图章节可清该书离线内容后重取，进度保留；本地TXT/EPUB解析默认行为不变。
+WeRead EPUB chapters with provably empty text may promote an inline background image to a page image. True empty chapters remain empty, and mixed text/images retain their layout. Bounded conservative detection does not add general external-CSS backgrounds. Clear and redownload old assembled content to apply the fix while retaining progress; local TXT/EPUB parsing stays unchanged.
 
 ## 验证与本地交付 / Validation and local delivery
 
 ```sh
+export IDF_PATH=/path/to/firmware/esp-idf
 bash tools/run_weread_host_tests.sh
 python3 tools/test_weread_native_e2e.py
 bash tools/run_weread_e2e_tests.sh
 ```
+
+总入口包含真实SDK HTTP解析器的25场景轮询测试、DNS迟回调与取消、持久待补队列及紧急持久化恢复测试。需要Python3、支持ASan/UBSan的C编译器、zlib和ESP-IDF源码；`CC`可指定编译器。解析器优先取`IDF_PATH`或`KIIKO_IDF_PICO`，未配置时检查PATH里的`idf.py`和通用`~/esp/esp-idf`；依赖缺失明确失败，不静默跳过。可单独运行`IDF_PATH=/path/to/sdk python3 tools/weread_http_poll_host_test.py`，或用`WEREAD_TEST_BUILD_DIR`指定这些新增测试的独立输出根目录。
+The entry point includes25 production polling scenarios using the SDK's unchanged HTTP parser, DNS late-reply/cancellation, durable detail queues and emergency persistence recovery. Supply Python3, an ASan/UBSan-capable C compiler, zlib and ESP-IDF sources; `CC` selects the compiler. Parser discovery uses `IDF_PATH` or `KIIKO_IDF_PICO`, then PATH's `idf.py` and `~/esp/esp-idf`. Missing dependencies fail explicitly. Run the polling script separately with `IDF_PATH`; `WEREAD_TEST_BUILD_DIR` isolates the newly added tests' outputs.
 
 C测试启用ASan/UBSan。受限内存池另覆盖800本渐进书架、3000章目录、线程分配隔离、JSON嵌套与OOM回滚/重试；可用`WEREAD_NATIVE_MEMORY=1 python3 tools/test_weread_native_e2e.py`运行受限池生产HTTP链路。原生HTTP测试运行生产网络、认证、书源、worker和进度代码，覆盖JSON/仅Cookie登录、多文件映射、冲突选择、离线落盘/补报、预读、阻塞请求取消、换卡、缓存清理与退出。Python Tier另含协议模拟，不能替代生产C或设备验收。
 C tests use ASan/UBSan. Constrained-pool tests cover800 staged books,3000 chapters, task allocation isolation, JSON nesting and OOM rollback/retry. Use `WEREAD_NATIVE_MEMORY=1 python3 tools/test_weread_native_e2e.py` for constrained production HTTP E2E. Native HTTP tests exercise production networking/auth/source/worker/progress, including JSON/cookie-only login, multi-file mapping, conflict choices, offline persistence/retry, prefetch, blocked-request cancellation, card replacement, cleanup and logout. Python tiers also contain simulations and do not replace production C or device acceptance.
@@ -124,5 +144,5 @@ C tests use ASan/UBSan. Constrained-pool tests cover800 staged books,3000 chapte
 双板使用 `tools/build_firmware.py --board all` 独立构建与验证，产物仅放在ignored build目录。菜单调度和冷解析按体积编译，阅读绘制及图片热路径保持O2；没有扩大分区、删字库或改变波形/供电。保留正式版本号，不覆盖已发布下载、不自动刷机、不发布。
 Build/verify both boards independently with `tools/build_firmware.py --board all`; outputs stay under ignored build directories. Size-optimize menu dispatch/cold parsing while keeping reader/image paint hot paths atO2. Partitions, fonts, waveforms and power remain intact. Keep published version numbers without replacing downloads, flashing or publishing.
 
-Pico用户已确认书架更流畅、从目录找回的位置退书重开后保持；第一阶段性能版连续开同一本书的第二次明显更快且位置正确。第二阶段用户反馈功能正常，速度变化不明显；一次实测worker准备6243ms，其中云进度阶段5184ms（包含网络准备），不是两版对照耗时。自导入封面此前已确认正常；旧86%位置未做估算恢复。仍待长时验证：会话续期、手机与设备交替阅读、S31正文及封面实屏、慢网切章、拔卡/换卡、浅睡与深睡恢复。宿主测试不构成这些验收。
-Device acceptance remains: updated session renewal, phone/device positions both ways (including the reported86%-to-start mismatch), S31 text and both panels' covers, slow-network chapter changes, media loss/replacement and light/deep sleep. Host results do not constitute these checks.
+宿主与SDK验证不能代替实际刷新、残影、真实网络耗时、耗电、栈水位及手机/设备交替阅读验收。普通在线开书仍须取得新鲜单书云进度；设备离线、休眠或后台尚未确认时不承诺云端即时保存。补报先核对新鲜云端基线，但服务端接口不提供跨设备事务锁，同时在手机和设备导航仍需核对冲突。历史百分比不能用于恢复或上报猜测位置。
+Host/SDK checks do not replace device refresh, ghosting, network, power, stack-watermark or alternating phone/device acceptance. Normal online opening still fetches a fresh cloud position. Offline, sleeping or unacknowledged work cannot promise immediate cloud persistence. Fresh-baseline checks protect retries, but the service offers no cross-device transaction lock; simultaneous navigation still needs conflict checks. Never recover or report guessed coordinates from a historical percentage.

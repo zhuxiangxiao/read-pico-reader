@@ -9,18 +9,36 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import os
 import json
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 
 root=Path(__file__).resolve().parents[1]
-sdk=Path(os.environ.get("IDF_PATH","/Users/skyzhu/esp/esp-idf"))
-parser=sdk/"components/http_parser"
-assert (parser/"http_parser.c").is_file(),"Set IDF_PATH to the ESP-IDF used to build firmware"
-out=root/"build/night-optimization/http-poll"
+def find_sdk_parser():
+    """Use the configured firmware SDK; never replace its parser with a mock."""
+    configured=os.environ.get("IDF_PATH") or os.environ.get("KIIKO_IDF_PICO")
+    executable=shutil.which("idf.py")
+    candidates=[Path(configured).expanduser()] if configured else [
+        *([Path(executable).resolve().parents[1]] if executable else []),
+        Path.home()/"esp/esp-idf",
+    ]
+    for sdk in candidates:
+        parser=sdk.resolve()/"components/http_parser"
+        if all((parser/name).is_file() for name in ("http_parser.c","http_parser.h")):
+            print(f"Testing production HTTP poller with SDK parser: {parser}",flush=True)
+            return parser
+    checked=", ".join(str(path.resolve()) for path in candidates)
+    raise SystemExit(
+        "WeRead HTTP polling tests require ESP-IDF's real components/http_parser/http_parser.c and .h. "
+        "Set IDF_PATH (or KIIKO_IDF_PICO) to the SDK used for firmware, or activate its export.sh. "
+        f"Checked: {checked}. This required test has not run."
+    )
+parser=find_sdk_parser()
+out=Path(os.environ.get("WEREAD_TEST_BUILD_DIR",root/"build/weread-tests")).resolve()/"http-poll"
 out.mkdir(parents=True,exist_ok=True)
-flags=[os.environ.get("CC","/usr/bin/cc"),"-std=c11","-D_DEFAULT_SOURCE","-DWEREAD_USE_ESP_HTTP_CLIENT","-DWEREAD_TEST_ASYNC_HTTP",
+flags=[os.environ.get("CC","cc"),"-std=c11","-D_DEFAULT_SOURCE","-DWEREAD_USE_ESP_HTTP_CLIENT","-DWEREAD_TEST_ASYNC_HTTP",
        "-pthread","-Wall","-Wextra","-Werror","-Wno-deprecated-declarations","-g","-fsanitize=address,undefined","-fno-omit-frame-pointer",
        "-Imain/weread","-Itools/weread_stubs","-I"+str(parser)]
 names=["init","open","write","fetch_headers","read","get_status_code","get_content_length","is_complete_data_received"]

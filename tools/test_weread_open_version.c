@@ -24,7 +24,7 @@
 static unsigned version = 100, downloads;
 static unsigned toc_requests;
 static unsigned reports, reported_offset, reported_percent, reported_seconds;
-static bool selfheal, moved, corrupt, bad_offset, bad_index;
+static bool selfheal, moved, corrupt, corrupt_fail, fail_download, bad_offset, bad_index;
 static esp_err_t request(const char *url, const char *method, const char *headers, const char *body,
     char **out, size_t *len, int *status, void *ctx) {
     (void)method; (void)headers; (void)body; (void)ctx;
@@ -49,7 +49,9 @@ static esp_err_t download(const char *url, const char *headers, FILE *out, size_
     weread_cancel_fn cancel, void *arg, weread_download_info_t *info, void *ctx) {
     (void)url; (void)headers; (void)limit; (void)cancel; (void)arg; (void)ctx;
     memset(info, 0, sizeof(*info)); info->status = 200;
-    if (!downloads++ && selfheal) {
+    unsigned attempt=downloads++;
+    if(fail_download)return ESP_ERR_TIMEOUT;
+    if (!attempt && selfheal) {
         const char *json = "{\"errcode\":-2063}"; info->bytes = strlen(json);
         assert(fwrite(json, 1, info->bytes, out) == info->bytes); return ESP_OK;
     }
@@ -59,9 +61,28 @@ static esp_err_t download(const char *url, const char *headers, FILE *out, size_
     while ((n = fread(buf, 1, sizeof(buf), file))) { assert(fwrite(buf, 1, n, out) == n); info->bytes += n; }
     assert(!ferror(file)); fclose(file); return ESP_OK;
 }
+static void adopt_body(size_t chapter) {
+    html_text_t text={0};uint32_t actual_version=0;size_t actual=chapter;
+    assert(book_weread_load(chapter,NULL,NULL,&text)==ESP_OK);
+    assert(book_weread_commit_loaded(&actual,&actual_version)==ESP_OK&&actual==chapter&&actual_version==101);
+    html_text_free(&text);
+}
+static void complete_map(uint32_t uid) {
+    char path[1100];assert(weread_chapter_directory("test_book_101",uid,path,1024)==ESP_OK);
+    strcat(path,"/position.map");FILE *file=fopen(path,"rb");assert(file);
+    struct stat st;weread_position_header_t h={0};
+    assert(!fstat(fileno(file),&st)&&fread(&h,sizeof(h),1,file)==1&&h.magic==WEREAD_POSITION_MAGIC&&h.count&&h.count<=16384&&h.bytes);
+    assert((uint64_t)st.st_size==sizeof(h)+(uint64_t)h.count*sizeof(weread_position_point_t));
+    weread_position_point_t previous={0},point={0};
+    for(uint32_t i=0;i<h.count;++i){
+        assert(fread(&point,sizeof(point),1,file)==1&&point.byte<=h.bytes&&point.unit<=h.units);
+        assert(!i?(!point.byte&&!point.unit):(point.byte>=previous.byte&&point.unit>=previous.unit));previous=point;
+    }
+    assert(point.byte==h.bytes&&point.unit==h.units&&fgetc(file)==EOF&&!ferror(file)&&!fclose(file));
+}
 int main(int argc, char **argv) {
     assert(argc == 3); selfheal = !strcmp(argv[2], "selfheal");moved=!strcmp(argv[2],"moved");
-    corrupt=!strcmp(argv[2],"corrupt");bad_offset=!strcmp(argv[2],"bad-offset");bad_index=!strcmp(argv[2],"bad-index");
+    corrupt_fail=!strcmp(argv[2],"corrupt-fail");corrupt=!strcmp(argv[2],"corrupt")||corrupt_fail;bad_offset=!strcmp(argv[2],"bad-offset");bad_index=!strcmp(argv[2],"bad-index");
     assert(!setenv("WEREAD_STORAGE_ROOT", argv[1], 1));
     assert(weread_auth_init(argv[1]) == ESP_OK);
     weread_auth_session_t session = {0};
@@ -75,6 +96,7 @@ int main(int argc, char **argv) {
         assert(weread_chapter_download("test_book_101",2)==ESP_OK);
         char path[1100];assert(weread_chapter_directory("test_book_101",2,path,1024)==ESP_OK);
         strcat(path,"/position.map");assert(!truncate(path,sizeof(weread_position_header_t)));
+        assert(downloads==1&&!weread_chapter_cached("test_book_101",2));fail_download=corrupt_fail;
     }
     if (!selfheal&&!invalid_choice) { version = 101; assert(weread_shelf_refresh_book("test_book_101") == ESP_OK); }
     weread_runtime_init(); assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
@@ -85,7 +107,19 @@ int main(int argc, char **argv) {
         assert(result.conflict&&!result.open_ready);weread_progress_t choice=result.cloud;weread_runtime_result_free(&result);
         assert(weread_runtime_choose("test_book_101",&choice,true));started=time(NULL);
         while(weread_runtime_busy()){assert(time(NULL)-started<10);usleep(1000);}
-        assert(weread_runtime_poll(&result)&&result.error==(corrupt?ESP_ERR_INVALID_RESPONSE:WEREAD_ERR_POSITION)&&!result.open_ready);
+        assert(weread_runtime_poll(&result));
+        if(corrupt&&!corrupt_fail){
+            assert(result.error==ESP_OK&&result.open_ready&&!result.conflict&&downloads==2&&!reports);
+            assert(weread_chapter_cached("test_book_101",2));complete_map(2);
+            uint32_t proven=0;assert(book_weread_validate_prepared("test_book_101",choice.chapter_uid,choice.chapter_index,choice.chapter_offset,&proven)==ESP_OK&&proven==100);
+            weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_uid==choice.chapter_uid&&
+                saved.chapter_index==choice.chapter_index&&saved.chapter_offset==choice.chapter_offset&&saved.progress==choice.progress&&saved.book_version==100&&
+                !saved.dirty&&!saved.position_pending&&!saved.reading_time&&!saved.pending_pages);
+            weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
+            puts("Corrupt cached map re-downloaded once; complete map and explicit cloud coordinates validated before saving.");return 0;
+        }
+        assert(result.error==(corrupt_fail?ESP_ERR_TIMEOUT:WEREAD_ERR_POSITION)&&!result.open_ready&&!reports);
+        if(corrupt_fail)assert(downloads==2&&!weread_chapter_cached("test_book_101",2));
         weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_uid==1&&saved.dirty&&saved.reading_time==7);
         weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
         puts("Invalid cloud choice rejected without replacing dirty local progress.");return 0;
@@ -106,6 +140,7 @@ int main(int argc, char **argv) {
         weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK);
         assert(weread_progress_select("test_book_101",&saved,true)==ESP_OK);
         assert(weread_reader_resume(uri,&chapter,&offset)==ESP_OK);
+        adopt_body(chapter);
         weread_reader_begin(uri,1000);
         weread_reader_tick(uri,chapter,0,0,"display page",1000,false);
         weread_reader_flush(1000,true);
@@ -117,7 +152,7 @@ int main(int argc, char **argv) {
         assert(!reports&&weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_offset==20&&saved.progress==86&&saved.reading_time==1&&saved.dirty&&!saved.position_pending);
         weread_reader_end(2200);book_weread_close();
         assert(weread_reader_prepare_open(uri)==ESP_OK&&book_weread_open(uri)==ESP_OK);
-        assert(weread_reader_resume(uri,&chapter,&offset)==ESP_OK);weread_reader_begin(uri,2200);
+        assert(weread_reader_resume(uri,&chapter,&offset)==ESP_OK);adopt_body(chapter);weread_reader_begin(uri,2200);
         weread_reader_tick(uri,chapter,0,0,"cold display",2200,false);weread_reader_flush(2200,true);
         assert(!reports&&weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.reading_time==1&&!saved.position_pending);
         // 真导航在调用时冻结位置，后续重排不能移动尚未提交的目标。
@@ -125,9 +160,15 @@ int main(int argc, char **argv) {
         weread_reader_navigated(uri,chapter,6,44,"navigation");
         weread_reader_tick(uri,chapter,0,0,"reflow",2300,false);
         weread_reader_flush(2300,true);
+        assert(!reports&&weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.dirty&&saved.position_pending&&
+            saved.chapter_offset==expected&&saved.progress==44&&saved.reading_time==1&&!strcmp(saved.summary,"navigation"));
+        weread_reader_end(2300);book_weread_close();
+        assert(weread_runtime_idle(2500));started=time(NULL);
+        while(weread_runtime_busy()){assert(time(NULL)-started<10);usleep(1000);}
+        assert(weread_runtime_poll(&result)&&result.job==WR_JOB_REPORT&&result.error==ESP_OK);weread_runtime_result_free(&result);
         assert(reports==1&&reported_offset==expected&&reported_percent==44&&reported_seconds==1);
-        assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&!saved.dirty&&!strcmp(saved.summary,"navigation"));
-        book_weread_close();weread_runtime_stop();weread_shelf_clear();
+        assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&!saved.dirty&&!saved.position_pending&&!strcmp(saved.summary,"navigation"));
+        weread_runtime_stop();weread_shelf_clear();
         puts("Position protection: untouched open, read time, reflow and committed navigation passed.");return 0;
     }
     // 校验后的原始坐标持久化，冷恢复不需要先生成页首检查点。

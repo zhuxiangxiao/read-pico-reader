@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: LicenseRef-Kiikoread-Personal-Study-1.0
 """Exercise production DNS callbacks and ownership through cancellation and late replies."""
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 from home_cover_cache_host_test import function
@@ -83,5 +84,5 @@ int main(void){
 with tempfile.TemporaryDirectory(prefix="weread-dns-host-") as folder:
     path=Path(folder)
     (path/"test.c").write_text(unit)
-    subprocess.run(["cc","-std=c11","-Wall","-Wextra","-Werror","-g","-fsanitize=address,undefined","-fno-omit-frame-pointer",str(path/"test.c"),"-o",str(path/"test")],check=True)
+    subprocess.run([os.environ.get("CC","cc"),"-std=c11","-Wall","-Wextra","-Werror","-g","-fsanitize=address,undefined","-fno-omit-frame-pointer",str(path/"test.c"),"-o",str(path/"test")],check=True)
     subprocess.run([str(path/"test")],check=True,timeout=10)

@@ -422,7 +422,8 @@ static esp_err_t sync_begin(bool full){
         cJSON *arrays[]={array,pending};
         for(unsigned k=0;k<2;++k){cJSON *entry=arrays[k]->child;
             while(entry){cJSON *next=entry->next;const char *id=item_id(entry);
-                if(!members||!members[id_slot(members,id)])cJSON_Delete(cJSON_DetachItemViaPointer(arrays[k],entry));entry=next;
+                if(!members||!members[id_slot(members,id)])cJSON_Delete(cJSON_DetachItemViaPointer(arrays[k],entry));
+                entry=next;
             }
         }
     }

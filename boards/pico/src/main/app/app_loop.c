@@ -646,7 +646,7 @@ static bool poll_media(app_ctx_t* ctx, const app_desc_t* current,
 // 锁屏前先由页面保存进度，再持久化一次恢复上下文；不在翻页或点击时写入。
 // Flush page progress before persisting one lock checkpoint; never write it on page turns or taps.
 static bool prepare_lock(app_ctx_t *ctx, const app_desc_t *current, bool feedback) {
-    if(app_index_of(current)==1&&!app_book_prepare_leave(ctx)){app_present(ctx,current,APP_REDRAW_PAGE);return false;}
+    if(!app_book_prepare_leave(ctx)){app_present(ctx,current,APP_REDRAW_PAGE);return false;}
     app_book_shelf_prefetch_cancel();
     if (feedback) app_lock_feedback(ctx->hl);
     if (current->on_before_lock) current->on_before_lock(ctx);

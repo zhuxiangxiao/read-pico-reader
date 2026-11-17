@@ -21,7 +21,7 @@ typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE} app_redraw_t;
 typedef struct {bool touched;} touch_t;
 typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;} app_ctx_t;
 typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t;
-static struct {bool pending,started,committing,last_page;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
+static struct {bool pending,started,committing,last_page;esp_err_t error;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
 static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true;
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE;
 static char s_path[]="weread://book_A",s_message[128],s_reader_notice[64],s_title[64];
@@ -41,7 +41,7 @@ static void wr_reader_sample(uint64_t now,bool active){(void)now;(void)active;}
 static esp_err_t weread_reader_save(uint64_t now){(void)now;++saves;return save_fail?ESP_FAIL:ESP_OK;}
 static bool weread_runtime_start(int job,const char *id,const char *uid){
  assert(!busy&&job==WR_JOB_CHAPTER&&!strcmp(id,"book_A"));
- ++starts;busy=true;ready=(weread_result_t){.job=job,.chapter_uid=(uint32_t)strtoul(uid,NULL,10)};strcpy(ready.id,id);return true;
+ ++starts;busy=true;done=false;ready=(weread_result_t){.job=job,.chapter_uid=(uint32_t)strtoul(uid,NULL,10)};strcpy(ready.id,id);return true;
 }
 static size_t reader_page_offset(size_t page){return page*100;}
 static esp_err_t book_navigation_title(size_t toc,char *out,size_t cap){(void)toc;copy_text(out,cap,"new title");return ESP_OK;}
@@ -67,12 +67,13 @@ int main(void){
  complete(WEREAD_ERR_PURCHASE);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
  assert(!s_wr_jump.pending&&!loads&&!moves&&s_chapter==2&&s_page==7&&strstr(s_reader_notice,"手机"));
  char anchor[]="owned-anchor";assert(wr_chapter_queue(&ctx,3,0,false,anchor,SIZE_MAX));anchor[0]='X';
+ assert(starts==2&&busy); // No tick or feedback presentation is needed to start the request.
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&busy);
  assert(wr_chapter_queue(&ctx,5,0,true,NULL,SIZE_MAX));
  complete(ESP_OK);assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&busy&&starts==3&&!loads);
  complete(ESP_OK);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&loads==1&&moves==1&&s_chapter==5&&s_page==9);
  assert(!s_wr_jump.pending&&!s_reader_notice[0]);
- assert(wr_chapter_queue(&ctx,6,0,false,NULL,SIZE_MAX));save_fail=true;
+ save_fail=true;assert(wr_chapter_queue(&ctx,6,0,false,NULL,SIZE_MAX));
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&!busy&&starts==3&&s_chapter==5&&!s_wr_jump.pending);
  save_fail=false;assert(wr_chapter_queue(&ctx,7,0,false,NULL,SIZE_MAX));
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&busy);
@@ -83,6 +84,7 @@ int main(void){
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&loads==2&&moves==1&&s_chapter==5);
  load_fail=false;assert(wr_chapter_queue(&ctx,8,0,false,NULL,SIZE_MAX));
  ctx.request_app=true;assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!s_wr_jump.pending&&!s_reader_notice[0]);ctx.request_app=false;
+ complete(ESP_ERR_INVALID_STATE); // The cancelled worker finishes without committing its old target.
  alloc_fail=true;assert(!wr_chapter_queue(&ctx,9,0,false,"owned-anchor",SIZE_MAX)&&!s_wr_jump.pending);
  alloc_fail=false;assert(wr_chapter_queue(&ctx,9,0,false,"owned-anchor",SIZE_MAX));
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE);complete(ESP_OK);

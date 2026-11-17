@@ -88,13 +88,24 @@ int main(int argc,char **argv){
     if(!strcmp(mode,"binding")){
         html_text_t old={0},candidate={0};size_t current=0;uint32_t v=0,old_coordinate=0;
         assert(book_weread_load(0,NULL,NULL,&old)==ESP_OK&&book_weread_commit_loaded(&current,&v)==ESP_OK&&v==100);
+        uint32_t old_identity=0;struct stat old_stat;
+        assert(book_weread_content_identity("weread://window_book",&old_identity)&&old_identity);
+        assert(book_weread_stat("weread://window_book",&old_stat)&&(uint32_t)old_stat.st_size==old_identity);
+        uint32_t foreign_identity=1;assert(!book_weread_content_identity("weread://another_book",&foreign_identity)&&!foreign_identity);
         assert(book_weread_map_version(0,100,true,3,&old_coordinate)==ESP_OK);
+        uint32_t cached_coordinate=0;assert(book_weread_map_cached(0,100,true,3,&cached_coordinate)==ESP_OK&&cached_coordinate==old_coordinate);
+        assert(book_weread_map_cached(0,101,true,3,&cached_coordinate)==ESP_ERR_INVALID_STATE);
+        assert(book_weread_map_cached(0,100,true,UINT32_MAX,&cached_coordinate)==WEREAD_ERR_POSITION);
         char old_root[512];assert(weread_chapter_directory("window_book",11,old_root,sizeof(old_root))==ESP_OK&&book_weread_directory_in_use(old_root));
         size_t old_map_bytes=book_weread_map_cache_bytes();assert(old_map_bytes>0&&old_map_bytes<=65536);
         assert(book_weread_prepare_open("window_book")==ESP_OK&&book_weread_prepared("window_book"));
         server_version=101;assert(weread_shelf_refresh_book("window_book")==ESP_OK&&weread_toc_sync_version("window_book",101)==ESP_OK);
+        struct stat metadata_stat;assert(book_weread_stat("weread://window_book",&metadata_stat)&&(uint32_t)metadata_stat.st_size==old_identity);
+        assert(book_weread_map_detached("window_book",11,100,false,3,&cached_coordinate)==ESP_OK&&cached_coordinate==old_coordinate);
         assert(book_weread_prepared("window_book")&&weread_reader_prepare("weread://window_book",1)==ESP_OK);
         assert(book_weread_load(1,NULL,NULL,&candidate)==ESP_OK&&strstr(candidate.utf8,"version101"));
+        assert(book_weread_content_identity("weread://window_book",&foreign_identity)&&foreign_identity==old_identity);
+        assert(book_weread_map_cached(1,101,true,3,&cached_coordinate)==ESP_ERR_INVALID_STATE);
         char title[256];assert(book_weread_title(1,title,sizeof(title))==ESP_OK&&!strcmp(title,"UID27-v101"));
         assert(book_weread_map_cache_bytes()>old_map_bytes&&book_weread_map_cache_bytes()<=131072);
         book_weread_discard_loaded();html_text_free(&candidate);assert(book_weread_map_cache_bytes()==old_map_bytes);
@@ -108,12 +119,18 @@ int main(int argc,char **argv){
         weread_progress_t pending;assert(weread_progress_load("window_book",&pending)==ESP_OK&&pending.book_version==100&&pending.dirty&&pending.position_pending&&pending.chapter_offset==old_coordinate);
         current=1;assert(book_weread_load(1,NULL,NULL,&candidate)==ESP_OK&&book_weread_commit_loaded(&current,&v)==ESP_OK&&current==6&&v==101);
         assert(book_weread_uid(current)==27&&book_weread_cached_version("window_book",&v)&&v==101&&!book_weread_prepared("window_book"));
+        uint32_t new_identity=0;struct stat new_stat;
+        assert(book_weread_content_identity("weread://window_book",&new_identity)&&new_identity!=old_identity);
+        assert(book_weread_stat("weread://window_book",&new_stat)&&(uint32_t)new_stat.st_size==new_identity);
         assert(book_weread_map_version(current,101,true,3,&coordinate)==ESP_OK);
+        assert(book_weread_map_cached(current,101,true,3,&cached_coordinate)==ESP_OK&&cached_coordinate==coordinate);
+        assert(book_weread_map_cached(1,101,true,3,&cached_coordinate)==ESP_ERR_INVALID_STATE);
+        assert(book_weread_map_cached(current,100,true,3,&cached_coordinate)==ESP_ERR_INVALID_STATE);
         uint32_t checked=0;assert(book_weread_validate_prepared("window_book",27,7,coordinate,&checked)==ESP_OK&&checked==101);
         assert(book_weread_image(current,"Images/p.png",&image,&length,&png)==ESP_OK&&length>8&&length>=18&&!memcmp(image+8,"version101",10));free(image);
         assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));weread_result_t reopen=completed();assert(reopen.error==ESP_OK&&reopen.conflict);weread_runtime_result_free(&reopen);
         assert(!book_weread_directory_in_use(old_root));html_text_free(&old);html_text_free(&candidate);
-        puts("PASS: layout discard preserves actual100 text/map/image roots under metadata101; commit adopts UID27 at its fresh ordinal7 and validates actual101 coordinates");
+        puts("PASS: layout discard preserves actual100 text/map/image/identity under metadata101; commit adopts UID27 at its fresh ordinal7, actual101 identity and exact cached coordinates");
     }else if(!strcmp(mode,"version-zero")){
         assert(weread_progress_note("window_book",11,1,20,17,4,1,"old pending",1700000100)==ESP_OK);
         weread_progress_t before,after;assert(weread_progress_load("window_book",&before)==ESP_OK&&before.book_version==100&&before.dirty);

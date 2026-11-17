@@ -38,12 +38,24 @@ static uint32_t session_stamp(void) {
     for(size_t i=0;i<sizeof(parts)/sizeof(*parts);++i)for(const unsigned char *c=(const unsigned char*)parts[i];*c;++c)hash=(hash^*c)*16777619u;
     return hash?hash:1;
 }
-typedef weread_client_identity_t progress_identity_t;
-static bool identity_read(progress_identity_t *identity){return weread_client_identity_get(identity);}
+typedef struct {
+    weread_client_identity_t client;
+    uint8_t media[WEREAD_MEDIA_ID_BYTES];
+    bool media_valid;
+} progress_identity_t;
+static bool rescue_enabled(void);
+static bool identity_read(progress_identity_t *identity){
+    memset(identity,0,sizeof(*identity));
+    if(!weread_client_identity_get(&identity->client))return false;
+    identity->media_valid=weread_progress_capture_media(identity->media);
+    return identity->media_valid||!rescue_enabled();
+}
 static bool identity_matches(const progress_identity_t *identity){
     const weread_auth_session_t *s=weread_auth_get_current_session();
-    return s&&!strcmp(identity->root,weread_auth_get_storage_root())&&!strcmp(identity->vid,s->vid)&&
-        !strcmp(identity->token,s->access_token)&&!strcmp(identity->refresh,s->refresh_token)&&!strcmp(identity->device,s->device_id);
+    const weread_client_identity_t *client=&identity->client;uint8_t media[WEREAD_MEDIA_ID_BYTES];
+    return s&&!strcmp(client->root,weread_auth_get_storage_root())&&!strcmp(client->vid,s->vid)&&
+        !strcmp(client->token,s->access_token)&&!strcmp(client->refresh,s->refresh_token)&&!strcmp(client->device,s->device_id)&&
+        (!identity->media_valid||(weread_progress_capture_media(media)&&!memcmp(identity->media,media,sizeof(media))));
 }
 static void baseline(weread_progress_t *p,const weread_progress_t *cloud) {
     p->base_uid=cloud->chapter_uid;p->base_index=cloud->chapter_index;p->base_offset=cloud->chapter_offset;
@@ -58,6 +70,7 @@ typedef struct {
     char root[256],vid[32],device[64],id[WEREAD_BOOK_ID_CAP];
     weread_progress_t expected,desired;
 } rescue_record_t;
+_Static_assert(sizeof(rescue_record_t)<=1280,"bounded rescue record");
 static bool s_rescue_choice;
 #if !defined(ESP_PLATFORM)
 static weread_progress_rescue_backend_t s_rescue_backend;
@@ -285,6 +298,8 @@ static esp_err_t load_tf(const char *id, weread_progress_t *out) { WR_GUARD;
     bool allow_archive=err==ESP_ERR_NOT_FOUND||foreign_valid;
     if (err == ESP_OK && (!wr_owner_matches(o) || !saved_id || strcmp(saved_id, id) || !decode(o, out, false))) err = ESP_ERR_INVALID_RESPONSE;
     cJSON_Delete(o);
+    // 临时IO或OOM不能用旧副本冒充当前事务。/ Transient I/O and OOM must not turn a stale backup into the current transaction.
+    if(err!=ESP_OK&&err!=ESP_ERR_NOT_FOUND&&err!=ESP_ERR_INVALID_RESPONSE&&err!=ESP_ERR_INVALID_SIZE){memset(out,0,sizeof(*out));return err;}
     if(err==ESP_OK||err==ESP_ERR_NO_MEM){if(err!=ESP_OK)memset(out,0,sizeof(*out));return err;}
     // 主文件缺失/损坏时优先本账号事务副本；明确切换账号时优先该账号归档。/ Prefer the same-owner transaction backup after interrupted commits, and owner archives after an explicit account switch.
     for(unsigned pass=0;pass<2;++pass){
@@ -322,7 +337,8 @@ static esp_err_t rescue_restore(const char *id,weread_progress_t *out){
     if(!record)return ESP_ERR_NO_MEM;
     unsigned slot;esp_err_t err=rescue_find(id,card,record,&slot);if(err!=ESP_OK)return err;
     *out=record->desired;weread_progress_t current;err=load_tf(id,&current);
-    if(err!=ESP_ERR_NOT_FOUND&&(err!=ESP_OK||(!progress_equal(&current,&record->expected)&&!progress_equal(&current,&record->desired))))return WEREAD_ERR_PROGRESS_CONFLICT;
+    if(err!=ESP_OK&&err!=ESP_ERR_NOT_FOUND)return err;
+    if(err==ESP_OK&&!progress_equal(&current,&record->expected)&&!progress_equal(&current,&record->desired))return WEREAD_ERR_PROGRESS_CONFLICT;
     if(err!=ESP_OK||!progress_equal(&current,&record->desired)){
         err=save_tf(id,&record->desired);if(err!=ESP_OK)return err;
     }
@@ -342,9 +358,11 @@ static const char *web_base(void) {
 }
 static esp_err_t request_mode(const char *url, const char *body, cJSON **out, int *status,const progress_identity_t *identity) {
     char *text = NULL; size_t len = 0; *out = NULL;
+    if(identity){WR_GUARD;if(!identity_matches(identity)){*status=0;return ESP_ERR_INVALID_STATE;}}
     const char *headers=body?"Content-Type: application/json\r\n":NULL;
-    esp_err_t err=identity?weread_client_request_bound(url,body?"POST":"GET",headers,body,&text,&len,status,identity):
+    esp_err_t err=identity?weread_client_request_bound(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client):
         weread_client_request(url,body?"POST":"GET",headers,body,&text,&len,status);
+    if(identity){WR_GUARD;if(!identity_matches(identity)){free(text);*status=0;return ESP_ERR_INVALID_STATE;}}
     if (text && len && len <= 65536) { WR_GUARD; *out = wr_parse_json(text,len+1); }
     free(text);
     if(err==ESP_OK && !*out && wr_memory_failed())err=ESP_ERR_NO_MEM;

@@ -10,6 +10,8 @@
 #include "weread_toc.h"
 #include <sys/stat.h>
 bool book_weread_is_open(void);
+/// 已打开书源实际采用的解析类型；调用方在成功排版后冻结。/ Capture the open source's actual parser type after successful layout.
+bool book_weread_plain_text(void);
 esp_err_t book_weread_open(const char *uri);
 void book_weread_close(void);
 esp_err_t book_weread_prepare_open(const char *id);
@@ -18,6 +20,8 @@ void book_weread_adopt_prepared(const char *id,weread_toc_t *toc);
 bool book_weread_prepared(const char *id);
 void book_weread_clear_prepared(void);
 bool book_weread_cached_version(const char *id,uint32_t *version);
+/// 仅返回已提交正文的虚拟文件身份；不随后台书架版本改变，不访问TF。/ Return only the committed body's virtual file identity, independently of newer shelf metadata and without TF I/O.
+bool book_weread_content_identity(const char *uri,uint32_t *identity);
 esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version);
 size_t book_weread_count(void);
 esp_err_t book_weread_title(size_t index, char *out, size_t cap);
@@ -37,6 +41,10 @@ size_t book_weread_index(uint32_t uid);
 /// 双向映射排版字节与源HTML UTF16坐标；失败时禁止上传猜测值。/ Map typeset bytes/source HTML UTF16 both ways; never upload guessed values after failure.
 esp_err_t book_weread_map(size_t index, bool to_cloud, uint32_t input, uint32_t *output);
 esp_err_t book_weread_map_version(size_t index,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output);
+/// 只查已提交正文的精确RAM映射；缺表返回NOT_FOUND，绝不读卡兜底。/ Query only the committed body's exact RAM map; a missing table returns NOT_FOUND without a filesystem fallback.
+esp_err_t book_weread_map_cached(size_t index,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output);
+/// 仅供已冻结实际UID/版本/解析类型、并先验账号与原卡CID的reader恢复；不接管书源或采用新目录/书架元数据，原序号仍由caller保留。/ Recovery for a caller that captured the rendered UID/edition/parser and checked its owner/original CID; never adopt a source or newer TOC/shelf metadata, and retain the caller's captured ordinal.
+esp_err_t book_weread_map_detached(const char *id,uint32_t uid,uint32_t version,bool plain_text,uint32_t typed_offset,uint32_t *raw_offset);
 /// 虚拟身份仅用于恢复/进度，绝不代替本地扫描 stat。/ Virtual identity is for resume/progress, never local file enumeration.
 bool book_weread_stat(const char *uri, struct stat *out);
 

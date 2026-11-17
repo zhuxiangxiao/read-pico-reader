@@ -61,6 +61,8 @@ esp_err_t weread_reader_save(uint64_t now_ms);
 weread_progress_state_t weread_reader_state(void);
 bool weread_reader_save_failed(void);
 bool weread_reader_pending_save(void);
+/// 已保存在设备应急账本，尚未确认云端同步。/ Durable in the device rescue journal, without a cloud acknowledgement.
+bool weread_reader_rescued(void);
 unsigned weread_reader_offline(void);
 bool weread_reader_storage_blocked(void);
 bool weread_reader_caching(void);
