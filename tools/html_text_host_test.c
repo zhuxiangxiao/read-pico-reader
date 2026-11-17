@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "html_text.h"
 int html_test_fail_after = -1;
 // 宿主替身字体表：A 映射到槽 1、B 映射到槽 2，其余名字当作书里没有。
@@ -273,6 +274,25 @@ int main(void) {
     t = parse("<p><a href='#missing'><img src='note.gif'/></a></p>", "\xef\xbf\xbc");
     assert(!t.notes && !t.note_count);
     html_text_free(&t);
+
+    // head注释、rawtext中的小于号及长段落ID不能阻止正文脚注登记。
+    // Head comments, rawtext less-than signs and unrelated long IDs must not hide body notes.
+    t = parse("<head><!-- metadata --><style>.x:before{content:'<';}</style><script>const x='<script>';</script></head>"
+              "<p>1 < 5<a href='#note'>[1]</a></p><aside id='note'>Explanation</aside>",
+              "1 < 5[1]\nExplanation");
+    assert(t.note_count == 1); html_text_free(&t);
+    t = parse("<head><script src='code.js'/><style/></head><head/>"
+              "<p>A<a href='#note'>[1]</a></p><aside id='note'>Explanation</aside>", "A[1]\nExplanation");
+    assert(t.note_count == 1); html_text_free(&t);
+    // 未闭合的有效标签必须线性拒绝，不对每个重复 '<a ' 扫到文末。
+    // Reject repeated unterminated tags in linear time rather than rescanning to EOF for each '<a '.
+    size_t truncated_len = 512u * 1024u;
+    char* truncated = malloc(truncated_len); assert(truncated);
+    for (size_t i = 0; i < truncated_len; ++i) truncated[i] = "<a "[i % 3];
+    clock_t started = clock();
+    assert(html_to_blocks(truncated, truncated_len, &t) == ESP_ERR_INVALID_RESPONSE);
+    assert((double)(clock() - started) / CLOCKS_PER_SEC < 3.0);
+    html_text_free(&t); free(truncated);
 
     puts("html_text_host_test: PASS");
 }

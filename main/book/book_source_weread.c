@@ -50,6 +50,34 @@ esp_err_t book_weread_prepare_open(const char *id){WR_GUARD;
     if(err!=ESP_OK){book_weread_clear_prepared();return err;}
     strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);return ESP_OK;
 }
+esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version){WR_GUARD;
+    if(!version||!book_weread_prepared(id))return ESP_ERR_INVALID_STATE;
+    size_t i=0;
+    while(i<s_prepared_toc.count&&s_prepared_toc.chapters[i].uid!=uid)++i;
+    if(i==s_prepared_toc.count||(index&&index!=s_prepared_toc.chapters[i].index))return WEREAD_ERR_POSITION;
+    char *path __attribute__((cleanup(wr_release)))=wr_alloc(1100);
+    if(!path)return ESP_ERR_NO_MEM;
+    esp_err_t err=weread_chapter_directory(id,uid,path,1024);
+    if(err!=ESP_OK)return err;
+    strcat(path,"/position.map");FILE *file=fopen(path,"rb");
+    if(!file)return ESP_ERR_NOT_FOUND;
+    weread_position_header_t header={0};bool ok=fread(&header,sizeof(header),1,file)==1;
+    ok=ok&&header.magic==WEREAD_POSITION_MAGIC&&header.bytes&&header.count&&header.count<=16384;
+    weread_position_point_t point={0},previous={0};
+    for(uint32_t n=0;ok&&n<header.count;++n){
+        if(!(n%128)&&weread_client_cancelled()){fclose(file);return ESP_ERR_INVALID_STATE;}
+        ok=fread(&point,sizeof(point),1,file)==1&&point.byte<=header.bytes&&point.unit<=header.units&&
+            (!n||(point.byte>=previous.byte&&point.unit>=previous.unit));
+        previous=point;
+    }
+    ok=ok&&fgetc(file)==EOF&&!ferror(file);fclose(file);
+    strcpy(strrchr(path,'/')+1,"body.html");struct stat st;
+    if(!ok||stat(path,&st)||!S_ISREG(st.st_mode)||st.st_size!=(off_t)header.bytes)return ESP_ERR_INVALID_RESPONSE;
+    if(offset>header.units)return WEREAD_ERR_POSITION;
+    // 只有章节UID、目录序号及原文范围均一致，才把显式开书候选绑定最终版本。
+    // Rebind a new-open choice only after UID, ordinal and original-source bounds agree.
+    *version=s_prepared_toc.book_version;return ESP_OK;
+}
 
 bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
     if (!book_path_is_weread(uri) || !out) return false;
@@ -191,6 +219,7 @@ esp_err_t book_weread_map(size_t i, bool to_cloud, uint32_t input, uint32_t *out
     weread_position_header_t header = {0};
     if (fread(&header, sizeof(header), 1, f) != 1 || header.magic != WEREAD_POSITION_MAGIC ||
         !header.count || header.count > 16384) { fclose(f); return ESP_ERR_INVALID_RESPONSE; }
+    if(!to_cloud&&input>header.units){fclose(f);return WEREAD_ERR_POSITION;}
     weread_position_point_t *points = wr_alloc(header.count * sizeof(*points));
     if (!points) { fclose(f); return ESP_ERR_NO_MEM; }
     bool valid = fread(points, sizeof(*points), header.count, f) == header.count && fgetc(f) == EOF;
@@ -247,10 +276,12 @@ bool book_weread_metadata(const char *uri, char *title, size_t tc, char *author,
     return true;
 }
 bool book_weread_cover(const char *uri, uint8_t *pixels, size_t cap) { WR_GUARD;
-    char path[512]; weread_book_t b;
+    char path[512],legacy[512];bool migrated=false;
     if (!book_path_is_weread(uri) || !pixels || cap < 176u*240u ||
-        !weread_shelf_find(uri+9,&b) || wr_cache_path(uri+9,"cover.gray",path,sizeof(path)) != ESP_OK) return false;
-    FILE *f=fopen(path,"rb"); if (!f) return false;
+        weread_cover_cache_path(uri+9,"gray",path,sizeof(path)) != ESP_OK) return false;
+    FILE *f=fopen(path,"rb");
+    if(!f&&wr_cache_path(uri+9,"cover.gray",legacy,sizeof(legacy))==ESP_OK){f=fopen(legacy,"rb");migrated=f!=NULL;}
+    if(!f)return false;
     bool ok=fread(pixels,1,176u*240u,f)==176u*240u && fgetc(f)==EOF;
-    fclose(f); return ok;
+    fclose(f);if(ok&&migrated)(void)rename(legacy,path);return ok;
 }

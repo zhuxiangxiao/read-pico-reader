@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define ROWS 6
 #define QR_AREA ((EpdRect){72,218,540,540})
@@ -42,17 +43,22 @@ static weread_book_t *s_books;
 static size_t s_count, s_visible;
 static uint16_t *s_matches;
 static int s_page;
-static bool s_auth, s_grid, s_search, s_wifi, s_keep_network, s_wake, s_sync_after_init;
+static bool s_grid = true;
+static bool s_auth, s_search, s_wifi, s_keep_network, s_wake, s_sync_after_init;
 static bool s_conflict, s_clear, s_logout;
 static bool s_more_sync,s_syncing;
 static uint64_t s_next_sync;
+static uint64_t s_sync_check, s_sync_not_before, s_last_input, s_owner;
+static unsigned s_epoch;
+static bool s_force_cover;
 static char s_query[65], s_uid[64], s_qr[256], s_id[64], s_requested[64], s_message[128];
 static weread_progress_t s_local, s_cloud;
 static ui_text_edit_t s_edit;
 static uint64_t s_next_poll, s_next_action;
 static EpdRect s_area;
 static bool s_cover_remote;
-static struct { uint8_t *pixels; bool checked; weread_cover_retry_t retry; } s_covers[ROWS];
+typedef struct { uint8_t *pixels; bool checked; weread_cover_retry_t retry; uint64_t key; } row_cover_t;
+static row_cover_t s_covers[ROWS];
 
 bool app_weread_request_open(const char *uri) {
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_requested)) return false;
@@ -75,6 +81,33 @@ static weread_book_t *row_book(int row) {
     size_t i = (size_t)s_page * ROWS + (size_t)row;
     return s_matches && i < s_visible ? &s_books[s_matches[i]] : NULL;
 }
+static bool covers_checked(void) {
+    for(int i=0;i<ROWS;++i)if(row_book(i)&&!s_covers[i].checked)return false;
+    return true;
+}
+static uint64_t page_signature(void) {
+    uint64_t h=14695981039346656037ULL;
+    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b)break;
+        const char *fields[]={b->book_id,b->title,b->author,b->cover};
+        for(unsigned j=0;j<4;++j)for(const unsigned char *p=(const unsigned char *)fields[j];;p++){
+            h=(h^*p)*1099511628211ULL;if(!*p)break;
+        }
+        h=(h^b->progress)*1099511628211ULL;
+    }
+    return h^s_visible^((uint64_t)s_page<<32);
+}
+static void adopt_books(weread_result_t *r) {
+    row_cover_t old[ROWS];char ids[ROWS][64]={{0}};
+    memcpy(old,s_covers,sizeof(old));memset(s_covers,0,sizeof(s_covers));
+    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b)strcpy(ids[i],b->book_id);}
+    free(s_books);s_books=r->books;r->books=NULL;s_count=r->count;filter_page(false);
+    for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b)continue;
+        uint64_t k=weread_cover_key(b->book_id,b->cover);
+        for(int j=0;j<ROWS;++j)if(!strcmp(ids[j],b->book_id)&&old[j].key==k){s_covers[i]=old[j];old[j].pixels=NULL;break;}
+        s_covers[i].key=k;
+    }
+    for(int i=0;i<ROWS;++i)free(old[i].pixels);
+}
 static EpdRect row_rect(int i) {
     return s_grid ? (EpdRect){36 + i % 3 * 212,246 + i / 3 * 304,188,286} :
         (EpdRect){36,246 + i * 110,612,100};
@@ -95,7 +128,8 @@ static void open_id(const char *id) {
     message("正在准备阅读…"); start(WR_JOB_OPEN, id, NULL);
 }
 static void enter(app_ctx_t *ctx) {
-    (void)ctx; s_keep_network = s_wifi = s_search = s_conflict = s_clear = s_logout = s_auth = false;
+    s_last_input=ctx->now_ms;s_sync_check=ctx->now_ms+1200;s_force_cover=false;
+    s_keep_network = s_wifi = s_search = s_conflict = s_clear = s_logout = s_auth = false;
     s_uid[0] = s_qr[0] = s_message[0] = 0; s_next_poll = s_next_action = 0;
     s_sync_after_init = true; s_wake=false; start(WR_JOB_INIT, NULL, NULL);
     s_more_sync=false;
@@ -175,6 +209,7 @@ static app_redraw_t keyboard_update(app_ctx_t *ctx) {
     s_area=u.area; return u.layout?APP_REDRAW_PAGE:u.area.width?APP_REDRAW_AREA:APP_REDRAW_NONE;
 }
 static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
+    s_last_input=ctx->now_ms;
     if (s_wifi) return app_transfer.on_gesture?app_transfer.on_gesture(ctx,e):APP_REDRAW_NONE;
     if (s_search) {
         if(e->type==UI_GESTURE_PRESS){ui_keyboard_press(e->x0,e->y0,560,ctx->now_ms);return keyboard_update(ctx);}
@@ -209,8 +244,11 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
     }
     if(ui_rect_hit((EpdRect){36,188,390,48},x,y)){
         stop_job();s_search=true;ui_text_edit_init(&s_edit,s_query,sizeof(s_query));ui_keyboard_begin(&s_edit,false);return APP_REDRAW_PAGE;}
-    if(ui_rect_hit((EpdRect){450,188,198,48},x,y)){stop_job();s_grid=!s_grid;release_covers();return APP_REDRAW_PAGE;}
-    if(ui_rect_hit(MAIN_ACTION,x,y)){if(s_syncing&&weread_runtime_busy())return APP_REDRAW_NONE;stop_job();start(WR_JOB_SYNC,NULL,NULL);message("正在加载第一页…");return APP_REDRAW_PAGE;}
+    if(ui_rect_hit((EpdRect){450,188,198,48},x,y)){stop_job();s_grid=!s_grid;return APP_REDRAW_PAGE;}
+    if(ui_rect_hit(MAIN_ACTION,x,y)){if(s_syncing&&weread_runtime_busy())return APP_REDRAW_NONE;stop_job();
+        s_force_cover=true;s_sync_not_before=0;
+        for(int i=0;i<ROWS;++i)if(!s_covers[i].pixels){memset(&s_covers[i].retry,0,sizeof(s_covers[i].retry));s_covers[i].checked=false;}
+        start(WR_JOB_SYNC,NULL,NULL);message("正在同步书架…");return APP_REDRAW_PAGE;}
     if(ui_rect_hit(SIDE_ACTION,x,y)){wifi_open(ctx);return APP_REDRAW_PAGE;}
     if(y>=1128&&x>=456){stop_job();s_logout=true;return APP_REDRAW_PAGE;}
     if(y>=924&&y<988){
@@ -237,12 +275,14 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     }
     weread_result_t r;
     if(weread_runtime_poll(&r)){
+        uint64_t old_page=page_signature();char old_message[sizeof(s_message)];strcpy(old_message,s_message);
+        bool local_cover=r.job==WR_JOB_COVER&&!s_cover_remote;
         s_auth=r.authenticated;
-        if(r.books||r.job==WR_JOB_INIT||r.job==WR_JOB_SYNC||r.job==WR_JOB_LOGOUT||(r.job==WR_JOB_POLL&&r.authenticated)){
-            char old_ids[ROWS][64]={{0}};
-            for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b)strcpy(old_ids[i],b->book_id);}
-            free(s_books);s_books=r.books;r.books=NULL;s_count=r.count;filter_page(false);
-            for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b||strcmp(old_ids[i],b->book_id)){free(s_covers[i].pixels);memset(&s_covers[i],0,sizeof(s_covers[i]));}}
+        if(r.job==WR_JOB_INIT){uint64_t owner=weread_cover_key("","");unsigned epoch=weread_runtime_cache_epoch();
+            if(owner!=s_owner||epoch!=s_epoch){s_sync_not_before=0;release_covers();s_owner=owner;s_epoch=epoch;}
+        }
+        if(!(r.error==ESP_ERR_NO_MEM&&!r.books)&&(r.books||r.job==WR_JOB_INIT||r.job==WR_JOB_SYNC||r.job==WR_JOB_LOGOUT||(r.job==WR_JOB_POLL&&r.authenticated))){
+            adopt_books(&r);
         }
         if(r.job==WR_JOB_QR&&r.error==ESP_OK){
             bool encoded=ui_wifi_qr_prepare_text(r.qr_url);
@@ -268,18 +308,29 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         if(r.job==WR_JOB_COVER){for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
             s_covers[i].checked=true;
             if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;}
-            else if(s_cover_remote)weread_cover_retry_result(&s_covers[i].retry,r.http_status,ctx->now_ms);
+            else if(s_cover_remote)weread_cover_retry_result(&s_covers[i].retry,
+                r.error!=ESP_OK&&r.http_status>=200&&r.http_status<300?0:r.http_status,ctx->now_ms);
+            if(r.cover_retry_seconds&&(!s_cover_remote||s_covers[i].retry.failures>=3))
+                s_covers[i].retry.not_before_ms=ctx->now_ms+(uint64_t)r.cover_retry_seconds*1000;
         }}}
         if(r.job==WR_JOB_CLEAR){release_covers();message(r.error==ESP_OK?"离线内容已清理":"清理失败，请重试");}
         if(r.error!=ESP_OK&&r.job!=WR_JOB_COVER&&r.job!=WR_JOB_POLL)
-            message(r.error==ESP_ERR_NO_MEM?"内存不足，请稍后重试":r.error==ESP_ERR_INVALID_RESPONSE?"返回数据不完整，请稍后重试":r.error==WEREAD_ERR_PURCHASE?"请在微信读书手机端购买或领取此章节":r.error==WEREAD_ERR_SOLD_OUT?"这本书已下架，暂时无法下载":"网络暂不可用，可阅读已缓存章节");
-        if(r.job==WR_JOB_INIT&&s_sync_after_init){
+            message(r.error==ESP_ERR_NO_MEM?"内存不足，请稍后重试":r.error==WEREAD_ERR_POSITION?"阅读位置与目录不匹配，请先在手机打开本书后重试":r.error==ESP_ERR_INVALID_RESPONSE?"返回数据不完整，请稍后重试":r.error==WEREAD_ERR_PURCHASE?"请在微信读书手机端购买或领取此章节":r.error==WEREAD_ERR_SOLD_OUT?"这本书已下架，暂时无法下载":"网络暂不可用，可阅读已缓存章节");
+        if(r.job==WR_JOB_INIT){
+            bool initial=s_sync_after_init;
             s_sync_after_init=false;
-            if(r.error==ESP_OK){start(s_auth?WR_JOB_SYNC:WR_JOB_QR,NULL,NULL);message(s_auth?"正在同步书架…":"正在生成二维码…");}
+            if(r.error==ESP_OK){
+                if(s_auth){message("单击阅读，长按清理离线内容");s_sync_check=ctx->now_ms+1200;
+                    if(!s_count&&!weread_shelf_cache_fresh((uint64_t)time(NULL))&&ctx->now_ms>=s_sync_not_before){start(WR_JOB_SYNC,NULL,NULL);message("正在加载第一页…");}}
+                else if(initial){start(WR_JOB_QR,NULL,NULL);message("正在生成二维码…");}
+            }
             else message("TF 卡不可用，请重新挂载后进入");
         }
         if(r.job==WR_JOB_SYNC){
             s_syncing=false;s_more_sync=r.shelf_loading;s_next_sync=ctx->now_ms+800;
+            s_sync_check=ctx->now_ms+(r.error==ESP_OK?300000:60000);
+            s_sync_not_before=r.error==ESP_OK?0:ctx->now_ms+60000;
+            if(r.error!=ESP_OK)s_more_sync=false;
             if(r.error==ESP_OK){
                 char text[128];
                 if(s_more_sync)snprintf(text,sizeof(text),"已加载 %u / %u 本，后台继续加载…",(unsigned)s_count,(unsigned)r.shelf_total);
@@ -294,21 +345,35 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         if(s_requested[0]&&s_auth&&((r.job==WR_JOB_INIT&&requested_cached)||r.job==WR_JOB_SYNC)){
             stop_job();open_id(s_requested);s_requested[0]=0;
         }
-        weread_runtime_result_free(&r);return APP_REDRAW_PAGE;
+        bool unchanged=r.job==WR_JOB_SYNC&&old_page==page_signature()&&!strcmp(old_message,s_message);
+        bool batch_cover=local_cover&&!covers_checked();
+        if(local_cover)s_next_action=ctx->now_ms;
+        weread_runtime_result_free(&r);return unchanged||batch_cover?APP_REDRAW_NONE:APP_REDRAW_PAGE;
     }
     if(weread_runtime_busy()||s_search||s_conflict||s_clear||s_logout||ctx->request_app||ctx->request_return)return APP_REDRAW_NONE;
-    if(s_auth&&s_more_sync&&ctx->now_ms>=s_next_sync){start(WR_JOB_SYNC,NULL,"continue");return APP_REDRAW_NONE;}
+    bool idle=ctx->now_ms>=s_last_input&&ctx->now_ms-s_last_input>=1000;
+    if(s_auth&&s_more_sync&&ctx->now_ms>=s_next_sync&&idle&&covers_checked()){start(WR_JOB_SYNC,NULL,"continue");return APP_REDRAW_NONE;}
+    if(s_auth&&!s_more_sync&&idle&&covers_checked()&&ctx->now_ms>=s_sync_check&&ctx->now_ms>=s_sync_not_before){
+        s_sync_check=ctx->now_ms+300000;
+        if(!weread_shelf_cache_fresh((uint64_t)time(NULL))){start(WR_JOB_SYNC,NULL,NULL);return APP_REDRAW_NONE;}
+    }
     if(!s_auth&&s_uid[0]&&(uint64_t)ctx->now_ms>=s_next_poll){s_next_poll=ctx->now_ms+2000;start(WR_JOB_POLL,NULL,s_uid);return APP_REDRAW_NONE;}
     if(s_auth&&(uint64_t)ctx->now_ms>=s_next_action){
+        for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b||s_covers[i].pixels||s_covers[i].checked)continue;
+            s_covers[i].key=weread_cover_key(b->book_id,b->cover);s_cover_remote=false;
+            start(WR_JOB_COVER,b->book_id,s_force_cover?"retry":NULL);s_next_action=ctx->now_ms+150;return APP_REDRAW_NONE;
+        }
         for(int i=0;i<ROWS;++i){weread_book_t *b=row_book(i);if(!b||s_covers[i].pixels)continue;
-            if(!s_covers[i].checked){s_cover_remote=false;start(WR_JOB_COVER,b->book_id,NULL);break;}
             char url[512];if(!b->cover[0]||weread_cover_retry_url(b->cover,&s_covers[i].retry,ctx->now_ms,url,sizeof(url))!=ESP_OK)continue;
+            if(!idle)continue;
             s_cover_remote=true;start(WR_JOB_COVER,b->book_id,url);break;
         }s_next_action=ctx->now_ms+150;
+        if(covers_checked())s_force_cover=false;
     }
     return APP_REDRAW_NONE;
 }
 static app_redraw_t key(app_ctx_t *ctx,int key) {
+    s_last_input=ctx->now_ms;
     if(s_wifi&&app_transfer.on_key)return app_transfer.on_key(ctx,key);
     if(s_search){ui_keyboard_end();s_search=false;filter();return APP_REDRAW_PAGE;}
     if(s_conflict||s_clear||s_logout){s_conflict=s_clear=s_logout=false;return APP_REDRAW_PAGE;}

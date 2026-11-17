@@ -117,6 +117,10 @@ esp_err_t read_pico_transfer_save_wifi(const char *ssid, const char *password);
 esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds);
 /// 已连接 STA 时对时，不断开 WiFi；供 HTTPS 页面校验证书。/ Sync time on connected STA without disconnecting WiFi for HTTPS certificate checks.
 esp_err_t read_pico_transfer_sync_time_online(uint32_t *utc_seconds);
+/// 仅取消本次准入的在线对时，不抢占其他对时所有者；回调含调用方截止时间。
+/// Cancel only this admitted online sync; never preempt another owner. The callback may include a deadline.
+esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc_seconds,
+    bool (*cancelled)(void *), void *ctx);
 
 /// 后台短时校准，可被手动联网或睡眠取消；不读取 TF 文件。
 /// Brief background calibration, cancellable by manual networking or sleep; no TF access.

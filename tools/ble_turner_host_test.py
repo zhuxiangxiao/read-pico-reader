@@ -333,7 +333,7 @@ transfer = (ROOT / 'components/read_pico_transfer/read_pico_transfer.c').read_te
 for name in ('read_pico_transfer_start', 'read_pico_transfer_scan_wifi', 'sync_time_impl'):
     assert 'ble_pt_network_acquire()' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', name)
 assert 'sync_time_run(utc_seconds, false, false)' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', 'read_pico_transfer_sync_time')
-assert 'sync_time_impl(utc_seconds)' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', 'sync_time_run')
+assert 'sync_time_impl(utc_seconds)' in function(ROOT / 'components/read_pico_transfer/read_pico_transfer.c', 'sync_time_run_cancelable')
 assert transfer.count('ble_pt_network_acquire()') == 3
 with tempfile.TemporaryDirectory(prefix='pico-ble-test-') as directory:
     work = Path(directory)

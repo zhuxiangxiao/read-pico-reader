@@ -74,6 +74,7 @@ int main(void){
  wire_u32(packet+40,2147483647U+2208988800U);assert(transfer_ntp_reply(packet,48,nonce,&utc)&&utc==2147483647U);
  wire_u32(packet+40,0);assert(!transfer_ntp_reply(packet,48,nonce,&utc));
  reset(NORMAL);assert(transfer_sync_time_ntp(&utc)==ESP_OK&&utc==1791633600U&&saved_utc==utc&&closes==1&&frees==1&&sends==1&&clock_sets==1);
+ reset(NORMAL);assert(transfer_sync_time_ntp_bounded(&utc,NULL)==ESP_OK&&utc==1791633600U&&lookups==1&&frees==1); // Non-ESP builds retain normal DNS.
  reset(FALLBACK);assert(transfer_sync_time_ntp(&utc)==ESP_OK&&closes==2&&frees==2&&sends==4);
  reset(TIMEOUT);assert(transfer_sync_time_ntp(&utc)==ESP_ERR_TIMEOUT&&utc==0&&closes==3&&frees==3&&sends==9&&!clock_sets);
  reset(DNSERR);assert(transfer_sync_time_ntp(&utc)==ESP_ERR_TIMEOUT&&lookups==3&&!opens&&!frees);

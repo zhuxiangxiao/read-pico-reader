@@ -10,8 +10,59 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#ifdef ESP_PLATFORM
+#include <stdatomic.h>
+#include <stdlib.h>
+#include "lwip/dns.h"
+#include "lwip/tcpip.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+typedef struct {
+    const char *name;
+    ip_addr_t address;
+    atomic_uint refs;
+    atomic_bool done;
+    bool found;
+} time_dns_t;
+static void time_dns_release(time_dns_t *query) {
+    if (atomic_fetch_sub(&query->refs, 1) == 1) free(query);
+}
+static void time_dns_found(const char *name, const ip_addr_t *address, void *arg) {
+    (void)name;
+    time_dns_t *query = arg;
+    if (address && IP_IS_V4(address)) { query->address = *address; query->found = true; }
+    atomic_store(&query->done, true);
+    time_dns_release(query);
+}
+static void time_dns_start(void *arg) {
+    time_dns_t *query = arg;
+    err_t err = dns_gethostbyname_addrtype(query->name, &query->address,
+        time_dns_found, query, LWIP_DNS_ADDRTYPE_IPV4);
+    if (err != ERR_INPROGRESS) time_dns_found(query->name, err == ERR_OK ? &query->address : NULL, query);
+}
+static esp_err_t time_dns_resolve(const char *name, struct sockaddr_in *peer, bool (*cancelled)(void)) {
+    time_dns_t *query = calloc(1, sizeof(*query));
+    if (!query) return ESP_ERR_NO_MEM;
+    query->name = name; // Caller supplies a static server name; DNS may outlive this invocation.
+    atomic_init(&query->refs, 2); atomic_init(&query->done, false);
+    if (tcpip_try_callback(time_dns_start, query) != ERR_OK) {
+        time_dns_release(query); time_dns_release(query); return ESP_ERR_NO_MEM;
+    }
+    const int64_t deadline = esp_timer_get_time() + 2000000;
+    while (!atomic_load(&query->done) && !(cancelled && cancelled()) && esp_timer_get_time() < deadline)
+        vTaskDelay(pdMS_TO_TICKS(10));
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    if (cancelled && cancelled()) err = ESP_ERR_INVALID_STATE;
+    else if (atomic_load(&query->done) && query->found) {
+        *peer = (struct sockaddr_in){.sin_family = AF_INET, .sin_port = htons(123)};
+        peer->sin_addr.s_addr = ip4_addr_get_u32(ip_2_ip4(&query->address)); err = ESP_OK;
+    }
+    // DNS仍在途时由回调释放最后一个引用。/ An outstanding DNS callback owns the final reference after cancellation.
+    time_dns_release(query); return err;
+}
+#endif
 
-esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc_seconds, bool (*cancelled)(void)) {
+static esp_err_t sync_time_ntp(uint32_t *utc_seconds, bool (*cancelled)(void), bool bounded_dns) {
     if(!utc_seconds) return ESP_ERR_INVALID_ARG;
     *utc_seconds=0;
     // 原厂MetalioRtc使用time.windows.com；国内公网源作为单次请求备用。
@@ -20,24 +71,34 @@ esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc_seconds, bool (*cancel
     esp_err_t result=ESP_ERR_TIMEOUT;
     for(unsigned source=0;source<sizeof(servers)/sizeof(servers[0]);source++) {
         if (cancelled && cancelled()) return ESP_ERR_INVALID_STATE;
+        struct sockaddr_in resolved;
         struct addrinfo hints={.ai_family=AF_INET,.ai_socktype=SOCK_DGRAM},*address=NULL;
-        int dns=getaddrinfo(servers[source],"123",&hints,&address);
-        if(dns || !address) {
+#ifdef ESP_PLATFORM
+        if (bounded_dns) {
+            esp_err_t err=time_dns_resolve(servers[source],&resolved,cancelled);
+            if(err==ESP_ERR_INVALID_STATE || err==ESP_ERR_NO_MEM) return err;
+            if(err!=ESP_OK) continue;
+        }
+#else
+        bounded_dns=false;
+#endif
+        int dns=bounded_dns?0:getaddrinfo(servers[source],"123",&hints,&address);
+        if(dns || (!bounded_dns && !address)) {
             if(address) freeaddrinfo(address);
             ESP_LOGW("time_sync","NTP DNS source=%u result=%d",source+1,dns);
             continue;
         }
-        if (cancelled && cancelled()) {freeaddrinfo(address);return ESP_ERR_INVALID_STATE;}
-        const struct sockaddr_in *peer=(const struct sockaddr_in*)address->ai_addr;
+        if (cancelled && cancelled()) {if(address)freeaddrinfo(address);return ESP_ERR_INVALID_STATE;}
+        const struct sockaddr_in *peer=bounded_dns?&resolved:(const struct sockaddr_in*)address->ai_addr;
         char ip[INET_ADDRSTRLEN]={0};
         inet_ntop(AF_INET,&peer->sin_addr,ip,sizeof(ip));
         ESP_LOGI("time_sync","NTP source=%u host=%s IPv4=%s",source+1,servers[source],ip);
         int fd=socket(AF_INET,SOCK_DGRAM,IPPROTO_UDP);
-        if(fd<0) {freeaddrinfo(address);return errno==ENOMEM?ESP_ERR_NO_MEM:ESP_FAIL;}
+        if(fd<0) {if(address)freeaddrinfo(address);return errno==ENOMEM?ESP_ERR_NO_MEM:ESP_FAIL;}
         // UDP connect限定回包来源；所有退出路径均关闭socket并释放DNS结果。
         // Connected UDP restricts the peer; release sockets and DNS results on every exit.
-        int connected=connect(fd,address->ai_addr,address->ai_addrlen);
-        freeaddrinfo(address);
+        int connected=connect(fd,(const struct sockaddr*)peer,sizeof(*peer));
+        if(address)freeaddrinfo(address);
         if(connected) {ESP_LOGW("time_sync","NTP UDP connect errno=%d",errno);close(fd);continue;}
         struct timeval timeout={.tv_usec=100000};
         if(setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))) {close(fd);return ESP_FAIL;}
@@ -78,6 +139,13 @@ esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc_seconds, bool (*cancel
         close(fd);
     }
     return result;
+}
+
+esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc_seconds, bool (*cancelled)(void)) {
+    return sync_time_ntp(utc_seconds,cancelled,false);
+}
+esp_err_t transfer_sync_time_ntp_bounded(uint32_t *utc_seconds, bool (*cancelled)(void)) {
+    return sync_time_ntp(utc_seconds,cancelled,true);
 }
 
 esp_err_t transfer_sync_time_ntp(uint32_t *utc_seconds) {

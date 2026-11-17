@@ -10,7 +10,7 @@ typedef struct {
     uint32_t chapter_uid, chapter_index, chapter_offset, progress, reading_time, book_version;
     uint64_t updated_at, last_report_ms;
     unsigned pending_pages;
-    bool dirty;
+    bool dirty, position_pending;
     char summary[256];
 } weread_progress_t;
 
@@ -19,6 +19,8 @@ esp_err_t weread_progress_load(const char *id, weread_progress_t *out);
 esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict);
 /// 显式选择云端或本地后保存；本地选择继续标脏。/ Persist an explicit cloud/local selection; local choices stay dirty.
 esp_err_t weread_progress_select(const char *id, const weread_progress_t *choice, bool from_cloud);
+esp_err_t weread_progress_checkpoint(const char *id,const weread_progress_t *progress);
+esp_err_t weread_progress_note_time(const char *id,uint32_t seconds,uint64_t timestamp);
 esp_err_t weread_progress_note(const char *id, uint32_t uid, uint32_t index, uint32_t offset,
     uint32_t percent, uint32_t seconds, unsigned pages, const char *summary, uint64_t timestamp);
 /// 非强制上报等候 60 秒或十页；失败保持磁盘 dirty。/ Nonforced reports wait 60 seconds or ten pages; errors retain on-disk dirty state.

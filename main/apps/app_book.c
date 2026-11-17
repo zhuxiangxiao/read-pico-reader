@@ -7253,6 +7253,7 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     if (!s_text) return APP_REDRAW_PAGE;
     s_jump_offset = SIZE_MAX;
     s_last_turn_ms = s_stats_activity_ms = ctx->now_ms;
+    wr_reader_move();
     ticket_count_turn();
     uint8_t full_pages = app_settings_reader_full_pages();
     if (full_pages) ++s_turns;
@@ -7858,7 +7859,7 @@ static app_redraw_t reader_chapter_jump_commit(app_ctx_t *ctx,size_t page,bool r
     s_reader_footer_pending=s_reader_image_refresh_pending=s_reader_cleanup=false;
     unlock_draw();
     release_page_images();prepare_inline_image();
-    if(changed)save_progress();
+    if(changed){wr_reader_move();save_progress();}
     s_stats_activity_ms=ctx->now_ms;ctx->user_activity=true;
     return APP_REDRAW_PAGE;
 }
@@ -7983,7 +7984,7 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
                     if (s_bookmark_edit) s_bookmark_selected ^= UINT32_C(1) << newest;
                     else if (mark.chapter < book_chapter_count() && load_chapter(ctx, mark.chapter, mark.byte_off, false)) {
                         s_reader_panel = READER_PANEL_NONE;
-                        save_progress();
+                        wr_reader_move();save_progress();
                     }
                 }
             }
@@ -8712,7 +8713,7 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
                     copy_text(s_title, sizeof(s_title), entry_title);
                 s_view = READING;
                 s_reader_panel = READER_PANEL_NONE;
-                save_progress();
+                wr_reader_move();save_progress();
             } else set_reader_view(s_text ? TOC : SHELF);
             return APP_REDRAW_PAGE;
         }

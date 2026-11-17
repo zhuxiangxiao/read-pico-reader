@@ -76,6 +76,14 @@ with open('build/weread-tests/no-version.zip','wb') as output:
         'info.txt':json.dumps({'bookId':'test_book_101','synckey':100,'chapterUpdateTime':0,'chapters':[{'chapterUid':2,'files':['Text/live.xhtml']}]}).encode(),
         'Text/live.xhtml':'<html><body><p>真实清单兼容，无版本字段</p></body></html>'.encode(),
     },b'test_password_123'))
+with open('build/weread-tests/notes.zip','wb') as output:
+    output.write(fixture['_make_zipcrypto_zip']({
+        'info.txt':json.dumps({'bookId':'test_book_101','chapters':[{'chapterUid':3,'files':['Text/one.xhtml','Text/two.xhtml','Text/three.xhtml']}]}).encode(),
+        'Text/one.xhtml':('<html><head><!-- metadata --><style>.unused:before {content:"<";}</style><title>T</title></head><body>'+''.join(f'<p id="long_unreferenced_paragraph_id_{i:02d}">普通段落</p>' for i in range(16))+'<p id="noteref-a">甲😀<a href=\'#note\'>[1]</a>&amp;乙<a href="two.xhtml#note">[2]</a><a href="../Other/missing.xhtml#note">[9]</a><img src="../Images/picture.png"/></p><p id="note">第一注<a href="#noteref-a">返回</a></p></body></html>').encode(),
+        'Text/two.xhtml':'<html><body><p id="noteref-b">丙<a href="#note">[3]</a></p><p id=note>第二注<a href="#noteref-b">返回</a></p></body></html>'.encode(),
+        'Text/three.xhtml':'<html><body><p>丁<a href="#abcdefghijklmnopqrstuvw">[4]</a></p><p id="abcdefghijklmnopqrstuvw">第三注</p></body></html>'.encode(),
+        'Styles/notes.css':b'#note {text-align:right} #abcdefghijklmnopqrstuvw {text-align:center}',
+    },b'test_password_123'))
 PY
 echo "Compiling and running production WeRead streamed chapter tests..."
 "${CC}" "${flags[@]}" \
@@ -84,6 +92,18 @@ echo "Compiling and running production WeRead streamed chapter tests..."
     main/weread/weread_store.c main/weread/weread_auth.c main/weread/weread_client.c \
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_chapter
 build/weread-tests/test_weread_chapter
+
+echo "Compiling and running new-open version binding tests..."
+"${CC}" "${flags[@]}" tools/test_weread_open_version.c \
+    main/book/book_weread_crypto.c main/book/book_source_weread.c main/book/html_text.c \
+    main/weread/weread_{runtime,chapter,position,progress,shelf,toc,store,auth,client}.c \
+    tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_open_version
+python3 - <<'PY'
+import subprocess,tempfile
+for mode in ('updated','selfheal','moved','corrupt','bad-offset','bad-index','protection'):
+    with tempfile.TemporaryDirectory(prefix='weread-open-version-') as cache:
+        subprocess.run(['build/weread-tests/test_weread_open_version',cache,mode],check=True)
+PY
 
 echo "Compiling and running production WeRead progress tests..."
 "${CC}" "${flags[@]}" \
@@ -101,3 +121,16 @@ echo "Compiling and running constrained WeRead memory-pool tests..."
     main/weread/weread_client.c main/weread/weread_shelf.c main/weread/weread_toc.c \
     tools/weread_stubs/cJSON.c -lm -o build/weread-tests/test_weread_memory
 build/weread-tests/test_weread_memory
+
+echo "Compiling and running bounded cache lifecycle tests..."
+"${CC}" "${flags[@]}" -DWEREAD_TEST_MEMORY -Dtime=cache_test_time \
+    -Dmalloc=weread_test_malloc -Dcalloc=weread_test_calloc -Drealloc=weread_test_realloc -Dfree=weread_test_free \
+    tools/test_weread_cache.c tools/weread_stubs/heap_caps_memory_mock.c \
+    main/book/book_weread_crypto.c main/book/book_source_weread.c main/book/html_text.c \
+    main/weread/weread_{chapter,position,progress,shelf,toc,store,auth,client}.c \
+    tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_cache
+build/weread-tests/test_weread_cache
+python3 tools/weread_cache_ui_host_test.py
+python3 tools/weread_cover_cache_host_test.py
+
+python3 tools/weread_time_cancel_host_test.py

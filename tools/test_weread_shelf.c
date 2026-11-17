@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 static int mode, batches, calls, toc_mode,last_batch;
 static char root[] = "/tmp/kiiko-weread-shelf-XXXXXX";
@@ -44,12 +45,12 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         assert(n > 0 && n <= 20 && cJSON_IsArray(cJSON_GetObjectItem(req, "albumIds")));
         cJSON *r = cJSON_CreateObject(), *a = cJSON_AddArrayToObject(r, "books"), *v;
         cJSON_ArrayForEach(v, ids) {
-            if(mode==7&&!strcmp(v->valuestring,"book_02"))continue;
+            if((mode==7||mode==8)&&!strcmp(v->valuestring,"book_02"))continue;
             cJSON *b = cJSON_CreateObject();
             cJSON_AddStringToObject(b, "bookId", v->valuestring);
             cJSON_AddStringToObject(b, "title", "一份真实 C 缓存");
-            cJSON_AddStringToObject(b, "format", "epub");
-            cJSON_AddNumberToObject(b, "bookVersion", 12);
+            cJSON_AddStringToObject(b, "format", mode==9&&!strcmp(v->valuestring,"book_02")?"audio":"epub");
+            cJSON_AddNumberToObject(b, "bookVersion", mode>=8?13:12);
             cJSON_AddItemToArray(a, b);
         }
         *out = cJSON_PrintUnformatted(r); cJSON_Delete(r); cJSON_Delete(req);
@@ -58,13 +59,19 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         if (mode == 1) {
             assert(strstr(url, "synckey=100&onlyBookid=1"));
             *out = reply("{\"synckey\":101,\"bookIds\":[\"C\"],\"bookProgress\":[{\"bookId\":\"C\",\"progress\":46,\"updateTime\":999}],\"removed\":[{\"bookId\":\"B\"}]}");
-        } else if (mode == 2 || mode == 3 || mode==7) {
+        } else if (mode == 8 || mode == 9 || mode == 11) {
+            assert(strstr(url, mode==9?"synckey=201&":"synckey=200&"));
+            *out=reply(mode==9?"{\"synckey\":202,\"bookIds\":[\"book_02\"]}":
+                "{\"synckey\":201,\"bookIds\":[\"book_02\",\"book_03\"]}");
+        } else if (mode == 2 || mode == 3 || mode==7 || mode==10) {
             cJSON *r = cJSON_CreateObject(), *ids = cJSON_AddArrayToObject(r, "bookIds");
+            if(mode==10)assert(strstr(url,"synckey=0&")&&strstr(url,"lectureSynckey=0"));
             for (int i = 0; i < 45; ++i) {
+                if(mode==10&&i==2)continue;
                 char id[32]; snprintf(id, sizeof(id), "book_%02d", i);
                 cJSON_AddItemToArray(ids, cJSON_CreateString(id));
             }
-            cJSON_AddNumberToObject(r, "synckey", 200);
+            cJSON_AddNumberToObject(r, "synckey", mode==10?202:200);
             *out = cJSON_PrintUnformatted(r); cJSON_Delete(r);
         } else if (mode == 4) *out = reply("{\"synckey\":300,\"bookIds\":[\"../../escape\"]}");
         else if (mode == 5) *out = reply("{\"synckey\":300,\"books\":[]}");
@@ -98,6 +105,12 @@ int main(void) {
     weread_client_set_transport(transport, NULL);
     assert(weread_shelf_sync(true) == ESP_OK);
     assert(weread_shelf_count() == 3 && weread_shelf_synckey() == 100);
+    uint64_t now=(uint64_t)time(NULL);
+    assert(weread_shelf_cache_fresh(now)&&!weread_shelf_cache_fresh(now+301)&&!weread_shelf_cache_fresh(now-2));
+    uint64_t cover_key=weread_cover_key("A","https://cdn.qq.com/one");
+    assert(cover_key!=weread_cover_key("A","https://cdn.qq.com/two")&&cover_key!=weread_cover_key("B","https://cdn.qq.com/one"));
+    char cover_path[512];assert(weread_cover_cache_path("A","gray",cover_path,sizeof(cover_path))==ESP_OK&&strstr(cover_path,"/cover-"));
+    assert(weread_cover_cache_path("A","../escape",cover_path,sizeof(cover_path))!=ESP_OK);
     weread_book_t book;
     assert(weread_shelf_get(0, &book) && !strcmp(book.book_id, "B"));
     assert(!weread_shelf_find("audio", &book) && !weread_shelf_find("lecture", &book));
@@ -115,16 +128,41 @@ int main(void) {
     weread_shelf_clear();batches=0;
     assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6&&last_batch==6&&weread_shelf_sync_pending());
     assert(weread_shelf_synckey()==0);
+    assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)));
     mode=3;assert(weread_shelf_sync_step(false)==ESP_ERR_TIMEOUT&&weread_shelf_count()==6);
     assert(!weread_shelf_sync_pending()&&weread_shelf_load()==ESP_OK&&weread_shelf_count()==6);
+    // key0重进使用当前完整ID集合，不保留中断后被手机删除的首批书。/ Restart key0 from current IDs, dropping a first-batch book removed on the phone after interruption.
+    mode=10;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6);
+    assert(!weread_shelf_find("book_02",&book));
+    while(weread_shelf_sync_pending())assert(weread_shelf_sync_step(false)==ESP_OK);
+    assert(weread_shelf_count()==44&&weread_shelf_synckey()==202);
+    weread_shelf_clear();assert(weread_shelf_load()==ESP_OK&&!weread_shelf_find("book_02",&book));
+    weread_shelf_clear();
     mode=2;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==6);
     assert(weread_shelf_sync_step(false)==ESP_OK&&weread_shelf_count()==26&&last_batch==20);
     assert(weread_shelf_sync_step(false)==ESP_OK&&weread_shelf_count()==45&&!weread_shelf_sync_pending()&&weread_shelf_synckey()==200);
+    // 已有书详情遗漏也须重试其版本变更；原子接口回滚，渐进接口保留旧书但不前移key。
+    // Retry a changed existing book omitted by details: atomic sync rolls back, staged sync retains the book without advancing the key.
+    mode=8;assert(weread_shelf_sync(false)==ESP_ERR_INVALID_RESPONSE&&weread_shelf_synckey()==200);
+    assert(weread_shelf_find("book_03",&book)&&book.book_version==12);
+    assert(weread_shelf_sync_step(true)==ESP_OK&&!weread_shelf_sync_pending()&&weread_shelf_synckey()==200);
+    size_t done,total,skipped;weread_shelf_sync_progress(&done,&total,&skipped);
+    assert(done==2&&total==2&&skipped==1&&weread_shelf_find("book_02",&book)&&book.book_version==12);
+    assert(weread_shelf_find("book_03",&book)&&book.book_version==13);
+    weread_shelf_clear();assert(weread_shelf_load()==ESP_OK&&weread_shelf_synckey()==200);
+    mode=11;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_synckey()==201);
+    assert(weread_shelf_find("book_02",&book)&&book.book_version==13);
+    // 明确返回audio不是遗漏，可移除旧书并提交游标。/ An explicit audio result is not omitted: remove the old book and commit the cursor.
+    mode=9;assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_synckey()==202);
+    weread_shelf_sync_progress(&done,&total,&skipped);
+    assert(skipped==0&&weread_shelf_count()==44&&!weread_shelf_find("book_02",&book));
+    mode=2;assert(weread_shelf_sync(true)==ESP_OK&&weread_shelf_count()==45);
     mode=7;assert(weread_shelf_sync(true)==ESP_ERR_INVALID_RESPONSE&&weread_shelf_count()==45);
     weread_shelf_clear();assert(weread_shelf_sync_step(true)==ESP_OK&&weread_shelf_count()==5);
     while(weread_shelf_sync_pending())assert(weread_shelf_sync_step(false)==ESP_OK);
-    size_t done,total,skipped;weread_shelf_sync_progress(&done,&total,&skipped);
+    weread_shelf_sync_progress(&done,&total,&skipped);
     assert(weread_shelf_count()==44&&done==45&&total==45&&skipped==1&&weread_shelf_synckey()==0);
+    assert(!weread_shelf_cache_fresh((uint64_t)time(NULL)));
     mode=2;assert(weread_shelf_sync(true)==ESP_OK&&weread_shelf_count()==45);
     char tmp[512]; snprintf(tmp, sizeof(tmp), "%s/shelf.json.tmp", root); assert(!mkdir(tmp, 0700));
     mode = 5; assert(weread_shelf_sync(true) != ESP_OK && weread_shelf_count() == 45);
@@ -141,6 +179,7 @@ int main(void) {
     assert(toc.count == 1 && toc.chapters[0].uid == 1 && toc.book_version == 13); weread_toc_free(&toc);
     assert(weread_toc_sync("../escape") == ESP_ERR_INVALID_ARG);
     account("456"); assert(weread_shelf_count() == 0 && weread_shelf_load() != ESP_OK);
+    assert(!weread_shelf_cache_fresh((uint64_t)time(NULL))&&cover_key!=weread_cover_key("A","https://cdn.qq.com/one"));
     assert(weread_toc_load("A", &toc) != ESP_OK); account("123");
     assert(weread_shelf_load() == ESP_OK);
     char url[128]; assert(weread_cover_get_url("http://cdn.qq.com/s_cover?x=/s_query", url, sizeof(url)) == ESP_OK);

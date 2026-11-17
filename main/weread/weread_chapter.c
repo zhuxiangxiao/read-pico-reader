@@ -19,6 +19,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,14 +163,31 @@ static bool append_source(FILE *f, const char *data, size_t len, size_t *total, 
     if (!position_anchor(p, *total) || !append(f, data, len, total)) return false;
     p->units += weread_utf16_length(data, len); return true;
 }
-static bool append_html(FILE *f, const char *data, size_t len, const char *source, size_t *total, position_writer_t *map) {
+static bool merged_file(const cJSON *files, const char *path) {
+    cJSON *file; char normalized[512];
+    cJSON_ArrayForEach(file,files)
+        if(cJSON_IsString(file)&&weread_resource_path(NULL,file->valuestring,normalized,sizeof(normalized))&&!strcmp(normalized,path))return true;
+    return false;
+}
+static void note_id(char out[24], const char *source, const char *fragment) {
+    uint64_t hash=UINT64_C(14695981039346656037);
+    const char *parts[]={source,fragment};
+    for(unsigned i=0;i<2;++i) {
+        const unsigned char *p=(const unsigned char *)parts[i];
+        do {hash=(hash^*p)*UINT64_C(1099511628211);}while(*p++);
+    }
+    // 保留解析器对noteref回链的过滤。/ Retain the parser's noteref backlink filter.
+    snprintf(out,24,"%s%016" PRIx64,!strncmp(fragment,"noteref",7)?"noteref":"w",hash);
+}
+static bool append_html(FILE *f, const char *data, size_t len, const char *source, const cJSON *files, size_t *total, position_writer_t *map) {
     size_t start = 0; bool tag = false;
     for (size_t i = 0; i < len; ++i) {
         if (data[i] == '<') tag = true;
         if (data[i] == '>') tag = false;
         if (!tag || !i || !isspace((unsigned char)data[i - 1])) continue;
         size_t k = len - i >= 3 && !strncasecmp(data + i, "src", 3) ? 3 :
-            len - i >= 4 && !strncasecmp(data + i, "href", 4) ? 4 : 0;
+            len - i >= 4 && !strncasecmp(data + i, "href", 4) ? 4 :
+            len - i >= 2 && !strncasecmp(data + i, "id", 2) ? 2 : 0;
         if (!k) continue;
         size_t j = i + k;
         while (j < len && isspace((unsigned char)data[j])) ++j;
@@ -182,10 +200,26 @@ static bool append_html(FILE *f, const char *data, size_t len, const char *sourc
         if (j == len || j - value >= 512) continue;
         char raw[512], normalized[512];
         memcpy(raw, data + value, j - value); raw[j - value] = 0;
-        if (weread_resource_path(source, raw, normalized, sizeof(normalized))) {
+        char alias[24];
+        if(k==2) {
+            note_id(alias,source,raw);
+            if(quote)++j;
+            // 保留原id的CSS/语义，只给合并脚注添加隔离别名；新增属性不计原文UTF16。
+            // Keep the original CSS/semantic id; add a document-bound note alias without counting synthetic UTF16 units.
+            if(!append_source(f,data+start,j-start,total,map)||!append(f," data-wr-note=\"",15,total)||
+                !append(f,alias,strlen(alias),total)||!append(f,"\"",1,total))return false;
+            start=j;i=j-1;continue;
+        }
+        bool relative=raw[0]!='#'&&weread_resource_path(source,raw,normalized,sizeof(normalized));
+        const char *fragment=k==4?strchr(raw,'#'):NULL;
+        if(fragment&&fragment[1]&&((raw[0]=='#'&&wr_copy(normalized,sizeof(normalized),source))||
+            (relative&&merged_file(files,normalized)))) {
+            note_id(alias,normalized,fragment+1);normalized[0]='#';strcpy(normalized+1,alias);
+            fragment=NULL;relative=true;
+        }
+        if (relative) {
             if (!append_source(f, data + start, value - start, total, map) ||
                 !append(f, normalized, strlen(normalized), total)) return false;
-            const char *fragment = k == 4 ? strchr(raw, '#') : NULL;
             if (fragment && !append(f, fragment, strlen(fragment), total)) return false;
             map->units += weread_utf16_length(data + value, j - value);
             start = j;
@@ -229,7 +263,7 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
                 free(data); data = (char *)plain; len = plain_len;
             }
         }
-        if (!strcmp(format, "txt") ? !append_source(f, data, len, &total, &map) : !append_html(f, data, len, normalized, &total, &map)) err = ESP_ERR_INVALID_SIZE;
+        if (!strcmp(format, "txt") ? !append_source(f, data, len, &total, &map) : !append_html(f, data, len, normalized, files, &total, &map)) err = ESP_ERR_INVALID_SIZE;
         if (err == ESP_OK && !append(f, "\n", 1, &total)) err = ESP_ERR_INVALID_SIZE;
         free(data); if (err != ESP_OK) break;
     }
@@ -302,7 +336,7 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         else if (err == ESP_OK && w->response.status == 402) err = WEREAD_ERR_PURCHASE;
         else if (err == ESP_OK && w->response.status == 499) err = WEREAD_ERR_SOLD_OUT;
         else if (err == ESP_OK && w->response.status != 200) err = ESP_ERR_INVALID_RESPONSE;
-        ESP_LOGI("weread","chapter response result=%d http=%d bytes=%u key=%u code=%d",(int)err,w->response.status,(unsigned)w->response.bytes,(unsigned)strlen(w->response.encrypt_key),code);
+        ESP_LOGI("weread","chapter result=%d http=%d bytes=%u",(int)err,w->response.status,(unsigned)w->response.bytes);
         memset(&w->x,0,sizeof(w->x)); wr_copy(w->x.root, sizeof(w->x.root), w->root);
         if (err == ESP_OK && !strcmp(w->b.format, "epub")) {
             size_t n = 0;
@@ -313,12 +347,10 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
             weread_secure_zero(w->password, sizeof(w->password));
         } else if (err == ESP_OK) err = book_weread_unpack_tar_file(archive, extract, &w->x);
         if (w->x.file) fclose(w->x.file);
-        ESP_LOGI("weread","chapter unpack result=%d",(int)err);
         if (fclose(archive) && err == ESP_OK) err = ESP_FAIL;
         unlink(w->path);
         if (err != ESP_OK && w->x.error != ESP_OK) err = w->x.error;
         if (err == ESP_OK) err = assemble(w->root, id, uid, v, w->b.format);
-        ESP_LOGI("weread","chapter assembly result=%d",(int)err);
         cJSON *m = NULL;
         if (err == ESP_OK) {
             m = cJSON_CreateObject();

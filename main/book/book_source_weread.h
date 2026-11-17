@@ -15,6 +15,7 @@ esp_err_t book_weread_prepare_open(const char *id);
 bool book_weread_prepared(const char *id);
 void book_weread_clear_prepared(void);
 bool book_weread_cached_version(const char *id,uint32_t *version);
+esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version);
 size_t book_weread_count(void);
 esp_err_t book_weread_title(size_t index, char *out, size_t cap);
 esp_err_t book_weread_load(size_t index, const char *anchor, size_t *offset, html_text_t *out);

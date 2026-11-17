@@ -622,7 +622,8 @@ static esp_err_t weread_client_request_internal(
     // 区分超时与会话撤销，超时保留本地凭据以供 Web 进度回退。/ Distinguish timeout from revocation; preserve credentials for web-progress fallback.
     int session_code = 0;
     bool is_expired = (status == 401);
-    if (!is_expired && resp && resp_len > 0) {
+    // HTTP状态与业务码分别判断；401也可能明确撤销会话。/ Classify revocation even in HTTP401 bodies.
+    if (resp && resp_len > 0) {
         if (strstr(resp, "-2013") != NULL || strstr(resp, "-2012") != NULL) {
             cJSON *chk = wr_parse_json(resp,resp_len + 1);
             if (chk) {
@@ -703,10 +704,16 @@ void weread_client_set_download_transport(weread_download_transport_fn fn, void 
 }
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-typedef struct { weread_download_info_t *info; bool invalid; } download_event_t;
+typedef struct { weread_download_info_t *info; char **redirect; bool invalid; } download_event_t;
 static esp_err_t download_event(esp_http_client_event_t *event) {
     download_event_t *ctx = event->user_data;
     if (event->event_id != HTTP_EVENT_ON_HEADER || !event->header_key || !event->header_value) return ESP_OK;
+    if (!strcasecmp(event->header_key, "Location")) {
+        size_t n = strlen(event->header_value);
+        free(*ctx->redirect); *ctx->redirect = n < 2048 ? wr_alloc(n + 1) : NULL;
+        if (!*ctx->redirect) ctx->invalid = true;
+        else memcpy(*ctx->redirect, event->header_value, n + 1);
+    }
     char *out = NULL; size_t cap = 0;
     if (!strcasecmp(event->header_key, "encryptkey")) { out = ctx->info->encrypt_key; cap = sizeof(ctx->info->encrypt_key); }
     if (!strcasecmp(event->header_key, "Content-Type")) { out = ctx->info->content_type; cap = sizeof(ctx->info->content_type); }
@@ -717,8 +724,8 @@ static esp_err_t download_event(esp_http_client_event_t *event) {
     return ESP_OK;
 }
 static esp_err_t download_raw(const char *url, const char *headers, FILE *file, size_t limit,
-    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info) {
-    download_event_t event = {.info = info};
+    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info, char **redirect) {
+    download_event_t event = {.info = info, .redirect = redirect};
     esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
         .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
         .event_handler = download_event, .user_data = &event};
@@ -767,20 +774,34 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
     weread_cancel_fn cancel, void *ctx, weread_download_info_t *info) { WR_GUARD;
     if (!url || !file || !limit || !info) return ESP_ERR_INVALID_ARG;
     if (s_network) { esp_err_t ready = s_network(s_network_ctx); if (ready != ESP_OK) return ready; }
-    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    char *redirected __attribute__((cleanup(wr_release))) = NULL;
+    const char *current = url;
+    unsigned redirects = 0;
+    for (unsigned attempt = 0; attempt < 2;) {
         memset(info, 0, sizeof(*info));
         char *headers __attribute__((cleanup(release_headers)))=wr_alloc(4096);
-        if(!headers || !request_headers(url,NULL,headers))return ESP_ERR_NO_MEM;
+        const char *accept=strstr(current,"/book/chapterdownload?")?NULL:"Accept: image/png,image/jpeg,image/webp,*/*\r\n";
+        if(!headers || !request_headers(current,accept,headers))return ESP_ERR_NO_MEM;
+        char *next __attribute__((cleanup(wr_release))) = NULL;
         esp_err_t err;
-        if (s_download_transport) err = s_download_transport(url, headers, file, limit, cancel, ctx, info, s_download_ctx);
+        if (s_download_transport) err = s_download_transport(current, headers, file, limit, cancel, ctx, info, s_download_ctx);
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-        else err = download_raw(url, headers, file, limit, cancel, ctx, info);
+        else err = download_raw(current, headers, file, limit, cancel, ctx, info, &next);
 #else
         else err = ESP_ERR_INVALID_STATE;
 #endif
         release_headers(&headers);
         if (err != ESP_OK || info->bytes > limit) return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
         if (fflush(file)) return ESP_FAIL;
+        if (next && (info->status == 301 || info->status == 302 || info->status == 303 || info->status == 307 || info->status == 308)) {
+            // 原生封面会跳到腾讯云；每跳重建请求头，外域绝不继承会话凭据。
+            // Native covers redirect to Tencent storage; rebuild headers on every hop to strip credentials outside qq.com.
+            if (++redirects > 3 || strncmp(next, "https://", 8) || strpbrk(next, "\r\n\\") ||
+                !strcspn(next + 8, "/?#") || memchr(next + 8, '@', strcspn(next + 8, "/?#"))) return ESP_ERR_INVALID_RESPONSE;
+            if (ftruncate(fileno(file), 0) || fseek(file, 0, SEEK_SET)) return ESP_FAIL;
+            free(redirected); redirected = next; next = NULL; current = redirected;
+            continue;
+        }
         int code = 0;
         if (info->bytes <= 4096 && !fseek(file, 0, SEEK_SET)) {
             char *text __attribute__((cleanup(wr_release)))=wr_alloc(4097);
@@ -791,7 +812,7 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             if (cJSON_IsNumber(v)) code = v->valueint;
             cJSON_Delete(r);
         }
-        if (!weread_client_is_trusted_url(url) ||
+        if (!weread_client_is_trusted_url(current) ||
             (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
         if (attempt || (cancel && cancel(ctx))) {
             if (attempt && code == -2013) weread_auth_clear_session();
@@ -800,6 +821,7 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         err = weread_auth_renew_session(NULL);
         if (err != ESP_OK) return err;
         if (ftruncate(fileno(file), 0) || fseek(file, 0, SEEK_SET)) return ESP_FAIL;
+        ++attempt;
     }
     return ESP_FAIL;
 }

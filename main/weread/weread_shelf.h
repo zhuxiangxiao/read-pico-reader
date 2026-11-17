@@ -29,6 +29,10 @@ bool weread_shelf_get(size_t index, weread_book_t *out);
 bool weread_shelf_find(const char *book_id, weread_book_t *out);
 uint32_t weread_shelf_book_version(const char *id);
 uint64_t weread_shelf_synckey(void);
+bool weread_shelf_cache_fresh(uint64_t now_seconds);
+uint64_t weread_cover_key(const char *book_id,const char *raw_url);
+esp_err_t weread_cover_cache_path(const char *book_id,const char *kind,char *path,size_t cap);
+bool weread_cover_is_original(const char *book_id,const char *url);
 
 /// 封面 URL 升级为 HTTPS 与 t6；不修改查询串。/ Upgrade to HTTPS/t6 without editing the query.
 esp_err_t weread_cover_get_url(const char *raw_url, char *out_url, size_t cap);

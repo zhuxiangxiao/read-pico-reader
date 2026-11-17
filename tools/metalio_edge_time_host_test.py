@@ -42,7 +42,7 @@ static uint8_t buffers[2][BOUNCE_BUF_LINES*9];
 static struct {
  bool frame_finishing; int native_height,display_lines,line_bytes,dummy_bytes;
  int64_t frame_t0_us,last_frame_us,eof_last_us,eof_dt_min_us,eof_dt_max_us,eof_dt_sum_us,eof_work_min_us,eof_work_max_us,eof_work_sum_us;
- unsigned eof_dt_n,eof_work_n; size_t lines_fed,bb_eof_count;
+ unsigned eof_dt_n,eof_work_n; size_t lines_fed,bb_eof_count,nodes_per_bounce;
  struct {int white_border_pixels;} config;
  struct {void *dev;} hal; void *dma_chan;
  bool (*line_source_cb)(void*,uint8_t*); void *line_cb_payload;
@@ -60,7 +60,7 @@ for name in ('lcd_finish_frame_from_isr','fill_bounce_buffer','lcd_rgb_panel_eof
     lcd+=function(lcd_path,name)
 lcd+=r'''
 int main(void){
- lcd.native_height=684;lcd.display_lines=688;lcd.line_bytes=8;lcd.dummy_bytes=1;
+ lcd.native_height=684;lcd.display_lines=688;lcd.line_bytes=8;lcd.dummy_bytes=1;lcd.nodes_per_bounce=1;
  lcd.line_source_cb=source;lcd.frame_done_cb=finished;
  for(int i=0;i<2;i++){lcd.bounce_buffer[i]=buffers[i];fill_bounce_buffer(buffers[i]);}
  assert(lcd.lines_fed==16&&!done&&!lcd.frame_finishing);
@@ -106,7 +106,9 @@ static int get_ps_fail,set_ps_fail,ps_sets;
 static esp_err_t esp_wifi_get_ps(wifi_ps_type_t *out){*out=power_save;return get_ps_fail?ESP_FAIL:ESP_OK;}
 static esp_err_t esp_wifi_set_ps(wifi_ps_type_t mode){++ps_sets;if(set_ps_fail)return ESP_FAIL;power_save=mode;return ESP_OK;}
 static int ntp_calls,https_calls;static esp_err_t ntp_result=ESP_ERR_TIMEOUT,https_result=ESP_ERR_TIMEOUT;
+static bool (*s_time_owner_cancel)(void *);
 static esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc,bool (*cancel)(void)){(void)cancel;assert(power_save==WIFI_PS_NONE);++ntp_calls;if(ntp_result==ESP_OK)*utc=1791633600;return ntp_result;}
+static esp_err_t transfer_sync_time_ntp_bounded(uint32_t *utc,bool (*cancel)(void)){return transfer_sync_time_ntp_cancelable(utc,cancel);}
 static esp_err_t transfer_sync_time_https(uint32_t *utc){assert(power_save==WIFI_PS_NONE);++https_calls;if(https_result==ESP_OK)*utc=1791633600;return https_result;}
 '''
 for name in ('time_connect','sync_network_time'):

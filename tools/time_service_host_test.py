@@ -125,6 +125,8 @@ int main(void){
 '''
 lease=common+r'''
 static bool s_config_busy,s_time_active,s_time_automatic,s_time_cancel,s_stopping;
+static bool (*s_time_owner_cancel)(void *);
+static void *s_time_owner_ctx;
 static uint32_t s_time_pending_utc;
 enum {READ_PICO_TRANSFER_STOPPED,READ_PICO_TRANSFER_READY};
 static struct {int state;} s_status;
@@ -132,7 +134,7 @@ static int impl_result,impl_calls,cancel_reads;
 static bool cancel_time_sync(bool automatic_only){++cancel_reads;return !s_time_active||(!automatic_only||s_time_automatic);}
 static esp_err_t sync_time_impl(uint32_t *utc){assert(s_time_active&&s_config_busy);++impl_calls;*utc=wall;return impl_result;}
 static esp_err_t sync_time_online_impl(uint32_t *utc){return sync_time_impl(utc);}
-'''+function('sync_time_run',root/'components/read_pico_transfer/read_pico_transfer.c')+r'''
+'''+function('time_sync_cancelled',root/'components/read_pico_transfer/read_pico_transfer.c')+function('sync_time_run_cancelable',root/'components/read_pico_transfer/read_pico_transfer.c')+function('sync_time_run',root/'components/read_pico_transfer/read_pico_transfer.c')+r'''
 int main(void){uint32_t utc;
  assert(sync_time_run(NULL,false,true)==ESP_ERR_INVALID_ARG);
  assert(sync_time_run(&utc,false,true)==ESP_OK&&impl_calls==1&&s_time_pending_utc==wall);

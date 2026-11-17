@@ -1,7 +1,7 @@
 # 微信读书 / WeRead
 
-设备入口为「书架 → 微信读书」。Pico 与 S31 共用登录、缓存、页面与同步服务；本地 TXT/EPUB 扫描范围保持原样。当前为本地测试功能，尚未用真实账号和双板实屏验收。
-Open **Shelf → 微信读书**. Pico and S31 share login, caching, UI and synchronization; local TXT/EPUB enumeration is unchanged. This is a local test feature, pending real-account and physical-device acceptance.
+设备入口为「书架 → 微信读书」。Pico 与 S31 共用登录、缓存、页面与同步服务；本地 TXT/EPUB 扫描范围保持原样。当前为本地测试功能：Pico 已确认真实扫码登录、正文、自导入封面，以及本轮缓存书架更流畅、从目录找回的位置退书重开后保持；跨端长时同步和 S31 实屏仍待验收。
+Open **Shelf → 微信读书**. Pico and S31 share login, caching, UI and synchronization; local TXT/EPUB enumeration is unchanged. Pico QR login, first-page shelf and text display have been confirmed on hardware. Cross-device positions and S31 panel acceptance remain pending.
 
 ## 使用 / Use
 
@@ -9,10 +9,14 @@ Open **Shelf → 微信读书**. Pico and S31 share login, caching, UI and synch
   Connect WiFi, scan, and confirm or complete verification on the phone. Credentials belong to the current TF card.
 - 首次先加载第一页最多6本，显示后其余每批最多20本在后台补齐；已有缓存先显示，可直接点书中断后台加载并优先开书。部分详情缺失保留已显示书籍，未补齐时不前移同步游标。
   Fetch at most6 books for the first page, then up to20 per background batch. Show cached books immediately; opening interrupts background loading. Missing details retain visible books without advancing the sync cursor.
-- 支持列表/网格、书名和作者搜索、分页、逐本封面加载；单击阅读，长按清理该书离线内容。清理保留阅读进度，退出登录删除所有凭据副本。
-  Browse list/grid pages, search titles/authors and load covers progressively. Tap to read or hold to clear that book's content while retaining progress. Logout removes every credential copy.
+- 默认网格，可切换列表；支持书名和作者搜索、分页、逐本封面加载。单击阅读，长按清理该书离线内容。清理保留阅读进度，退出登录删除所有凭据副本。
+- 书架缓存先上屏；完整同步后5分钟内重复进入不自动联网同步，过期后空闲1秒再后台增量检查。手动刷新立即检查；失败暂缓重试，首次/未完成书架继续分批加载。
+- 当前页先读完本地封面点阵，再补远端缺图；切换列表/网格复用同组像素，书架重排按书号和封面版本转移。账号、书号、原图地址或点阵格式变化使对应缓存失效；失败封面短期负缓存，手动刷新可重试。
+  Start in grid view and switch to a list if preferred; search titles/authors and load covers progressively. Tap to read or hold to clear that book's content while retaining progress. Logout removes every credential copy.
 - 普通开书先检查本机和云端位置；存在冲突时明确选择。离线保留书架、目录和已完整下载的章节，未缓存章节需要联网。
   Normal opens compare local/cloud positions and ask when they conflict. Shelf, TOC and complete chapters remain available offline; uncached chapters require connectivity.
+- 云端未读空位置从首章打开。睡眠恢复从 TF 上按账号、版本与章节 UID 校验的位置恢复；损坏记录或未知章节会报错。普通新开书的位置候选在下载自愈后绑定最终目录版本。
+  An unread cloud position starts at the first chapter. Sleep restoration validates the TF account, version and chapter UID; corrupt records or unknown chapters fail explicitly. A normal new-open choice binds to the final TOC after download recovery.
 - 首页继续阅读、锁屏票根和开机恢复支持虚拟书籍。睡眠恢复沿用本机保存的位置与全屏状态；启动中断时可清除恢复记录，保留内容和进度。
   Home resume, ticket locks and boot restoration accept virtual books. Sleep resumes retain the saved local position/fullscreen state. Interrupted-opening recovery can clear its checkpoint while retaining content and progress.
 
@@ -48,11 +52,25 @@ QR results allow65-second long polls (idle replies measured at about55s), includ
 认证支持顶层/data字段别名和受信任登录响应的 Set-Cookie 令牌，支持单次续期重放。非 HTTPS/非 qq.com 目标不携带凭据，禁止自动重定向；loopback 例外只存在于宿主测试。
 Authentication accepts root/data aliases and trusted login Set-Cookie tokens, with a single renewal/replay. Non-HTTPS/non-qq.com destinations receive no credentials and redirects are disabled; loopback exceptions exist only in host tests.
 
+开书优先 fresh 请求 reMarkable 原生 `/shelf/syncbook` 的单书完整 `bookProgress`；精确匹配书号并要求 UID/目录序号/偏移/百分比四字段。缺失或不完整才走原生 `getProgress` 及其必要兼容回退，不能把缺字段伪造为未读。完整原生路径将进度读取降到一次请求。选择位置后复用刚同步目录；正文就绪即进入阅读，封面预热移到同一 worker 的阅读空闲期。
+Each open first fetches a fresh single-book native reMarkable `/shelf/syncbook` position, matching the book ID and requiring UID, ordinal, offset and percentage. Missing/incomplete records retain the native `getProgress` compatibility path; they are never invented as unread positions. Complete native positions need one request. Choices reuse the synchronized TOC; ready text opens immediately and the same worker warms covers during reader idle.
+
+开书在写入所选位置前验证最终目录的 UID/序号、原文偏移范围及映射文件完整性；旧版本的矛盾位置不会被直接改成本版或裁到章节边界。失败保留原本机 dirty 和待上报时长，并提示先在手机重新打开该书。
+Before persisting a choice, validate the final UID/ordinal, source bounds and complete map file. Conflicting old-edition coordinates are neither relabeled nor clamped to a chapter boundary. Failure retains local dirty progress and pending reading time, asking the user to reopen the book on the phone.
+
 书架先取ID，首屏6本后每批最多20本补齐，过滤讲书并按最近阅读排序；批次失败保留已提交页面。原子同步接口仍保留整轮失败不提交语义。章节版本失效仅刷新当前书的元数据。目录按 UID 合并，支持 clearAll。首次 EPUB 请求包含公共章节0，归档以4KiB输出流式解包，校验CRC、路径、大小与取消状态；支持Deflate分块边界的需要输入状态，并按 info.txt 顺序组装多文件正文。清单仅在存在bookVersion时核对版本。支持402/499提示和一次-2063版本自愈。
 Shelf ID sync publishes the first6 books, then up to20 per batch, filters lectures and sorts by recent reading. Failed batches retain committed pages; the atomic sync API still preserves the prior complete snapshot on failure. Chapter-version recovery refreshes only that book. TOCs merge UIDs or replace on clearAll. Initial EPUB downloads include common chapter0; archives stream4KiB chunks with CRC/path/size/cancellation checks, handle Deflate input boundaries and assemble files in info.txt order. Validate manifest bookVersion only when present. Handle402/499 and retry version error-2063 once.
 
 `position.map` 记录属性重写前后的位置锚点，将排版 UTF8 字节与原文 HTML UTF16 坐标双向映射，覆盖标签、实体、代理对和多文件。禁止直接上传排版字节；映射失败不上传猜测位置。旧的无映射缓存须重取。协议位置仍需真实账号跨端核验。
+
+恢复时保留经校验的原始协议坐标、百分比和摘要。首次显示、字体/排版重排不算位置变化；仅阅读时间先存本地，等真实导航再合并上传，避免只读秒覆盖手机刚移动的位置。位置待报标志独立持久化，旧dirty记录仍可补报。成功翻页、目录/书签或章内跳转在提交时冻结新位置，之后的重排不改待上报目标。无新位置且无待报位置时，开书再退出不发位置请求。书架缓存有效期不影响开书时重新获取单书云端进度。
 `position.map` anchors before/after attribute rewriting map normalized UTF8 bytes to original HTML UTF16 coordinates, including markup, entities, surrogate pairs and multiple files. Never upload normalized bytes or guessed mappings. Old caches without maps require downloading again. Cross-device coordinates still require real-account validation.
+
+新组装正文保留原 ID 样式，脚注采用按文档隔离的短别名，防止合并文件同名 ID 混淆；只登记实际引用的目标，普通段落不挤占固定脚注槽。已下载的旧正文继续可离线阅读；需要脚注修复时，长按清理该书离线内容后联网重取，阅读进度保留。目标文件未包含在本章合并文件内的脚注仍不提取。
+Newly assembled chapters retain original CSS IDs and use document-specific note aliases. Only referenced targets occupy the fixed note slots. Existing downloaded chapters remain readable offline; hold to clear a book's content and download again for the note fix, retaining progress. Targets outside the chapter's merged files remain unsupported.
+
+RTC 未校时时，微信读书对时服从同一取消标志及截止时间，并保留其他任务的网络/校时所有权。S31 此有界路径使用 NTP；如果网络封锁 UDP/NTP，可先在系统时间设置中用原有手动对时（含 HTTPS Date 备用）完成校时，再打开微信读书。
+When the RTC is invalid, WeRead time calibration follows its cancellation/deadline without preempting another owner. S31 uses NTP on this bounded path; if UDP/NTP is blocked, first use the existing system manual calibration (including its HTTPS Date fallback).
 
 根目录 `/sdcard/.kiikoread/weread`：
 Root `/sdcard/.kiikoread/weread`:
@@ -69,6 +87,9 @@ Root `/sdcard/.kiikoread/weread`:
 
 目录创建先核对现存目录，兼容FatFS挂载根目录不能mkdir的行为。FAT提交保留 `.previous`，中断后可恢复；退出删除凭据的主文件、临时文件和previous。封面支持 HTTPS/t6、404原图回退和5/15/45秒退避；首次开书预热真实封面。首页快速模式只保留1位封面，票根只读取成品缓存。
 Directory creation accepts existing directories before mkdir, including FatFS mount roots. FAT commits retain `.previous` for interrupted-rename recovery; logout removes primary, temporary and previous credentials. Covers support HTTPS/t6, original-size fallback after404 and5/15/45-second backoff, with real-art warming on open. Fast Home retains only1-bit art; tickets read finished rasters only.
+
+自导入封面允许最多三次显式 HTTPS 跳转到腾讯云等存储域；每跳重建头，外域剥离会话凭据，拒绝降级、循环超限和过长地址。支持 PNG/JPEG/WebP，HTTP200但解码失败也进入退避，避免重复下载阻塞其他任务。
+Imported covers may follow at most three explicit HTTPS redirects to storage hosts. Every hop rebuilds headers and strips credentials outside qq.com; downgrade, excessive loops and oversized URLs fail. PNG/JPEG/WebP are accepted; decode failures back off even after HTTP200.
 
 上限：JSON2MiB、书架1024本、目录20000章、下载32MiB、单条目8MiB、展开总量64MiB、正文4MiB、CSS256KiB、位置锚点16384。旧完整目录由清理操作回收。
 Limits:2MiB JSON,1024 shelf books,20000 chapters,32MiB downloads,8MiB entries,64MiB expanded data,4MiB body,256KiB CSS and16384 anchors. Explicit cleanup reclaims older committed directories.
@@ -87,5 +108,5 @@ C tests use ASan/UBSan. Constrained-pool tests cover800 staged books,3000 chapte
 双板使用 `tools/build_firmware.py --board all` 独立构建与验证，产物仅放在ignored build目录。菜单调度和冷解析按体积编译，阅读绘制及图片热路径保持O2；没有扩大分区、删字库或改变波形/供电。保留正式版本号，不覆盖已发布下载、不自动刷机、不发布。
 Build/verify both boards independently with `tools/build_firmware.py --board all`; outputs stay under ignored build directories. Size-optimize menu dispatch/cold parsing while keeping reader/image paint hot paths atO2. Partitions, fonts, waveforms and power remain intact. Keep published version numbers without replacing downloads, flashing or publishing.
 
-实机待验：真实扫码/续期、手机与设备双向位置、双板正文与封面实屏、慢网切章、拔卡/换卡、浅睡与深睡恢复。宿主测试不构成这些验收。
-Device acceptance remains: real QR/renewal, phone/device positions both ways, both panels' text/covers, slow-network chapter changes, media loss/replacement and light/deep sleep. Host results do not constitute these checks.
+Pico本轮用户已确认书架更流畅、从目录找回的位置退书重开后保持，自导入封面此前已确认正常；旧86%位置未做估算恢复。仍待长时验证：会话续期、手机与设备交替阅读、S31正文及封面实屏、慢网切章、拔卡/换卡、浅睡与深睡恢复。宿主测试不构成这些验收。
+Device acceptance remains: updated session renewal, phone/device positions both ways (including the reported86%-to-start mismatch), S31 text and both panels' covers, slow-network chapter changes, media loss/replacement and light/deep sleep. Host results do not constitute these checks.

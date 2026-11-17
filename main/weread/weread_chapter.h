@@ -9,6 +9,7 @@
 #define WEREAD_ERR_PURCHASE 0x7901
 #define WEREAD_ERR_SOLD_OUT 0x7902
 #define WEREAD_ERR_VERSION 0x7903
+#define WEREAD_ERR_POSITION 0x7904
 
 void weread_chapter_set_cancel(weread_cancel_fn fn, void *ctx);
 esp_err_t weread_chapter_download(const char *book_id, uint32_t uid);

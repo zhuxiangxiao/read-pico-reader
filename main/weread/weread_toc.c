@@ -121,7 +121,6 @@ esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
     uint64_t new_key = 0, clear = 0;
     cJSON *updated = cJSON_GetObjectItemCaseSensitive(entry, "updated");
     cJSON *removed = cJSON_GetObjectItemCaseSensitive(entry, "removed");
-    ESP_LOGI("weread","TOC response result=%d entries=%d matched=%d updated=%d clear_type=%d",(int)err,cJSON_GetArraySize(data),entry!=NULL,cJSON_GetArraySize(updated),cJSON_GetObjectItemCaseSensitive(entry,"clearAll")?cJSON_GetObjectItemCaseSensitive(entry,"clearAll")->type:0);
     if (err == ESP_OK && (!entry || !wr_uint(entry, "synckey", &new_key) ||
         !wr_uint(entry, "clearAll", &clear) || clear > 1 || !cJSON_IsArray(updated) ||
         (removed && !cJSON_IsArray(removed)))) err = ESP_ERR_INVALID_RESPONSE;
@@ -133,7 +132,7 @@ esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
     cJSON *array = cJSON_GetObjectItemCaseSensitive(next, "chapters");
     if (err == ESP_OK) cJSON_ArrayForEach(v, updated) {
         weread_chapter_info_t parsed;
-        if (!chapter(v, &parsed)) {ESP_LOGW("weread","TOC chapter rejected uid_type=%d idx_type=%d title=%d",cJSON_GetObjectItem(v,"chapterUid")?cJSON_GetObjectItem(v,"chapterUid")->type:0,cJSON_GetObjectItem(v,"chapterIdx")?cJSON_GetObjectItem(v,"chapterIdx")->type:0,cJSON_IsString(cJSON_GetObjectItem(v,"title")));err = ESP_ERR_INVALID_RESPONSE; break; }
+        if (!chapter(v, &parsed)) { err = ESP_ERR_INVALID_RESPONSE; break; }
         cJSON *existing = find(array, parsed.uid);
         cJSON *copy = cJSON_Duplicate(v, true);
         if (!copy) { err = ESP_ERR_NO_MEM; break; }
@@ -165,6 +164,5 @@ esp_err_t weread_toc_sync(const char *id) { WR_GUARD;
     if (err == ESP_OK) err = wr_write_json(path, next);
     weread_toc_free(&check);
     cJSON_Delete(old); cJSON_Delete(req); cJSON_Delete(response); cJSON_Delete(next);
-    ESP_LOGI("weread","TOC result=%d",(int)err);
     return err;
 }

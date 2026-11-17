@@ -638,6 +638,8 @@ static int64_t s_profile_confirm_after;
 // 对时独占 SNTP 与临时 WiFi；取消后等待清理完成，才允许拆网络或睡眠。
 // Time sync owns SNTP/temporary WiFi; wait for cleanup before network teardown or sleep.
 static bool s_time_active, s_time_automatic, s_time_cancel;
+static bool (*s_time_owner_cancel)(void *);
+static void *s_time_owner_ctx;
 static uint32_t s_time_pending_utc;
 static bool cancel_time_sync(bool automatic_only) {
     portENTER_CRITICAL(&s_lock);
@@ -655,8 +657,12 @@ static bool cancel_time_sync(bool automatic_only) {
     return true;
 }
 static bool time_sync_cancelled(void) {
-    portENTER_CRITICAL(&s_lock); bool cancelled = s_time_cancel; portEXIT_CRITICAL(&s_lock);
-    return cancelled;
+    portENTER_CRITICAL(&s_lock);
+    bool cancelled = s_time_cancel;
+    bool (*owner_cancel)(void *) = s_time_owner_cancel;
+    void *ctx = s_time_owner_ctx;
+    portEXIT_CRITICAL(&s_lock);
+    return cancelled || (owner_cancel && owner_cancel(ctx));
 }
 static esp_err_t sync_time_online_impl(uint32_t *utc_seconds);
 static EventGroupHandle_t s_time_events;
@@ -818,9 +824,11 @@ static esp_err_t sync_network_time(uint32_t *utc_seconds) {
     err=esp_wifi_set_ps(WIFI_PS_NONE);
     if(err!=ESP_OK) return err;
     ESP_LOGI("time_sync","WiFi power save suspended previous=%d",previous_ps);
-    err=transfer_sync_time_ntp_cancelable(utc_seconds,time_sync_cancelled);
+    err=s_time_owner_cancel ? transfer_sync_time_ntp_bounded(utc_seconds,time_sync_cancelled) :
+        transfer_sync_time_ntp_cancelable(utc_seconds,time_sync_cancelled);
+    // 新调用方有自己的截止时间；不进入同步DNS/HTTPS备用路径。/ Owner deadlines cannot enter blocking DNS/HTTPS fallbacks.
     if(err!=ESP_OK && err!=ESP_ERR_NO_MEM && err!=ESP_ERR_INVALID_ARG &&
-       !s_time_automatic && !time_sync_cancelled())
+       !s_time_owner_cancel && !s_time_automatic && !time_sync_cancelled())
         err=transfer_sync_time_https(utc_seconds);
     esp_err_t restore=esp_wifi_set_ps(previous_ps);
     if(restore!=ESP_OK) ESP_LOGW("time_sync","WiFi power save restore result=%s",esp_err_to_name(restore));
@@ -953,12 +961,13 @@ static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     return sync_network_time(utc_seconds);
 }
 
-static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+static esp_err_t sync_time_run_cancelable(uint32_t *utc_seconds, bool online_only, bool automatic,
+    bool (*owner_cancel)(void *), void *ctx) {
     if (!utc_seconds) return ESP_ERR_INVALID_ARG;
     *utc_seconds = 0;
     // 手动操作优先于自动任务；配置和对时的准入在同一个锁下，防止双初始化。
     // Manual actions preempt automatic work; one lock admits configuration and time ownership.
-    if (!automatic && !cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
+    if (owner_cancel ? owner_cancel(ctx) : (!automatic && !cancel_time_sync(true))) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_lock);
     bool available = !s_config_busy && !s_time_active && !s_stopping;
     // 停服的 s_stopping 是正常状态，已有资源则仍拒绝正在拆除的网络。
@@ -969,15 +978,28 @@ static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool aut
         s_config_busy = s_time_active = true;
         s_time_automatic = automatic;
         s_time_cancel = false;
+        s_time_owner_cancel = owner_cancel;
+        s_time_owner_ctx = ctx;
     }
     portEXIT_CRITICAL(&s_lock);
     if (!available) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
+    esp_err_t err = time_sync_cancelled() ? ESP_ERR_INVALID_STATE :
+        online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
+    if (time_sync_cancelled()) { err = ESP_ERR_INVALID_STATE; *utc_seconds = 0; }
     portENTER_CRITICAL(&s_lock);
     if (err == ESP_OK) s_time_pending_utc = *utc_seconds;
+    s_time_owner_cancel = NULL; s_time_owner_ctx = NULL;
     s_time_active = s_time_automatic = s_config_busy = false;
     portEXIT_CRITICAL(&s_lock);
     return err;
+}
+static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+    return sync_time_run_cancelable(utc_seconds, online_only, automatic, NULL, NULL);
+}
+esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc_seconds,
+    bool (*cancelled)(void *), void *ctx) {
+    if (!cancelled) return ESP_ERR_INVALID_ARG;
+    return sync_time_run_cancelable(utc_seconds, true, false, cancelled, ctx);
 }
 esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
     return sync_time_run(utc_seconds, false, false);
@@ -2468,6 +2490,8 @@ static int64_t s_profile_confirm_after;
 // 对时独占 SNTP 与临时 WiFi；取消后等待清理完成，才允许拆网络或睡眠。
 // Time sync owns SNTP/temporary WiFi; wait for cleanup before network teardown or sleep.
 static bool s_time_active, s_time_automatic, s_time_cancel;
+static bool (*s_time_owner_cancel)(void *);
+static void *s_time_owner_ctx;
 static uint32_t s_time_pending_utc;
 static bool cancel_time_sync(bool automatic_only) {
     portENTER_CRITICAL(&s_lock);
@@ -2485,8 +2509,12 @@ static bool cancel_time_sync(bool automatic_only) {
     return true;
 }
 static bool time_sync_cancelled(void) {
-    portENTER_CRITICAL(&s_lock); bool cancelled = s_time_cancel; portEXIT_CRITICAL(&s_lock);
-    return cancelled;
+    portENTER_CRITICAL(&s_lock);
+    bool cancelled = s_time_cancel;
+    bool (*owner_cancel)(void *) = s_time_owner_cancel;
+    void *ctx = s_time_owner_ctx;
+    portEXIT_CRITICAL(&s_lock);
+    return cancelled || (owner_cancel && owner_cancel(ctx));
 }
 static esp_err_t sync_time_online_impl(uint32_t *utc_seconds);
 static esp_err_t time_sync_ntp(uint32_t *utc_seconds) {
@@ -2734,12 +2762,13 @@ static esp_err_t sync_time_online_impl(uint32_t *utc_seconds) {
     return time_sync_ntp(utc_seconds);
 }
 
-static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+static esp_err_t sync_time_run_cancelable(uint32_t *utc_seconds, bool online_only, bool automatic,
+    bool (*owner_cancel)(void *), void *ctx) {
     if (!utc_seconds) return ESP_ERR_INVALID_ARG;
     *utc_seconds = 0;
     // 手动操作优先于自动任务；配置和对时的准入在同一个锁下，防止双初始化。
     // Manual actions preempt automatic work; one lock admits configuration and time ownership.
-    if (!automatic && !cancel_time_sync(true)) return ESP_ERR_INVALID_STATE;
+    if (owner_cancel ? owner_cancel(ctx) : (!automatic && !cancel_time_sync(true))) return ESP_ERR_INVALID_STATE;
     portENTER_CRITICAL(&s_lock);
     bool available = !s_config_busy && !s_time_active && !s_stopping;
     // 停服的 s_stopping 是正常状态，已有资源则仍拒绝正在拆除的网络。
@@ -2750,15 +2779,28 @@ static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool aut
         s_config_busy = s_time_active = true;
         s_time_automatic = automatic;
         s_time_cancel = false;
+        s_time_owner_cancel = owner_cancel;
+        s_time_owner_ctx = ctx;
     }
     portEXIT_CRITICAL(&s_lock);
     if (!available) return ESP_ERR_INVALID_STATE;
-    esp_err_t err = online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
+    esp_err_t err = time_sync_cancelled() ? ESP_ERR_INVALID_STATE :
+        online_only ? sync_time_online_impl(utc_seconds) : sync_time_impl(utc_seconds);
+    if (time_sync_cancelled()) { err = ESP_ERR_INVALID_STATE; *utc_seconds = 0; }
     portENTER_CRITICAL(&s_lock);
     if (err == ESP_OK) s_time_pending_utc = *utc_seconds;
+    s_time_owner_cancel = NULL; s_time_owner_ctx = NULL;
     s_time_active = s_time_automatic = s_config_busy = false;
     portEXIT_CRITICAL(&s_lock);
     return err;
+}
+static esp_err_t sync_time_run(uint32_t *utc_seconds, bool online_only, bool automatic) {
+    return sync_time_run_cancelable(utc_seconds, online_only, automatic, NULL, NULL);
+}
+esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc_seconds,
+    bool (*cancelled)(void *), void *ctx) {
+    if (!cancelled) return ESP_ERR_INVALID_ARG;
+    return sync_time_run_cancelable(utc_seconds, true, false, cancelled, ctx);
 }
 esp_err_t read_pico_transfer_sync_time(uint32_t *utc_seconds) {
     return sync_time_run(utc_seconds, false, false);

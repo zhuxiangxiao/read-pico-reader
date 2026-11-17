@@ -19,6 +19,7 @@ typedef struct {
     esp_err_t error;
     bool authenticated, conflict, open_ready, noted;
     int qr_state, http_status;
+    unsigned cover_retry_seconds;
     char id[64], uid[64], qr_url[256], nickname[64];
     weread_book_t *books;
     size_t count;
@@ -38,6 +39,7 @@ void weread_runtime_result_free(weread_result_t *result);
 void weread_runtime_cancel_join(void);
 void weread_runtime_stop(void);
 void weread_runtime_media_lost(void);
+unsigned weread_runtime_cache_epoch(void);
 /// 仅本地读取凭据/书架，供首页、票根和开机恢复使用。/ Load credentials/shelf locally for home, tickets and boot resume.
 void weread_runtime_load_local(void);
 esp_err_t weread_runtime_connect(void *ctx);
@@ -46,6 +48,8 @@ esp_err_t weread_runtime_connect(void *ctx);
 esp_err_t weread_reader_prepare(const char *uri, size_t chapter);
 esp_err_t weread_reader_prepare_open(const char *uri);
 void weread_reader_begin(const char *uri, uint64_t now_ms);
+/// 仅成功翻页/跳转后调用；排版与首次显示不算导航。/ Mark committed navigation, never initial paint or reflow.
+void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary);
 esp_err_t weread_reader_resume(const char *uri, size_t *chapter, uint32_t *offset);
 void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsigned percent,
     const char *summary, uint64_t now_ms, bool active);

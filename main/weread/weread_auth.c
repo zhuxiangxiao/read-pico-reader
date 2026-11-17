@@ -198,8 +198,6 @@ esp_err_t weread_auth_start_qr_login(char *out_uid, size_t uid_cap, char *out_qr
     int status = 0;
 
     esp_err_t err = weread_client_request(url, "GET", headers, NULL, &resp, &resp_len, &status);
-    // 只记录状态和长度，不记录登录UID/响应或令牌。/ Log status and lengths, never login UIDs, bodies or tokens.
-    ESP_LOGI("weread", "QR response result=%d http=%d bytes=%u", (int)err, status, (unsigned)resp_len);
     if (err != ESP_OK || !resp || status != 200) {
         if (resp) free(resp);
         return ESP_FAIL;
@@ -221,7 +219,6 @@ esp_err_t weread_auth_start_qr_login(char *out_uid, size_t uid_cap, char *out_qr
     }
 
     if (!uid_item || !cJSON_IsString(uid_item) || !credential(uid_item->valuestring, WEREAD_UID_MAX_LEN, true)) {
-        ESP_LOGW("weread", "QR response has no usable UID");
         cJSON_Delete(root);
         return ESP_FAIL;
     }
@@ -287,7 +284,6 @@ esp_err_t weread_auth_poll_qr_login(const char *uid, weread_qr_state_t *out_stat
 
     esp_err_t err = weread_client_request(url, "POST", headers, body, &resp, &resp_len, &status);
     cJSON_free(body);
-    ESP_LOGI("weread", "poll response result=%d http=%d bytes=%u", (int)err, status, (unsigned)resp_len);
     if (err != ESP_OK) {
         *out_state = WEREAD_QR_STATE_ERROR;
         if (resp) free(resp);
@@ -382,10 +378,6 @@ esp_err_t weread_auth_poll_qr_login(const char *uid, weread_qr_state_t *out_stat
         else *out_state=WEREAD_QR_STATE_ERROR;
     }
 
-    cJSON *api_error=auth_alias(root,(const char *const[]){"errCode","errcode",NULL});(void)api_error;
-    ESP_LOGI("weread", "poll state=%u has_code=%d has_vid=%d has_key=%d api_error=%d",
-        (unsigned)*out_state,cJSON_IsString(code_item),vid_item!=NULL,cJSON_IsString(skey_item),
-        cJSON_IsNumber(api_error)?api_error->valueint:0);
     cJSON_Delete(root);
     return ESP_OK;
 }
@@ -430,7 +422,6 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
 
     esp_err_t err = weread_client_request(url, "POST", headers, body_str, &resp, &resp_len, &status);
     free(body_str);
-    ESP_LOGI("weread", "login exchange result=%d http=%d bytes=%u", (int)err, status, (unsigned)resp_len);
 
     if (err != ESP_OK || !resp || status != 200) {
         if (resp) free(resp);
@@ -440,7 +431,6 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
     cJSON *root = wr_parse_json(resp,resp_len + 1);
     free(resp);
     if (!root) {
-        ESP_LOGW("weread", "login exchange has invalid JSON");
         return ESP_FAIL;
     }
 
@@ -453,7 +443,6 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
     if (!token_item || !cJSON_IsString(token_item) ||
         !credential(token_item->valuestring, WEREAD_TOKEN_MAX_LEN, true) ||
         (refresh_item && (!cJSON_IsString(refresh_item) || !credential(refresh_item->valuestring, WEREAD_TOKEN_MAX_LEN, true)))) {
-        ESP_LOGW("weread", "login exchange has no usable token");
         cJSON_Delete(root);
         return ESP_FAIL;
     }
@@ -486,7 +475,6 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
     candidate.updated_at = (int64_t)time(NULL);
 
     esp_err_t saved = weread_auth_save_session(&candidate);
-    ESP_LOGI("weread", "login persistence result=%d",(int)saved);
     if (saved != ESP_OK) {
         weread_secure_zero(&candidate, sizeof(candidate)); cJSON_Delete(root); return saved;
     }
@@ -557,7 +545,10 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_GUARD;
     if (!tok_item) tok_item = cJSON_GetObjectItem(root, "skey");
 
     if (!tok_item || !cJSON_IsString(tok_item) || !credential(tok_item->valuestring, WEREAD_TOKEN_MAX_LEN, true)) {
+        const cJSON *code = auth_alias(root,(const char *const[]){"errCode","errcode","ret",NULL});
+        bool revoked = cJSON_IsNumber(code) && code->valuedouble == WEREAD_AUTH_ERRCODE_EXPIRED;
         cJSON_Delete(root);
+        if (revoked) { weread_auth_clear_session(); return ESP_ERR_INVALID_STATE; }
         return ESP_FAIL;
     }
 

@@ -27,3 +27,5 @@ static inline bool transfer_ntp_reply(const uint8_t *packet,size_t size,const ui
 esp_err_t transfer_sync_time_ntp(uint32_t *utc_seconds);
 
 esp_err_t transfer_sync_time_ntp_cancelable(uint32_t *utc_seconds, bool (*cancelled)(void));
+/// 在线调用方有截止时间时使用异步DNS；取消不保留任务栈地址。/ Async DNS for callers with deadlines; late callbacks never retain their stack.
+esp_err_t transfer_sync_time_ntp_bounded(uint32_t *utc_seconds, bool (*cancelled)(void));

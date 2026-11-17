@@ -48,6 +48,13 @@ int main(int argc, char **argv) {
     assert(strstr(url, "https://weread.qq.com/web/confirm?pf=2&uid="));
     assert(weread_auth_poll_qr_login(uid, &state, code, sizeof(code)) == ESP_OK && state == WEREAD_QR_STATE_CONFIRMED);
     assert(weread_auth_exchange_code(code, NULL) == ESP_OK && weread_auth_is_authenticated());
+    // 自导入封面按原生地址跳到外域时剥离凭据，拒绝降级、循环和超长Location。
+    // Native imported covers redirect without leaking credentials; reject downgrade, loops and oversized locations.
+    FILE *cover_file=tmpfile();assert(cover_file);weread_download_info_t cover_info={0};
+    assert(weread_client_download("https://res.weread.qq.com/mock/cover-native",cover_file,64,NULL,NULL,&cover_info)==ESP_OK&&cover_info.status==200&&cover_info.bytes==8);
+    char cover_bytes[8];rewind(cover_file);assert(fread(cover_bytes,1,8,cover_file)==8&&!memcmp(cover_bytes,"\xff\xd8\xff" "cover",8));fclose(cover_file);
+    const char *bad_covers[]={"https://res.weread.qq.com/mock/cover-loop","https://res.weread.qq.com/mock/cover-insecure","https://res.weread.qq.com/mock/cover-long"};
+    for(size_t i=0;i<sizeof(bad_covers)/sizeof(*bad_covers);++i){cover_file=tmpfile();assert(cover_file);assert(weread_client_download(bad_covers[i],cover_file,64,NULL,NULL,&cover_info)!=ESP_OK);fclose(cover_file);}
     assert(weread_shelf_sync(true) == ESP_OK && weread_shelf_count() == 2);
     assert(weread_toc_sync("test_book_101") == ESP_OK);
     assert(book_weread_open("weread://test_book_101") == ESP_OK && book_weread_count() == 2);
@@ -70,12 +77,29 @@ int main(int argc, char **argv) {
     // 页面真实任务链：快照、冲突、开书、读秒、强制存盘与关闭射频。/ Exercise real page jobs, choices, time accounting, persistence and shutdown.
     weread_runtime_init();assert(weread_runtime_start(WR_JOB_INIT,NULL,NULL));
     weread_result_t result=completion();assert(result.error==ESP_OK&&result.authenticated&&result.count==2);weread_runtime_result_free(&result);
-    control("{\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50,\"updateTime\":2000000000}}}");
+    // 首次未读与显式选择空云端进度都从真实首章开始。/ Unread and explicitly chosen empty cloud positions use the first chapter.
+    control("{\"progress_data\":{\"txt_book_202\":{}}}");
+    assert(weread_runtime_start(WR_JOB_OPEN,"txt_book_202",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(book_weread_open("weread://txt_book_202")==ESP_OK);
+    size_t unread_chapter=SIZE_MAX;uint32_t unread_offset=UINT32_MAX;
+    assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset==0);
+    book_weread_close();
+    assert(weread_progress_note("txt_book_202",1,1,3,25,0,1,"",1700000100)==ESP_OK);
+    assert(weread_runtime_start(WR_JOB_OPEN,"txt_book_202",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.conflict);cloud=result.cloud;weread_runtime_result_free(&result);
+    assert(weread_runtime_choose("txt_book_202",&cloud,true));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(book_weread_open("weread://txt_book_202")==ESP_OK);
+    assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset==0);
+    book_weread_close();
+    control("{\"progress_data\":{\"test_book_101\":{\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":3,\"progress\":50,\"updateTime\":2000000000}}}");
     assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
     assert(result.error==ESP_OK&&result.conflict&&!result.open_ready);
     if(result.conflict){
-        weread_progress_t choice=result.local;weread_runtime_result_free(&result);
-        assert(weread_runtime_choose("test_book_101",&choice,false));result=completion();
+        // 合法云端进度未带bookVersion，准备时绑定目录版本。/ Bind a valid cloud reply that omits bookVersion.
+        weread_progress_t choice=result.cloud;assert(!choice.book_version);weread_runtime_result_free(&result);
+        assert(weread_runtime_choose("test_book_101",&choice,true));result=completion();
     }
     assert(result.open_ready);weread_runtime_result_free(&result);
     assert(book_weread_prepared("test_book_101"));
@@ -88,6 +112,7 @@ int main(int argc, char **argv) {
     weread_reader_begin("weread://test_book_101",1000);
     assert(book_weread_load(0,NULL,NULL,&text)==ESP_OK);
     offset=(uint32_t)(strstr(text.utf8,"微风")-text.utf8);
+    weread_reader_navigated("weread://test_book_101",0,offset,17,text.utf8+offset);
     control("{\"endpoint_errors\":{\"/book/read\":{\"status\":503}}}");
     for(unsigned i=0;i<=5;++i){
         weread_reader_tick("weread://test_book_101",0,offset,17,text.utf8+offset,1000+i*200,true);
@@ -109,6 +134,48 @@ int main(int argc, char **argv) {
     assert(weread_reader_prepare("weread://test_book_101",1)==ESP_OK);
     assert(book_weread_load(1,NULL,NULL,&next)==ESP_OK&&strstr(next.utf8,"预读成功")&&offline_downloads==old_downloads);
     html_text_free(&next);weread_client_set_download_transport(NULL,NULL);
+    // 阅读中-2063自愈换版本，NVS仍是旧身份；冷恢复必须使用TF的UID/UTF16位置。
+    // A mid-read version retry changes the NVS identity; cold resume must use the TF UID/UTF16 record.
+    struct stat old_identity,new_identity;assert(book_weread_stat("weread://test_book_101",&old_identity));
+    char chapter_manifest[512];snprintf(chapter_manifest,sizeof(chapter_manifest),"%s/cache/test_book_101/chapter-2.json",argv[1]);
+    assert(!unlink(chapter_manifest));
+    control("{\"book_version\":101,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":101},{\"bookId\":\"txt_book_202\",\"bookVersion\":100}]}");
+    assert(weread_reader_prepare("weread://test_book_101",1)==ESP_OK);
+    assert(book_weread_load(1,NULL,NULL,&next)==ESP_OK);
+    uint32_t next_offset=(uint32_t)(strstr(next.utf8,"预读成功")-next.utf8);
+    weread_reader_navigated("weread://test_book_101",1,next_offset,86,next.utf8+next_offset);
+    weread_reader_tick("weread://test_book_101",1,next_offset,86,next.utf8+next_offset,3800,false);
+    weread_reader_flush(3800,true);
+    assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.chapter_uid==2&&local.book_version==101);
+    assert(book_weread_stat("weread://test_book_101",&new_identity)&&old_identity.st_size!=new_identity.st_size);
+    html_text_free(&next);weread_reader_end(3800);book_weread_close();
+    assert(weread_reader_prepare_open("weread://test_book_101")==ESP_OK);
+    assert(book_weread_open("weread://test_book_101")==ESP_OK);
+    chapter=0;offset=0;
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1&&offset==next_offset);
+    weread_progress_t valid_position=local;
+    local.book_version=100;assert(weread_progress_select("test_book_101",&local,true)==ESP_OK);
+    chapter=42;offset=99;assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_ERR_INVALID_RESPONSE&&chapter==42&&offset==99);
+    local=valid_position;local.chapter_uid=999;assert(weread_progress_select("test_book_101",&local,true)==ESP_OK);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_ERR_INVALID_RESPONSE&&chapter==42&&offset==99);
+    assert(weread_progress_select("test_book_101",&valid_position,true)==ESP_OK);
+    weread_auth_session_t account=*weread_auth_get_current_session(),other=account;strcpy(other.vid,"999");
+    assert(weread_auth_save_session(&other)==ESP_OK&&weread_auth_load_session(&other)==ESP_OK);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_ERR_INVALID_RESPONSE);
+    assert(weread_auth_save_session(&account)==ESP_OK&&weread_auth_load_session(&account)==ESP_OK);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1&&offset==next_offset);
+    // 版本0仍是有效unknown身份；只拒绝与当前目录不同的版本。
+    // Zero remains a valid unknown version when it matches the current TOC.
+    book_weread_close();
+    control("{\"book_version\":0,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0},{\"bookId\":\"txt_book_202\",\"bookVersion\":1}],\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50}}}");
+    assert(weread_shelf_refresh_book("test_book_101")==ESP_OK);
+    assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.conflict);cloud=result.cloud;weread_runtime_result_free(&result);
+    assert(weread_runtime_choose("test_book_101",&cloud,true));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(book_weread_open("weread://test_book_101")==ESP_OK);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
+    assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     // shutdown中断阻塞响应；取消后可重新创建任务。/ Shutdown interrupts blocked responses and permits worker restart.
     control("{\"latency\":1.5}");
     assert(weread_runtime_start(WR_JOB_SYNC,NULL,NULL));usleep(150000);

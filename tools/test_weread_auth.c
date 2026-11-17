@@ -582,6 +582,49 @@ static void test_transient_and_untrusted_errors(void) {
     puts("  -> Transient errors, external responses and credential encoding passed.");
 }
 
+static void test_http401_session_classification(void) {
+    const char *bodies[] = {"{\"errcode\":-2013}", "{\"errCode\":-2013}",
+        "{\"ret\":-2013}", "{\"errcode\":-2012}", "{}"};
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(*bodies); ++i) {
+        weread_auth_session_t session = {0};
+        strcpy(session.vid, "123"); strcpy(session.access_token, "old-token");
+        strcpy(session.refresh_token, "refresh-token");
+        assert(weread_auth_save_session(&session) == ESP_OK);
+        assert(weread_auth_load_session(&session) == ESP_OK);
+        mock_http_reset();
+        mock_http_add_rule("/shelf/sync", "GET", 401, bodies[i], ESP_OK);
+        mock_http_add_rule("/weblogin", "POST", 200, "{\"accessToken\":\"new-token\"}", ESP_OK);
+        mock_http_add_rule("/shelf/sync", "GET", 401, bodies[i], ESP_OK);
+        char *response = NULL; size_t length = 0; int status = 0;
+        assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL,
+            &response, &length, &status) != ESP_OK);
+        assert(status == 401 && response && length == strlen(bodies[i])); free(response);
+        assert(s_mock_ctx.total_dispatched_requests == 3);
+        // Only explicit revocation erases credentials, including their persisted copy.
+        assert(weread_auth_is_authenticated() == (i >= 3));
+        weread_auth_session_t loaded = {0};
+        assert((weread_auth_load_session(&loaded) == ESP_OK) == (i >= 3));
+    }
+    const char *renewals[] = {"{\"errcode\":-2013}", "{\"ret\":-2012}", "{}", NULL};
+    for (size_t i = 0; i < sizeof(renewals) / sizeof(*renewals); ++i) {
+        weread_auth_session_t session = {0};
+        strcpy(session.vid, "123"); strcpy(session.access_token, "old-token");
+        strcpy(session.refresh_token, "refresh-token");
+        assert(weread_auth_save_session(&session) == ESP_OK);
+        assert(weread_auth_load_session(&session) == ESP_OK);
+        mock_http_reset();
+        mock_http_add_rule("/shelf/sync", "GET", 401, "{\"errcode\":-2012}", ESP_OK);
+        mock_http_add_rule("/weblogin", "POST", 401, renewals[i], i == 3 ? ESP_ERR_TIMEOUT : ESP_OK);
+        char *response = NULL;
+        assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL,
+            &response, NULL, NULL) != ESP_OK); free(response);
+        assert(s_mock_ctx.total_dispatched_requests == 2);
+        assert(weread_auth_is_authenticated() == (i != 0));
+        assert((weread_auth_load_session(&session) == ESP_OK) == (i != 0));
+    }
+    puts("  -> HTTP401 revocation aliases and transient replay preservation passed.");
+}
+
 static void test_storage_failure_and_recovery(const char *dir) {
     char path[512], tmp[512], previous[512];
     snprintf(path, sizeof(path), "%s/auth.json", dir);
@@ -621,6 +664,7 @@ int main(void) {
     test_corrupted_auth_json_resilience(temp_dir);
     test_session_renewal_and_single_replay();
     test_replay_limit_guard_infinite_loop_prevention();
+    test_http401_session_classification();
     test_transient_and_untrusted_errors();
     test_storage_failure_and_recovery(temp_dir);
 
@@ -635,7 +679,7 @@ int main(void) {
     rmdir(temp_dir);
 
     printf("========================================================\n");
-    printf(" ALL 10 AUTH TEST GROUPS PASSED SUCCESSFULLY! (Zero errors)\n");
+    printf(" ALL 11 AUTH TEST GROUPS PASSED SUCCESSFULLY! (Zero errors)\n");
     printf("========================================================\n");
     return 0;
 }

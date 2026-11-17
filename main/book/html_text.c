@@ -308,6 +308,63 @@ static bool attr_value(const char* at, const char* end, const char* wanted,
     return false;
 }
 
+// 先登记真正被引用的目标，普通段落id不占脚注槽；复用原有固定数组。
+// Reserve the existing fixed slots for referenced targets rather than unrelated paragraph IDs.
+static void note_targets(writer_t* w, const char* html, size_t len) {
+    bool head = false;
+    for (size_t pos = 0; pos < len && w->note_id_count < 16; ++pos) {
+        if (html[pos] != '<') continue;
+        if (len - pos >= 4 && !memcmp(html + pos, "<!--", 4)) {
+            const char* end = bounded_case_find(html + pos + 4, html + len, "-->");
+            if (!end) return;
+            pos = (size_t)(end - html) + 2; continue;
+        }
+        size_t at = pos + 1;
+        bool closing = at < len && html[at] == '/';
+        if (closing) ++at;
+        if (at == len || lower((unsigned char)html[at]) < 'a' || lower((unsigned char)html[at]) > 'z') continue;
+        size_t start = at;
+        while (at < len && name_char((unsigned char)html[at])) ++at;
+        size_t name_len = at - start, end = at; char quote = 0;
+        for (; end < len; ++end) {
+            char c = html[end];
+            if (quote) { if (c == quote) quote = 0; }
+            else if (c == '\'' || c == '"') quote = c;
+            else if (c == '>') break;
+        }
+        // 有效标签截断时只扫描一次，主解析器随后返回错误；普通小于号不走此路径。
+        // Scan an unterminated tag once; the main parser reports it. Literal less-than signs do not enter this path.
+        if (end == len) return;
+        pos = end;
+        bool self_closing = end > at && html[end - 1] == '/';
+        if (name_len == 4 && !strncasecmp(html + start, "head", 4)) { if (!self_closing) head = !closing; continue; }
+        if (!closing && !self_closing && ((name_len == 6 && !strncasecmp(html + start, "script", 6)) ||
+                         (name_len == 5 && !strncasecmp(html + start, "style", 5)))) {
+            const char* marker = name_len == 6 ? "</script" : "</style";
+            const char* stop = html + end + 1;
+            size_t marker_len = strlen(marker);
+            do {
+                stop = bounded_case_find(stop, html + len, marker);
+                if (!stop) return;
+                stop += marker_len;
+            } while (stop < html + len && name_char((unsigned char)*stop));
+            pos = (size_t)(stop - html) - marker_len - 1; continue;
+        }
+        const char* href; size_t n;
+        if (head || closing || name_len != 1 || lower((unsigned char)html[start]) != 'a' ||
+            !attr_value(html + at, html + end, "href", &href, &n) ||
+            n < 2 || n > sizeof(w->note_ids[0].id) || *href++ != '#') continue;
+        --n;
+        if (n >= 7 && !memcmp(href, "noteref", 7)) continue;
+        size_t slot = 0;
+        while (slot < w->note_id_count && (strlen(w->note_ids[slot].id) != n || memcmp(w->note_ids[slot].id, href, n))) ++slot;
+        if (slot < w->note_id_count) continue;
+        memcpy(w->note_ids[slot].id, href, n); w->note_ids[slot].id[n] = 0;
+        w->note_ids[slot].start = w->note_ids[slot].end = w->note_ids[slot].depth = SIZE_MAX;
+        ++w->note_id_count;
+    }
+}
+
 static bool class_has(const char* classes, size_t len, const char* wanted) {
     size_t n = strlen(wanted);
     for (size_t i = 0; i < len;) {
@@ -743,6 +800,7 @@ static esp_err_t parse_notes(const char* html, size_t len,
     if ((!html && len) || (!css && css_len)) return ESP_ERR_INVALID_ARG;
     if (len > HTML_TEXT_MAX_BYTES) return ESP_ERR_INVALID_SIZE;
     writer_t w = {0};
+    note_targets(&w, html, len);
     w.observer = observer; w.observer_ctx = observer_ctx;
     w.fonts = fonts;
     w.ext_notes = ext;
@@ -891,16 +949,19 @@ static esp_err_t parse_notes(const char* html, size_t len,
                             w.note_image = -1;
                         }
                     }
-                    if (w.note_id_count < 16) {
+                    {
                         const char* idv = NULL; size_t idlen = 0;
-                        if (attr_value(html + at, html + end, "id", &idv, &idlen) && idlen &&
+                        if ((attr_value(html + at, html + end, "data-wr-note", &idv, &idlen) ||
+                             attr_value(html + at, html + end, "id", &idv, &idlen)) && idlen &&
                             idlen < sizeof(w.note_ids[0].id)) {
-                            memcpy(w.note_ids[w.note_id_count].id, idv, idlen);
-                            w.note_ids[w.note_id_count].id[idlen] = 0;
-                            w.note_ids[w.note_id_count].start = w.text.len;
-                            w.note_ids[w.note_id_count].end = SIZE_MAX;
-                            w.note_ids[w.note_id_count].depth = w.depth;
-                            ++w.note_id_count;
+                            for (size_t q = 0; q < w.note_id_count; ++q) {
+                                if (strlen(w.note_ids[q].id) != idlen || memcmp(w.note_ids[q].id, idv, idlen) ||
+                                    w.note_ids[q].start != SIZE_MAX) continue;
+                                w.note_ids[q].start = w.text.len;
+                                w.note_ids[q].end = SIZE_MAX;
+                                w.note_ids[q].depth = w.depth;
+                                break;
+                            }
                         }
                     }
                 }

@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 
 static cJSON *s_shelf;
 
@@ -125,6 +126,35 @@ size_t weread_shelf_count(void) { WR_GUARD;
 uint64_t weread_shelf_synckey(void) { WR_GUARD;
     return wr_owner_matches(s_shelf) ? number(s_shelf, "synckey") : 0;
 }
+bool weread_shelf_cache_fresh(uint64_t now){WR_GUARD;
+    uint64_t checked=wr_owner_matches(s_shelf)?number(s_shelf,"checkedAt"):0;
+    return checked>=1700000000&&now>=checked&&now-checked<300;
+}
+uint64_t weread_cover_key(const char *id,const char *url){WR_GUARD;
+    const weread_auth_session_t *session=weread_auth_get_current_session();
+    uint64_t key=UINT64_C(14695981039346656037);
+    const char *parts[]={session?session->vid:"",id?id:"",url?url:"","gray-v1-176x240"};
+    for(unsigned i=0;i<sizeof(parts)/sizeof(*parts);++i){
+        const unsigned char *p=(const unsigned char *)parts[i];
+        do{key=(key^*p)*UINT64_C(1099511628211);}while(*p++);
+    }
+    return key;
+}
+esp_err_t weread_cover_cache_path(const char *id,const char *kind,char *path,size_t cap){WR_GUARD;
+    if(!wr_owner_matches(s_shelf)||!wr_valid_id(id)||!kind||
+       (strcmp(kind,"img")&&strcmp(kind,"gray")&&strcmp(kind,"failed")))return ESP_ERR_INVALID_ARG;
+    const cJSON *book=find(books(s_shelf),id);if(!book)return ESP_ERR_NOT_FOUND;
+    char leaf[64];snprintf(leaf,sizeof(leaf),"cover-%016" PRIx64 ".%s",weread_cover_key(id,wr_string(book,"cover")),kind);
+    return wr_cache_path(id,leaf,path,cap);
+}
+bool weread_cover_is_original(const char *id,const char *url){WR_GUARD;
+    const char *raw=wr_owner_matches(s_shelf)?wr_string(find(books(s_shelf),id),"cover"):NULL;
+    if(!raw||!url||strncmp(url,"https://",8))return false;
+    if(!strncmp(raw,"http://",7))raw+=7;
+    else if(!strncmp(raw,"https://",8))raw+=8;
+    else return false;
+    return !strcmp(raw,url+8);
+}
 static bool decode(const cJSON *b, weread_book_t *out) {
     if (!b || !out) return false;
     memset(out, 0, sizeof(*out));
@@ -195,7 +225,8 @@ void weread_shelf_sync_progress(size_t *done,size_t *total,size_t *skipped){
 static esp_err_t sync_begin(bool full){
     weread_shelf_sync_discard();s_sync_done=s_sync_total=s_sync_skipped=0;
     if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
-    if(!wr_owner_matches(s_shelf))full=true;
+    // 首批缓存仍为key0，重启同步时必须重建完整集合。/ A first-batch key0 cache must rebuild the complete set when restarted.
+    if(!weread_shelf_synckey())full=true;
     s_sync.base_key=full?0:weread_shelf_synckey();
     s_sync.next=full?cJSON_CreateObject():cJSON_Duplicate(s_shelf,true);
     if(!s_sync.next)return ESP_ERR_NO_MEM;
@@ -217,7 +248,6 @@ static esp_err_t sync_begin(bool full){
         if(cJSON_GetArraySize(s_sync.pending)>WEREAD_SHELF_LIMIT){err=ESP_ERR_INVALID_SIZE;break;}
     }
     s_sync.count=(size_t)cJSON_GetArraySize(s_sync.pending);s_sync_total=s_sync.count;
-    ESP_LOGI("weread","shelf IDs result=%d ids=%u books=%d",(int)err,(unsigned)s_sync.count,cJSON_GetArraySize(array));
     return err;
 }
 static esp_err_t sync_advance(size_t batch_limit,bool publish){
@@ -235,11 +265,11 @@ static esp_err_t sync_advance(size_t batch_limit,bool publish){
         if(err==ESP_OK)err=merge_response(array,detail);
         for(size_t j=s_sync.cursor;j<end&&err==ESP_OK;++j){
             const char *id=item_id(cJSON_GetArrayItem(s_sync.pending,(int)j));
-            if(!find(array,id)&&!find(books(detail),id)){
+            // 旧缓存不能代替本轮详情；明确不可读的详情已由merge_book移除。/ Old cache is not this batch's detail; merge_book already removes explicit unsupported formats.
+            if(!find(books(detail),id)){
                 if(publish)++s_sync.skipped;else err=ESP_ERR_INVALID_RESPONSE;
             }
         }
-        ESP_LOGI("weread","shelf batch=%u/%u result=%d returned=%d skipped=%u",(unsigned)end,(unsigned)s_sync.count,(int)err,cJSON_GetArraySize(books(detail)),(unsigned)s_sync.skipped);
     }
     cJSON_Delete(req);cJSON_Delete(detail);
     if(err==ESP_OK)err=merge_progress(array,s_sync.response);
@@ -252,6 +282,11 @@ static esp_err_t sync_advance(size_t batch_limit,bool publish){
     if(err==ESP_OK){
         cJSON_DeleteItemFromObject(s_sync.next,"synckey");
         if(!cJSON_AddNumberToObject(s_sync.next,"synckey",(double)(end==s_sync.count&&!s_sync.skipped?s_sync.key:s_sync.base_key))||!wr_set_owner(s_sync.next))err=ESP_ERR_NO_MEM;
+        time_t now=time(NULL);
+        if(err==ESP_OK&&end==s_sync.count&&!s_sync.skipped&&now>=1700000000){
+            cJSON_DeleteItemFromObject(s_sync.next,"checkedAt");
+            if(!cJSON_AddNumberToObject(s_sync.next,"checkedAt",(double)now))err=ESP_ERR_NO_MEM;
+        }
     }
     if(err==ESP_OK)err=sort_shelf(s_sync.next);
     if(err==ESP_OK&&(publish||end==s_sync.count)){
@@ -270,7 +305,7 @@ esp_err_t weread_shelf_sync(bool full){WR_GUARD;
 }
 esp_err_t weread_shelf_sync_step(bool restart){WR_GUARD;
     esp_err_t err=ESP_OK;
-    if(restart||!weread_shelf_sync_pending())err=sync_begin(weread_shelf_count()==0);
+    if(restart||!weread_shelf_sync_pending())err=sync_begin(false);
     if(err==ESP_OK)err=sync_advance(s_sync.cursor?20:6,true);
     if(err!=ESP_OK)weread_shelf_sync_discard();
     return err;
