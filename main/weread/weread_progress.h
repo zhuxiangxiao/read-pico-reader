@@ -20,9 +20,15 @@ typedef struct {
 } weread_progress_t;
 
 esp_err_t weread_progress_load(const char *id, weread_progress_t *out);
-/// 返回云端候选但不替用户覆盖冲突位置；网络失败仍返回本地快照。/ Return a cloud candidate without overwriting conflicts; keep a local snapshot on network errors.
+/// 比较两个阅读进度，仅当 a 在章节顺序或章内偏移上严格领先于 b 时返回 true。/ Compare two progress records; return true only when a is strictly ahead of b by (chapter_index, chapter_offset).
+bool weread_progress_ahead(const weread_progress_t *a, const weread_progress_t *b);
+/// 按“较大进度优先”同步云端与本地进度；网络失败仍保留本地快照。/ Sync cloud and local progress by greater-progress-wins; keep local snapshot on network errors.
 esp_err_t weread_progress_sync(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict);
 esp_err_t weread_progress_sync_version(const char *id,weread_progress_t *local,weread_progress_t *cloud,bool *conflict,uint32_t *fresh_version,uint32_t *last_chapter_index);
+/// 仅拉取云端进度与版本元数据，不写本地文件。/ Fetch cloud progress and version metadata without writing local storage.
+esp_err_t weread_progress_fetch_version(const char *id,weread_progress_t *cloud,uint32_t *fresh_version,uint32_t *last_chapter_index);
+/// 在本机保持领先时仅重设云端基线。/ Rebase the cloud baseline onto local progress without altering the local reading position.
+esp_err_t weread_progress_rebase(const char *id,const weread_progress_t *cloud,uint32_t fresh_version,weread_progress_t *out);
 /// 显式选择云端或本地后保存；本地选择继续标脏。/ Persist an explicit cloud/local selection; local choices stay dirty.
 esp_err_t weread_progress_select(const char *id, const weread_progress_t *choice, bool from_cloud);
 esp_err_t weread_progress_checkpoint(const char *id,const weread_progress_t *progress);

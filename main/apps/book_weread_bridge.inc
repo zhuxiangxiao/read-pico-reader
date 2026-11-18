@@ -22,17 +22,32 @@ static void wr_reader_move(void){
 }
 static void wr_reader_sample(uint64_t now, bool active) {
     static uint64_t sampled;
+    static char footer_id[64];
+    static unsigned footer_cached, footer_total;
+    static bool footer_space;
     if (!s_text || !book_path_is_weread(s_path) || !book_layout_page_count()) return;
     if (active && now >= sampled && now - sampled < 200) return;
     sampled = now;
+    if (strcmp(footer_id, s_path + 9)) {
+        wr_copy(footer_id, sizeof(footer_id), s_path + 9);
+        weread_reader_cached_progress(&footer_cached, &footer_total);
+        footer_space = weread_reader_storage_blocked();
+    }
     size_t offset = reader_page_offset(s_page);
     if (offset > s_text_len) offset = s_text_len;
     weread_progress_state_t before=weread_reader_state();
     bool failed=weread_reader_save_failed(),pending=weread_reader_pending_save(),rescued=weread_reader_rescued();
-    unsigned offline=weread_reader_offline();bool caching=weread_reader_caching(),space=weread_reader_storage_blocked();
+    unsigned offline=weread_reader_offline();
+    bool caching=weread_reader_caching();
     weread_reader_tick(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,now,active);
-    if(before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||rescued!=weread_reader_rescued()||
-        offline!=weread_reader_offline()||caching!=weread_reader_caching()||space!=weread_reader_storage_blocked()){s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;}
+    unsigned next_cached=0,next_total=0;
+    weread_reader_cached_progress(&next_cached,&next_total);
+    bool next_space=weread_reader_storage_blocked();
+    bool cache_delta=next_cached!=footer_cached||next_total!=footer_total||next_space!=footer_space;
+    footer_cached=next_cached;footer_total=next_total;footer_space=next_space;
+    if(s_view==READING&&!s_toolbar&&
+        (before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||rescued!=weread_reader_rescued()||
+        offline!=weread_reader_offline()||cache_delta||caching!=weread_reader_caching())){s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;}
 }
 static const char *wr_reader_status(void){
     if(!book_path_is_weread(s_path))return "";
@@ -50,11 +65,19 @@ static const char *wr_reader_status(void){
 
 static void wr_reader_offline_caption(char *out,size_t cap){
     out[0]=0;if(!book_path_is_weread(s_path))return;
-    unsigned ready=weread_reader_offline();
-    if(weread_reader_storage_blocked())snprintf(out,cap,"缓存空间不足 · ");
-    else if(ready)snprintf(out,cap,"后续%u章已缓存 · ",ready);
-    else if(weread_reader_caching())snprintf(out,cap,"缓存后续章节 · ");
-    else snprintf(out,cap,"本章已缓存 · ");
+    unsigned cached=0,total=0;
+    weread_reader_cached_progress(&cached,&total);
+    if(weread_reader_storage_blocked()){
+        if(total)snprintf(out,cap,"缓存空间不足(%u/%u) · ",cached,total);
+        else snprintf(out,cap,"缓存空间不足 · ");
+    }else if(total){
+        snprintf(out,cap,"已缓存 %u/%u 章 · ",cached,total);
+    }else{
+        unsigned ready=weread_reader_offline();
+        if(ready)snprintf(out,cap,"后续%u章已缓存 · ",ready);
+        else if(weread_reader_caching())snprintf(out,cap,"缓存后续章节 · ");
+        else snprintf(out,cap,"本章已缓存 · ");
+    }
 }
 
 // 冷章只保存最新目标，旧正文保留到目标成功排版。/ Keep the old body until the latest cold target typesets successfully.
@@ -67,6 +90,7 @@ static struct {
 static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool last_page,const char *anchor,size_t source_offset);
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx);
 static void wr_chapter_cancel(void){
+    weread_runtime_prefetch_adopt(0);
     if(s_wr_jump.pending){weread_runtime_cancel();s_reader_notice[0]=0;s_reader_notice_until=0;}
     free(s_wr_jump.anchor);memset(&s_wr_jump,0,sizeof(s_wr_jump));
 }

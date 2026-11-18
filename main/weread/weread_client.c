@@ -599,23 +599,26 @@ static bool request_headers(const char *url, const char *custom_headers, char fi
     combined[0] = '\0';
 
     // If authenticated, inject session credentials if not already in custom_headers
-    const weread_auth_session_t *sess = weread_auth_get_current_session();
-    if (sess && weread_auth_is_authenticated()) {
-        if (!custom_headers || strstr(custom_headers, "vid:") == NULL) {
-            size_t cur = strlen(combined);
-            snprintf(combined + cur, 4096 - cur, "vid: %s\r\n", sess->vid);
-        }
-        if (!custom_headers || strstr(custom_headers, "accessToken:") == NULL) {
-            size_t cur = strlen(combined);
-            snprintf(combined + cur, 4096 - cur, "accessToken: %s\r\n", sess->access_token);
-        }
-        if (!custom_headers || strstr(custom_headers, "Cookie:") == NULL) {
-            char refresh[WEREAD_TOKEN_MAX_LEN * 3];
-            weread_client_url_encode(sess->refresh_token, refresh, sizeof(refresh));
-            size_t cur = strlen(combined);
-            snprintf(combined + cur, 4096 - cur,
-                     "Cookie: wr_vid=%s; wr_skey=%s; wr_rt=%s\r\n",
-                     sess->vid, sess->access_token, refresh);
+    {
+        WR_GUARD;
+        const weread_auth_session_t *sess = weread_auth_get_current_session();
+        if (sess && weread_auth_is_authenticated()) {
+            if (!custom_headers || strstr(custom_headers, "vid:") == NULL) {
+                size_t cur = strlen(combined);
+                snprintf(combined + cur, 4096 - cur, "vid: %s\r\n", sess->vid);
+            }
+            if (!custom_headers || strstr(custom_headers, "accessToken:") == NULL) {
+                size_t cur = strlen(combined);
+                snprintf(combined + cur, 4096 - cur, "accessToken: %s\r\n", sess->access_token);
+            }
+            if (!custom_headers || strstr(custom_headers, "Cookie:") == NULL) {
+                char refresh[WEREAD_TOKEN_MAX_LEN * 3];
+                weread_client_url_encode(sess->refresh_token, refresh, sizeof(refresh));
+                size_t cur = strlen(combined);
+                snprintf(combined + cur, 4096 - cur,
+                         "Cookie: wr_vid=%s; wr_skey=%s; wr_rt=%s\r\n",
+                         sess->vid, sess->access_token, refresh);
+            }
         }
     }
 
@@ -702,8 +705,13 @@ static esp_err_t weread_client_request_internal(
 
     bool is_weblogin = (strstr(url, "/weblogin") != NULL);
 
-    if (!s_background && !weread_client_cancelled() && err == ESP_OK && is_expired && !is_weblogin && weread_client_is_trusted_url(url) &&
-        weread_auth_is_authenticated()) {
+    bool allow_bg_timeout = s_background && status != 401 && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT;
+    bool authed = false;
+    if ((!s_background || allow_bg_timeout) && !weread_client_cancelled() && err == ESP_OK && is_expired && !is_weblogin && weread_client_is_trusted_url(url)) {
+        WR_GUARD;
+        authed = weread_auth_is_authenticated();
+    }
+    if (authed) {
         if (allow_replay) {
             // Renew session
             esp_err_t renew_err = weread_auth_renew_session(NULL);
@@ -715,15 +723,20 @@ static esp_err_t weread_client_request_internal(
                 );
             } else {
                 // Renewal failed
-                if (session_code == WEREAD_AUTH_ERRCODE_EXPIRED && renew_err == ESP_ERR_INVALID_STATE)
+                if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED && renew_err == ESP_ERR_INVALID_STATE) {
+                    WR_GUARD;
                     weread_auth_clear_session();
+                }
                 if (out_resp) *out_resp = resp; else free(resp);
                 if (out_len) *out_len = resp_len;
                 return renew_err;
             }
         } else {
             // Already replayed once and still expired -> abort loop, clear session
-            if (session_code == WEREAD_AUTH_ERRCODE_EXPIRED) weread_auth_clear_session();
+            if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED) {
+                WR_GUARD;
+                weread_auth_clear_session();
+            }
             if (out_resp) *out_resp = resp;
             else if (resp) free(resp);
             if (out_len) *out_len = resp_len;
@@ -751,7 +764,7 @@ esp_err_t weread_client_request(
     char **out_resp,
     size_t *out_len,
     int *out_status
-) { WR_GUARD;
+) { WR_MEMORY_SCOPE;
     return weread_client_request_internal(
         url, method, custom_headers, body, out_resp, out_len, out_status, true
     );
@@ -893,7 +906,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
 #endif
 
 esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
-    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info) { WR_GUARD;
+    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info) { WR_MEMORY_SCOPE;
     if (!url || !file || !limit || !info) return ESP_ERR_INVALID_ARG;
     if (s_network) { esp_err_t ready = s_network(s_network_ctx); if (ready != ESP_OK) return ready; }
     char *redirected __attribute__((cleanup(wr_release))) = NULL;
@@ -903,7 +916,9 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         memset(info, 0, sizeof(*info));
         char *headers __attribute__((cleanup(release_headers)))=wr_alloc(4096);
         const char *accept=strstr(current,"/book/chapterdownload?")?NULL:"Accept: image/png,image/jpeg,image/webp,*/*\r\n";
-        if(!headers || !request_headers(current,accept,headers))return ESP_ERR_NO_MEM;
+        bool hdr_ok = false;
+        if (headers) { WR_GUARD; hdr_ok = request_headers(current, accept, headers); }
+        if (!headers || !hdr_ok) return ESP_ERR_NO_MEM;
         char *next __attribute__((cleanup(wr_release))) = NULL;
         esp_err_t err;
         if (s_download_transport) err = s_download_transport(current, headers, file, limit, cancel, ctx, info, s_download_ctx);
@@ -936,9 +951,9 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         }
         if (!weread_client_is_trusted_url(current) ||
             (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
-        if(s_background)return ESP_ERR_INVALID_RESPONSE;
+        if (s_background && (info->status == 401 || code != WEREAD_AUTH_ERRCODE_TIMEOUT)) return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
-            if (attempt && code == -2013) weread_auth_clear_session();
+            if (attempt && code == -2013 && !s_background) { WR_GUARD; weread_auth_clear_session(); }
             return ESP_FAIL;
         }
         err = weread_auth_renew_session(NULL);

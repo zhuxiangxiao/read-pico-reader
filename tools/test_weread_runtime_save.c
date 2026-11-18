@@ -69,20 +69,21 @@ static void test_throttle(const char *mode,html_text_t *first){
             local_navigation(0,page,1000+page*1000,100);assert(!weread_runtime_idle(1000+page*1000));no_report();
         }
         if(!strcmp(mode,"throttle-conflict"))cloud_offset=2;
-        local_navigation(0,10,11000,100);reading_tick(0,10,12001);
+        local_navigation(0,10,11000,100);
+        // 300ms先预取下一章，进度上报让位到预取完成且满1s后。/ Next-chapter prefetch leads at 300ms; progress reporting follows once prefetch is ready and 1s elapsed.
+        reading_tick(0,10,11350);no_report();
+        reading_tick(0,10,12001);
         assert(note_jobs==1&&!report_jobs&&progress_reads==1);
         if(!strcmp(mode,"throttle-conflict")){
-            assert(!progress_posts&&weread_reader_state()==WR_PROGRESS_CONFLICT);
-            for(uint64_t now=13000;now<150000;now+=1000){reading_tick(0,10,now);assert(!weread_runtime_idle(now));}
-            assert(note_jobs==1&&!report_jobs&&progress_reads==1&&!progress_posts&&weread_reader_state()==WR_PROGRESS_CONFLICT);
+            assert(progress_posts==1&&weread_reader_state()==WR_PROGRESS_SYNCED);
         }else{
             assert(progress_posts==1);reading_tick(0,10,13000);assert(note_jobs==1&&progress_posts==1);
         }
     }else if(!strcmp(mode,"throttle-chapter")){
         local_navigation(0,4,2000,100);no_report();html_text_t next={0};uint32_t version=0;
-        adopt(1,&next,&version);local_navigation(1,4,3000,version);reading_tick(1,4,4001);
+        adopt(1,&next,&version);local_navigation(1,4,3000,version);reading_tick(1,4,3350);reading_tick(1,4,4001);
         assert(note_jobs==1&&!report_jobs&&progress_posts==1&&cloud_uid==27&&cloud_index==2);
-        html_text_free(&next);adopt(2,&next,&version);local_navigation(2,4,5000,version);reading_tick(2,4,6001);
+        html_text_free(&next);adopt(2,&next,&version);local_navigation(2,4,5000,version);reading_tick(2,4,5350);reading_tick(2,4,6001);
         // Each successful chapter handoff is urgent, including shortly after a successful previous ACK.
         assert(note_jobs==2&&!report_jobs&&progress_posts==2&&cloud_uid==50&&cloud_index==3);
         html_text_free(&next);
@@ -163,7 +164,7 @@ int main(int argc,char **argv){
         }
         weread_progress_t saved;assert(weread_progress_load("window_book",&saved)==ESP_OK&&saved.chapter_offset==raw&&saved.progress==17&&saved.dirty);
         assert(!rmdir(block));esp_err_t reported=weread_progress_outbox_report("window_book",90000,1700000300,&saved);
-        if(strstr(mode,"newer"))assert(reported==WEREAD_ERR_PROGRESS_CONFLICT&&saved.book_version==100&&saved.sync_conflict&&!progress_posts);
+        if(strstr(mode,"newer"))assert(reported==WEREAD_ERR_VERSION&&saved.book_version==100&&!saved.sync_conflict&&!progress_posts);
         else assert(reported==ESP_OK&&!saved.dirty);
         assert(internal_erases>0);weread_runtime_stop();html_text_free(&text);
         if(strstr(mode,"newer"))printf("PASS actual runtime %s retains exact edition100 raw under metadata101; fresh cloud conflict prevents every POST\n",mode);
@@ -194,10 +195,10 @@ int main(int argc,char **argv){
     }else if(!strcmp(mode,"version")){
         assert(weread_shelf_set_version("window_book",101)==ESP_OK);
         server_version=101;assert(weread_runtime_idle(3000));weread_result_t r=completed();
-        assert(r.error==WEREAD_ERR_PROGRESS_CONFLICT);weread_runtime_result_free(&r);
-        weread_progress_t saved;assert(weread_progress_load("window_book",&saved)==ESP_OK&&saved.book_version==100&&saved.chapter_offset==raw&&saved.dirty&&saved.sync_conflict&&!progress_posts);
+        assert(r.error==WEREAD_ERR_VERSION);weread_runtime_result_free(&r);
+        weread_progress_t saved;assert(weread_progress_load("window_book",&saved)==ESP_OK&&saved.book_version==100&&saved.chapter_offset==raw&&saved.dirty&&!saved.sync_conflict&&!progress_posts);
         assert(!weread_reader_save_failed());weread_reader_end(3001);weread_runtime_stop();
-        puts("PASS: retained raw edition100 saves locally under metadata101 without relabel; fresh cloud conflict prevents any POST");return 0;
+        puts("PASS: retained raw edition100 saves locally under metadata101 without relabel; version mismatch prevents any POST without locking conflict");return 0;
     }else if(!strcmp(mode,"renew")){
         weread_auth_session_t session=*weread_auth_get_current_session();strcpy(session.access_token,"renewed-token");strcpy(session.refresh_token,"renewed-refresh");
         assert(weread_auth_save_session(&session)==ESP_OK&&weread_auth_load_session(&session)==ESP_OK);

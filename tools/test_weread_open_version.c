@@ -104,25 +104,23 @@ int main(int argc, char **argv) {
     while (weread_runtime_busy()) { assert(time(NULL) - started < 10); usleep(1000); }
     weread_result_t result; assert(weread_runtime_poll(&result));
     if(invalid_choice){
-        assert(result.conflict&&!result.open_ready);weread_progress_t choice=result.cloud;weread_runtime_result_free(&result);
-        assert(weread_runtime_choose("test_book_101",&choice,true));started=time(NULL);
-        while(weread_runtime_busy()){assert(time(NULL)-started<10);usleep(1000);}
-        assert(weread_runtime_poll(&result));
+        assert(!result.conflict);
+        weread_progress_t choice=result.cloud;
         if(corrupt&&!corrupt_fail){
-            assert(result.error==ESP_OK&&result.open_ready&&!result.conflict&&downloads==2&&!reports);
+            assert(result.error==ESP_OK&&result.open_ready&&downloads==2&&!reports);
             assert(weread_chapter_cached("test_book_101",2));complete_map(2);
             uint32_t proven=0;assert(book_weread_validate_prepared("test_book_101",choice.chapter_uid,choice.chapter_index,choice.chapter_offset,&proven)==ESP_OK&&proven==100);
             weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_uid==choice.chapter_uid&&
                 saved.chapter_index==choice.chapter_index&&saved.chapter_offset==choice.chapter_offset&&saved.progress==choice.progress&&saved.book_version==100&&
                 !saved.dirty&&!saved.position_pending&&!saved.reading_time&&!saved.pending_pages);
             weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
-            puts("Corrupt cached map re-downloaded once; complete map and explicit cloud coordinates validated before saving.");return 0;
+            puts("Corrupt cached map re-downloaded once; complete map and auto-adopted cloud coordinates validated before saving.");return 0;
         }
         assert(result.error==(corrupt_fail?ESP_ERR_TIMEOUT:WEREAD_ERR_POSITION)&&!result.open_ready&&!reports);
         if(corrupt_fail)assert(downloads==2&&!weread_chapter_cached("test_book_101",2));
         weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_uid==1&&saved.dirty&&saved.reading_time==7);
         weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
-        puts("Invalid cloud choice rejected without replacing dirty local progress.");return 0;
+        puts("Invalid cloud position rejected without replacing dirty local progress.");return 0;
     }
     if(moved){
         assert(result.error==WEREAD_ERR_POSITION&&!result.open_ready);

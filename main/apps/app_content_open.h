@@ -27,6 +27,7 @@ void app_book_return_from_cover_wifi(bool connected);
 void app_device_settings_request_shelf_style(void);
 void app_book_return_from_shelf_style(void);
 bool app_book_reader_body_visible(void);
+bool app_book_reading_active(void);
 void app_book_ticket_sample(int64_t now_ms, bool exposed);
 /// 系统覆盖层延后计时，不关闭用户自动翻页开关。/ Defer timed turns during overlays without disabling the user switch.
 void app_book_pause_auto(void);
@@ -58,6 +59,8 @@ void app_home_release_clock_cache(void);
 #include "app.h"
 /// 微信书籍保存失败时保留当前阅读，不静默退出或休眠。/ Retain a WeRead session when local persistence fails.
 bool app_book_prepare_leave(app_ctx_t *ctx);
+/// 普通退出阅读时非阻塞保存进度，不阻塞等待后台同步或缓存任务。/ Non-blocking save when exiting reader back to shelf/home.
+bool app_book_prepare_exit(app_ctx_t *ctx);
 /// 书架外的主界面空闲时只预热第一页；导航和前台任务可直接取消。
 /// Warm only the first shelf page while another root is idle; navigation and foreground work can cancel.
 void app_book_shelf_prefetch_first(app_ctx_t *ctx);

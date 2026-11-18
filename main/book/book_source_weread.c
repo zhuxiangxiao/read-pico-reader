@@ -28,7 +28,7 @@
 
 static char s_id[64];
 static weread_toc_t s_toc;
-static bool s_txt;
+static bool s_txt, s_prepared_local;
 static char s_prepared_id[64],s_prepared_owner[32];
 static weread_toc_t s_prepared_toc;
 typedef struct {
@@ -62,7 +62,7 @@ static const char *bound_resource(const char *root){
 }
 static struct {char *text,*roots;size_t len;} s_css;
 static void clear_css(void){free(s_css.text);free(s_css.roots);memset(&s_css,0,sizeof(s_css));}
-void book_weread_clear_prepared(void){WR_GUARD;weread_toc_free(&s_prepared_toc);s_prepared_id[0]=s_prepared_owner[0]=0;}
+void book_weread_clear_prepared(void){WR_GUARD;weread_toc_free(&s_prepared_toc);s_prepared_id[0]=s_prepared_owner[0]=0;s_prepared_local=false;}
 bool book_weread_prepared(const char *id){WR_GUARD;
     const weread_auth_session_t *s=weread_auth_get_current_session();
     return s&&id&&s_prepared_toc.count&&!strcmp(id,s_prepared_id)&&!strcmp(s->vid,s_prepared_owner);
@@ -73,28 +73,55 @@ bool book_weread_cached_version(const char *id,uint32_t *version){WR_GUARD;
     if(s_id[0]&&!strcmp(s_id,id)){*version=s_loaded?s_loaded->version:s_toc.book_version;return true;}
     return false;
 }
-esp_err_t book_weread_prepare_open(const char *id){WR_GUARD;
-    uint32_t known=weread_shelf_book_version(id);
-    if(book_weread_prepared(id)&&(!known||known==s_prepared_toc.book_version))return ESP_OK;
+esp_err_t book_weread_prepare_open(const char *id){ WR_MEMORY_SCOPE;
+    uint32_t known = 0;
+    {
+        WR_GUARD;
+        known = weread_shelf_book_version(id);
+        if(book_weread_prepared(id)&&(s_prepared_local||!known||known==s_prepared_toc.book_version))return ESP_OK;
+        book_weread_clear_prepared();
+        if(!wr_valid_id(id)||!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
+    }
+    weread_toc_t toc={0};
+    esp_err_t err=weread_toc_load(id,&toc);
+    if(err!=ESP_OK){err=weread_toc_sync(id);if(err==ESP_OK)err=weread_toc_load(id,&toc);}
+    WR_GUARD;
+    known=weread_shelf_book_version(id);
+    if(err==ESP_OK&&!toc.count)err=ESP_ERR_NOT_FOUND;
+    if(err==ESP_OK&&known&&toc.book_version!=known)err=WEREAD_ERR_VERSION;
+    if(err!=ESP_OK||!wr_valid_id(id)||!weread_auth_is_authenticated()){
+        weread_toc_free(&toc);book_weread_clear_prepared();
+        return err!=ESP_OK?err:ESP_ERR_INVALID_STATE;
+    }
     book_weread_clear_prepared();
-    if(!wr_valid_id(id)||!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
-    esp_err_t err=weread_toc_load(id,&s_prepared_toc);
-    if(err!=ESP_OK){err=weread_toc_sync(id);if(err==ESP_OK)err=weread_toc_load(id,&s_prepared_toc);}
-    if(err==ESP_OK&&!s_prepared_toc.count)err=ESP_ERR_NOT_FOUND;
-    if(err==ESP_OK&&known&&s_prepared_toc.book_version!=known)err=WEREAD_ERR_VERSION;
-    if(err!=ESP_OK){book_weread_clear_prepared();return err;}
-    strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);return ESP_OK;
+    s_prepared_toc=toc;
+    strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);
+    return ESP_OK;
 }
 void book_weread_adopt_prepared(const char *id,weread_toc_t *toc){WR_GUARD;
     book_weread_clear_prepared();s_prepared_toc=*toc;memset(toc,0,sizeof(*toc));
     strcpy(s_prepared_id,id);strcpy(s_prepared_owner,weread_auth_get_current_session()->vid);
+}
+void book_weread_adopt_prepared_local(const char *id,weread_toc_t *toc){WR_GUARD;
+    book_weread_adopt_prepared(id,toc);
+    s_prepared_local=true;
+}
+esp_err_t book_weread_reload_toc(const char *id){WR_GUARD;
+    if(!id||strcmp(s_id,id))return ESP_ERR_INVALID_STATE;
+    weread_toc_t toc={0};esp_err_t err=ESP_OK;
+    if(book_weread_prepared(id)){toc=s_prepared_toc;memset(&s_prepared_toc,0,sizeof(s_prepared_toc));s_prepared_id[0]=s_prepared_owner[0]=0;s_prepared_local=false;}
+    else err=weread_toc_load(id,&toc);
+    if(err!=ESP_OK)return err;
+    if(!toc.count){weread_toc_free(&toc);return ESP_ERR_NOT_FOUND;}
+    weread_toc_free(&s_toc);s_toc=toc;
+    return ESP_OK;
 }
 esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version){WR_GUARD;
     bool prepared=book_weread_prepared(id),active=id&&!strcmp(s_id,id)&&binding_owned(s_loaded)&&s_loaded->uid==uid;
     if(!version||(!prepared&&!active))return ESP_ERR_INVALID_STATE;
     const weread_toc_t *toc=prepared?&s_prepared_toc:&s_toc;
     uint32_t known=weread_shelf_book_version(id);
-    if(known&&known!=toc->book_version)return WEREAD_ERR_VERSION;
+    if(known&&known!=toc->book_version&&!(prepared&&s_prepared_local))return WEREAD_ERR_VERSION;
     size_t i=0;
     while(i<toc->count&&toc->chapters[i].uid!=uid)++i;
     if(i==toc->count||(index&&index!=toc->chapters[i].index))return WEREAD_ERR_POSITION;
@@ -159,7 +186,7 @@ bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
     out->st_mtime = metadata ? (time_t)book->update_time : 0;
     return true;
 }
-bool book_weread_is_open(void) { return s_id[0] != 0; }
+bool book_weread_is_open(void) { WR_GUARD; return s_id[0] != 0; }
 bool book_weread_plain_text(void) { WR_GUARD; return s_id[0] && s_txt; }
 void book_weread_close(void) { WR_GUARD; binding_free(&s_loaded);binding_free(&s_candidate);clear_css();s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
 esp_err_t book_weread_open(const char *uri) { WR_GUARD;
@@ -172,7 +199,8 @@ esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!weread_shelf_find(uri + 9, &b)) return ESP_ERR_NOT_FOUND;
     weread_toc_t toc = {0};
     esp_err_t err=ESP_OK;
-    if(book_weread_prepared(uri+9)){toc=s_prepared_toc;memset(&s_prepared_toc,0,sizeof(s_prepared_toc));s_prepared_id[0]=s_prepared_owner[0]=0;}
+    bool from_local_prepared = false;
+    if(book_weread_prepared(uri+9)){from_local_prepared=s_prepared_local;toc=s_prepared_toc;memset(&s_prepared_toc,0,sizeof(s_prepared_toc));s_prepared_id[0]=s_prepared_owner[0]=0;s_prepared_local=false;}
     else err=weread_toc_load(uri+9,&toc);
     if (err != ESP_OK) {
         err = weread_toc_sync(uri + 9);
@@ -180,20 +208,20 @@ esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     }
     if (err != ESP_OK) return err;
     uint32_t known=weread_shelf_book_version(uri+9);
-    if(known&&toc.book_version!=known){weread_toc_free(&toc);return WEREAD_ERR_VERSION;}
+    if(known&&toc.book_version!=known&&!from_local_prepared){weread_toc_free(&toc);return WEREAD_ERR_VERSION;}
     if (!toc.count) { weread_toc_free(&toc); return ESP_ERR_NOT_FOUND; }
     book_weread_close(); s_toc = toc;
     strcpy(s_id, uri + 9); s_txt = !strcasecmp(b.format, "txt");
     return ESP_OK;
 }
-size_t book_weread_count(void) { return s_toc.count; }
-uint32_t book_weread_uid(size_t i) { return i < s_toc.count ? s_toc.chapters[i].uid : 0; }
-uint32_t book_weread_chapter_index(size_t i) { return i < s_toc.count ? s_toc.chapters[i].index : 0; }
-size_t book_weread_index(uint32_t uid) {
+size_t book_weread_count(void) { WR_GUARD; return s_toc.count; }
+uint32_t book_weread_uid(size_t i) { WR_GUARD; return i < s_toc.count ? s_toc.chapters[i].uid : 0; }
+uint32_t book_weread_chapter_index(size_t i) { WR_GUARD; return i < s_toc.count ? s_toc.chapters[i].index : 0; }
+size_t book_weread_index(uint32_t uid) { WR_GUARD;
     for (size_t i = 0; i < s_toc.count; ++i) if (s_toc.chapters[i].uid == uid) return i;
     return SIZE_MAX;
 }
-esp_err_t book_weread_title(size_t i, char *out, size_t cap) {
+esp_err_t book_weread_title(size_t i, char *out, size_t cap) { WR_GUARD;
     if (i >= s_toc.count || !out || !cap) return ESP_ERR_INVALID_ARG;
     const char *title=s_toc.chapters[i].title;
     if(binding_owned(s_candidate)&&s_candidate->index==i&&s_candidate->toc.count)title=s_candidate->toc.chapters[s_candidate->new_index].title;
@@ -418,6 +446,15 @@ static esp_err_t map_files(const char *root,bool text_source,const char *css,siz
     }
     if (!valid) { free(points); return ESP_ERR_INVALID_RESPONSE; }
     n = snprintf(path,1100,"%s/body.html",root);
+    if (!to_cloud && input == 0) {
+        struct stat st = {0};
+        esp_err_t err = n < 0 || n >= 1100 ? ESP_ERR_INVALID_SIZE :
+            (stat(path, &st) || !S_ISREG(st.st_mode) ? ESP_ERR_NOT_FOUND :
+             st.st_size != (off_t)header.bytes ? ESP_ERR_INVALID_RESPONSE : ESP_OK);
+        if (err == ESP_OK) *output = 0;
+        free(points);
+        return err;
+    }
     char *text = NULL;size_t len = 0;
     esp_err_t err = n < 0 || n >= 1100 ? ESP_ERR_INVALID_SIZE : weread_chapter_read_validated(path,&text,&len);
     if (err == ESP_OK && len != header.bytes) err = ESP_ERR_INVALID_RESPONSE;
@@ -503,6 +540,12 @@ esp_err_t book_weread_map(size_t i,bool to_cloud,uint32_t input,uint32_t *output
     loaded_chapter_t *bound=binding_owned(s_loaded)&&s_loaded->index==i?s_loaded:
         !s_loaded&&binding_owned(s_candidate)&&s_candidate->index==i?s_candidate:NULL;
     return map_bound(i,to_cloud,input,output,bound);
+}
+esp_err_t book_weread_map_candidate(size_t i,bool to_cloud,uint32_t input,uint32_t *output){WR_GUARD;
+    if (!output) return ESP_ERR_INVALID_ARG;
+    loaded_chapter_t *bound=binding_owned(s_candidate)&&s_candidate->index==i?s_candidate:NULL;
+    if (!bound) return ESP_ERR_NOT_FOUND;
+    return map_dense(bound,to_cloud,input,output);
 }
 esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *len, bool *png) { WR_GUARD;
     if (!data || !len || !png || i >= s_toc.count) return ESP_ERR_INVALID_ARG;

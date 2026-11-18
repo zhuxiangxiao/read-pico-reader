@@ -368,13 +368,24 @@ static bool native_readable(const cJSON *response,const cJSON *entry){
     return !number(entry,"type")&&!native_removed(response,id)&&(!detail||readable(detail));
 }
 static esp_err_t sync_begin(bool full){
-    weread_shelf_sync_discard();s_sync_done=s_sync_total=s_sync_skipped=0;
-    if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
-    bool forced=full,legacy=wr_owner_matches(s_shelf)&&!detail_queue(s_shelf)&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s_shelf,"syncPending"));
-    if(!weread_shelf_synckey()||(legacy&&(!number(s_shelf,"syncTarget")||number(s_shelf,"syncTarget")==weread_shelf_synckey())))full=true;
-    s_sync.base_key=full?0:weread_shelf_synckey();
-    char endpoint[160];snprintf(endpoint,sizeof(endpoint),"/shelf/sync?synckey=%" PRIu64 "&onlyBookid=1%s",s_sync.base_key,full?"&lectureSynckey=0":"");
-    esp_err_t err=wr_request_json(endpoint,NULL,&s_sync.response);
+    char endpoint[160] = "";
+    bool forced = full, legacy = false;
+    uint64_t base_key = 0;
+    {
+        WR_GUARD;
+        weread_shelf_sync_discard();s_sync_done=s_sync_total=s_sync_skipped=0;
+        if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
+        legacy=wr_owner_matches(s_shelf)&&!detail_queue(s_shelf)&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(s_shelf,"syncPending"));
+        if(!weread_shelf_synckey()||(legacy&&(!number(s_shelf,"syncTarget")||number(s_shelf,"syncTarget")==weread_shelf_synckey())))full=true;
+        base_key=full?0:weread_shelf_synckey();
+        s_sync.base_key=base_key;
+        snprintf(endpoint,sizeof(endpoint),"/shelf/sync?synckey=%" PRIu64 "&onlyBookid=1%s",base_key,full?"&lectureSynckey=0":"");
+    }
+    cJSON *resp = NULL;
+    esp_err_t err=wr_request_json(endpoint,NULL,&resp);
+    WR_GUARD;
+    if(!weread_auth_is_authenticated()){cJSON_Delete(resp);return ESP_ERR_INVALID_STATE;}
+    s_sync.response=resp;
     cJSON *r=s_sync.response,*v;
     bool has_books=cJSON_HasObjectItem(r,"books")||cJSON_HasObjectItem(r,"bookIds");
     if(err==ESP_OK&&(!wr_uint(r,"synckey",&s_sync.key)||!optional_array(r,"bookIds")||!optional_array(r,"lectureBooks")||!optional_array(r,"removed")))err=ESP_ERR_INVALID_RESPONSE;
@@ -456,24 +467,36 @@ static esp_err_t sync_begin(bool full){
     return err;
 }
 static esp_err_t sync_advance(size_t batch_limit,bool publish){
-    if(!s_sync.next)s_sync.next=cJSON_Duplicate(s_shelf,true);
-    if(!s_sync.next)return ESP_ERR_NO_MEM;
-    cJSON *array=books(s_sync.next),*pending=detail_queue(s_sync.next),*detail=NULL,*req=NULL;
-    esp_err_t err=ESP_OK;size_t end=s_sync.cursor;
-    cJSON *next=s_sync.at;
-    if(next){
-        req=cJSON_CreateObject();cJSON *batch=cJSON_AddArrayToObject(req,"bookIds");size_t requested=0;
-        if(!req||!batch||!cJSON_AddArrayToObject(req,"albumIds"))err=ESP_ERR_NO_MEM;
-        while(next&&requested<batch_limit&&err==ESP_OK){
-            cJSON *item=next;next=next->next;++end;
-            if(!find(pending,item_id(item)))continue;
-            if(!cJSON_AddItemReferenceToArray(batch,item))err=ESP_ERR_NO_MEM;
-            else ++requested;
+    cJSON *detail=NULL,*req=NULL,*batch=NULL;
+    esp_err_t err=ESP_OK;size_t end=0,requested=0;
+    cJSON *next=NULL;
+    {
+        WR_GUARD;
+        if(!s_sync.response)return ESP_ERR_INVALID_STATE;
+        if(!s_sync.next)s_sync.next=cJSON_Duplicate(s_shelf,true);
+        if(!s_sync.next)return ESP_ERR_NO_MEM;
+        cJSON *pending=detail_queue(s_sync.next);
+        end=s_sync.cursor;next=s_sync.at;
+        if(next){
+            req=cJSON_CreateObject();batch=req?cJSON_AddArrayToObject(req,"bookIds"):NULL;
+            if(!req||!batch||!cJSON_AddArrayToObject(req,"albumIds"))err=ESP_ERR_NO_MEM;
+            while(next&&requested<batch_limit&&err==ESP_OK){
+                cJSON *item=next;next=next->next;++end;
+                if(!find(pending,item_id(item)))continue;
+                cJSON *dup=cJSON_CreateString(item_id(item));
+                if(!dup||!cJSON_AddItemToArray(batch,dup)){cJSON_Delete(dup);err=ESP_ERR_NO_MEM;}
+                else ++requested;
+            }
         }
-        if(err==ESP_OK&&requested)err=wr_request_json("/shelf/syncbook",req,&detail);
-        if(err==ESP_OK&&requested&&!cJSON_IsArray(books(detail)))err=ESP_ERR_INVALID_RESPONSE;
-        if(err==ESP_OK&&requested)err=merge_response(array,detail);
-        if(err==ESP_OK&&requested)err=resolve_pending(s_sync.next,detail);
+    }
+    if(err==ESP_OK&&requested)err=wr_request_json("/shelf/syncbook",req,&detail);
+    WR_GUARD;
+    if(!s_sync.response||!s_sync.next){cJSON_Delete(req);cJSON_Delete(detail);return ESP_ERR_INVALID_STATE;}
+    cJSON *array=books(s_sync.next),*pending=detail_queue(s_sync.next);
+    if(requested){
+        if(err==ESP_OK&&!cJSON_IsArray(books(detail)))err=ESP_ERR_INVALID_RESPONSE;
+        if(err==ESP_OK)err=merge_response(array,detail);
+        if(err==ESP_OK)err=resolve_pending(s_sync.next,detail);
         cJSON *entry;
         cJSON_ArrayForEach(entry,batch){
             if(err!=ESP_OK)break;
@@ -517,25 +540,33 @@ static esp_err_t sync_advance(size_t batch_limit,bool publish){
     if(err!=ESP_OK||end==s_sync.count)weread_shelf_sync_discard();
     return err;
 }
-esp_err_t weread_shelf_sync(bool full){WR_GUARD;
+esp_err_t weread_shelf_sync(bool full){ WR_MEMORY_SCOPE;
     esp_err_t err=sync_begin(full);
     while(err==ESP_OK&&weread_shelf_sync_pending())err=sync_advance(20,false);
     if(err!=ESP_OK)weread_shelf_sync_discard();
     return err;
 }
-esp_err_t weread_shelf_sync_step(bool restart){WR_GUARD;
+esp_err_t weread_shelf_sync_step(bool restart){ WR_MEMORY_SCOPE;
     esp_err_t err=ESP_OK;
     if(restart||!weread_shelf_sync_pending())err=sync_begin(false);
     if(err==ESP_OK&&weread_shelf_sync_pending())err=sync_advance(s_sync.cursor?20:6,true);
     if(err!=ESP_OK)weread_shelf_sync_discard();
     return err;
 }
-esp_err_t weread_shelf_refresh_book(const char *id){WR_GUARD;
-    if(!wr_valid_id(id)||!wr_owner_matches(s_shelf))return ESP_ERR_INVALID_ARG;
-    cJSON *req=cJSON_CreateObject(),*ids=cJSON_AddArrayToObject(req,"bookIds"),*response=NULL,*next=NULL;
+esp_err_t weread_shelf_refresh_book(const char *id){ WR_MEMORY_SCOPE;
+    cJSON *req=NULL,*ids=NULL,*response=NULL,*next=NULL;
     esp_err_t err=ESP_ERR_NO_MEM;
-    if(req&&ids&&cJSON_AddItemToArray(ids,cJSON_CreateString(id))&&cJSON_AddArrayToObject(req,"albumIds"))
-        err=wr_request_json("/shelf/syncbook",req,&response);
+    {
+        WR_GUARD;
+        if(!wr_valid_id(id)||!wr_owner_matches(s_shelf))return ESP_ERR_INVALID_ARG;
+        req=cJSON_CreateObject();ids=cJSON_AddArrayToObject(req,"bookIds");
+        if(!req||!ids||!cJSON_AddItemToArray(ids,cJSON_CreateString(id))||!cJSON_AddArrayToObject(req,"albumIds")){
+            cJSON_Delete(req);return ESP_ERR_NO_MEM;
+        }
+    }
+    err=wr_request_json("/shelf/syncbook",req,&response);
+    WR_GUARD;
+    if(!wr_owner_matches(s_shelf))err=ESP_ERR_INVALID_STATE;
     if(err==ESP_OK&&!find(books(response),id))err=ESP_ERR_INVALID_RESPONSE;
     if(err==ESP_OK){next=cJSON_Duplicate(s_shelf,true);if(!next)err=ESP_ERR_NO_MEM;}
     if(err==ESP_OK)err=merge_response(books(next),response);

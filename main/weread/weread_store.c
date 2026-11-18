@@ -48,6 +48,13 @@ cJSON *wr_parse_json(const char *text,size_t bytes){
     }
     return cJSON_ParseWithLengthOpts(text,bytes,NULL,true);
 }
+void wr_memory_enter(void) {
+    if (!s_memory_depth++) s_memory_failed = false;
+}
+void wr_memory_leave(int *guard) {
+    (void)guard;
+    --s_memory_depth;
+}
 #if defined(ESP_PLATFORM)
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -60,9 +67,9 @@ void wr_lock(void) {
     if (!s_service_mutex) s_service_mutex = xSemaphoreCreateRecursiveMutexStatic(&s_service_mutex_buffer);
     portEXIT_CRITICAL(&s_service_init);
     xSemaphoreTakeRecursive(s_service_mutex, portMAX_DELAY);
-    if(!s_memory_depth++)s_memory_failed=false;
+    wr_memory_enter();
 }
-void wr_unlock(int *guard) { (void)guard;--s_memory_depth;xSemaphoreGiveRecursive(s_service_mutex); }
+void wr_unlock(int *guard) { (void)guard; wr_memory_leave(NULL); xSemaphoreGiveRecursive(s_service_mutex); }
 #else
 #include <pthread.h>
 static pthread_mutex_t s_service_mutex;
@@ -72,8 +79,8 @@ static void init_service_mutex(void) {
     pthread_mutexattr_init(&attr); pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&s_service_mutex, &attr); pthread_mutexattr_destroy(&attr);
 }
-void wr_lock(void) { pthread_once(&s_service_once, init_service_mutex); pthread_mutex_lock(&s_service_mutex);if(!s_memory_depth++)s_memory_failed=false; }
-void wr_unlock(int *guard) { (void)guard;--s_memory_depth;pthread_mutex_unlock(&s_service_mutex); }
+void wr_lock(void) { pthread_once(&s_service_once, init_service_mutex); pthread_mutex_lock(&s_service_mutex); wr_memory_enter(); }
+void wr_unlock(int *guard) { (void)guard; wr_memory_leave(NULL); pthread_mutex_unlock(&s_service_mutex); }
 #endif
 
 void *wr_alloc(size_t bytes) {
@@ -251,7 +258,7 @@ esp_err_t wr_write_json(const char *path, const cJSON *json) {
     return err;
 }
 
-esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out) {
+esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out) { WR_MEMORY_SCOPE;
     *out = NULL;
     char url[768];
     int n = snprintf(url, sizeof(url), "%s%s", weread_client_get_base_url(), endpoint);

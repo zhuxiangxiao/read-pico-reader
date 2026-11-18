@@ -16,7 +16,10 @@
 /// 跨前台/后台的可重入服务锁；作用域退出自动归还。/ Reentrant foreground/background service lock, released on scope exit.
 void wr_lock(void);
 void wr_unlock(int *guard);
+void wr_memory_enter(void);
+void wr_memory_leave(int *guard);
 #define WR_GUARD __attribute__((cleanup(wr_unlock))) int wr_scope_guard = (wr_lock(), 0)
+#define WR_MEMORY_SCOPE __attribute__((cleanup(wr_memory_leave))) int wr_memory_guard = (wr_memory_enter(), 0)
 
 /// 可回收工作缓冲优先使用PSRAM，避免扩大内部任务栈。/ Reclaimable work buffers use PSRAM instead of growing internal task stacks.
 void *wr_alloc(size_t bytes);

@@ -17,6 +17,10 @@ void book_weread_close(void);
 esp_err_t book_weread_prepare_open(const char *id);
 /// 接管已校验的目录，不复制章节数组。/ Take ownership of a validated TOC without copying its chapter array.
 void book_weread_adopt_prepared(const char *id,weread_toc_t *toc);
+/// 接管本地已缓存目录用于快速开书，允许暂低于书架最新元数据版本。/ Adopt a locally cached TOC for instant offline-first open even if shelf metadata is newer.
+void book_weread_adopt_prepared_local(const char *id,weread_toc_t *toc);
+/// 将已同步或准备好的最新目录替换到当前已打开书籍。/ Swap an updated or prepared TOC into the currently open book.
+esp_err_t book_weread_reload_toc(const char *id);
 bool book_weread_prepared(const char *id);
 void book_weread_clear_prepared(void);
 bool book_weread_cached_version(const char *id,uint32_t *version);
@@ -40,6 +44,7 @@ uint32_t book_weread_chapter_index(size_t index);
 size_t book_weread_index(uint32_t uid);
 /// 双向映射排版字节与源HTML UTF16坐标；失败时禁止上传猜测值。/ Map typeset bytes/source HTML UTF16 both ways; never upload guessed values after failure.
 esp_err_t book_weread_map(size_t index, bool to_cloud, uint32_t input, uint32_t *output);
+esp_err_t book_weread_map_candidate(size_t index, bool to_cloud, uint32_t input, uint32_t *output);
 esp_err_t book_weread_map_version(size_t index,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output);
 /// 只查已提交正文的精确RAM映射；缺表返回NOT_FOUND，绝不读卡兜底。/ Query only the committed body's exact RAM map; a missing table returns NOT_FOUND without a filesystem fallback.
 esp_err_t book_weread_map_cached(size_t index,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output);

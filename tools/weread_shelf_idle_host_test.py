@@ -73,7 +73,7 @@ int main(void){
     strcpy(mock_result.id,"id_0");assert(tick(&ctx)==APP_REDRAW_NONE&&s_auth);
     assert(weread_runtime_start(WR_JOB_REPORT,NULL,NULL));
     complete((weread_result_t){.job=WR_JOB_REPORT,.local={.chapter_uid=1,.dirty=true,.position_pending=true,.sync_conflict=true}});
-    strcpy(mock_result.id,"id_0");assert(tick(&ctx)==APP_REDRAW_AREA&&strstr(s_message,"手机")&&s_auth);
+    strcpy(mock_result.id,"id_0");assert(tick(&ctx)==APP_REDRAW_AREA&&strstr(s_message,"存储卡")&&s_auth);
     puts("PASS: report status changes use footer area only; retries neither repaint nor clear login");
     reset();initialized(3);assert(weread_runtime_start(WR_JOB_COVER,"id_0","remote"));
     before=nstarts;open_id("id_1");assert(s_open_queued&&mock_busy&&nstarts==before&&strstr(s_message,"正在准备阅读"));

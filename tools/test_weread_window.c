@@ -128,7 +128,7 @@ int main(int argc,char **argv){
         assert(book_weread_map_cached(current,100,true,3,&cached_coordinate)==ESP_ERR_INVALID_STATE);
         uint32_t checked=0;assert(book_weread_validate_prepared("window_book",27,7,coordinate,&checked)==ESP_OK&&checked==101);
         assert(book_weread_image(current,"Images/p.png",&image,&length,&png)==ESP_OK&&length>8&&length>=18&&!memcmp(image+8,"version101",10));free(image);
-        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));weread_result_t reopen=completed();assert(reopen.error==ESP_OK&&reopen.conflict);weread_runtime_result_free(&reopen);
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));weread_result_t reopen=completed();assert(reopen.error==ESP_OK&&!reopen.conflict&&reopen.open_ready);weread_runtime_result_free(&reopen);
         assert(!book_weread_directory_in_use(old_root));html_text_free(&old);html_text_free(&candidate);
         puts("PASS: layout discard preserves actual100 text/map/image/identity under metadata101; commit adopts UID27 at its fresh ordinal7, actual101 identity and exact cached coordinates");
     }else if(!strcmp(mode,"version-zero")){
@@ -140,11 +140,13 @@ int main(int argc,char **argv){
         assert(weread_progress_load("window_book",&after)==ESP_OK&&!memcmp(&before,&after,sizeof(before)));
         uint32_t version=999;assert(book_weread_cached_version("window_book",&version)&&version==100);
         char *body=NULL;size_t length=0;assert(weread_chapter_load_cached("window_book",11,&body,&length)==ESP_OK&&strstr(body,"Chapter 11"));free(body);
-        book_weread_close();assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));weread_result_t r=completed();
-        assert(r.error==ESP_OK&&r.conflict);weread_progress_t cloud=r.cloud;weread_runtime_result_free(&r);
-        assert(weread_runtime_choose("window_book",&cloud,true));r=completed();assert(r.error==ESP_OK&&r.open_ready);weread_runtime_result_free(&r);
+        book_weread_close();
+        char old_manifest[512];assert(wr_cache_path("window_book","chapter-11.json",old_manifest,sizeof(old_manifest))==ESP_OK);
+        assert(!unlink(old_manifest));
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));weread_result_t r=completed();
+        assert(r.error==ESP_OK&&!r.conflict&&r.open_ready);weread_runtime_result_free(&r);
         assert(book_weread_open("weread://window_book")==ESP_OK&&book_weread_cached_version("window_book",&version)&&version==0);
-        assert(weread_progress_load("window_book",&after)==ESP_OK&&after.book_version==0&&!after.position_pending&&after.chapter_offset==0);
+        assert(weread_progress_load("window_book",&after)==ESP_OK&&after.book_version==0&&after.position_pending&&after.chapter_offset==20);
         html_text_t parsed={0};assert(book_weread_load(0,NULL,NULL,&parsed)==ESP_OK&&strstr(parsed.utf8,"Chapter 11"));html_text_free(&parsed);
         char old_body[600];snprintf(old_body,sizeof(old_body),"%s/body.html",old_root);assert(!access(old_body,R_OK));
         puts("PASS: rejected held version100 with fresh unknown0 does not repeat stale request or relabel old text/pending; explicit reopen verifies fresh cloud and downloads0");
@@ -157,11 +159,11 @@ int main(int argc,char **argv){
         for(size_t i=1;i<=3;++i){html_text_t t={0};assert(book_weread_load(i,NULL,NULL,&t)==ESP_OK&&t.len);html_text_free(&t);}
         assert(downloads==before&&!weread_chapter_cached("window_book",404));
         assert(weread_reader_prepare("weread://window_book",4)==ESP_ERR_TIMEOUT&&downloads==before+1);
-        for(unsigned i=0;i<8;++i){(void)step(0,now++);}assert(downloads==before+1);
+        for(unsigned i=0;i<8;++i){(void)step(0,now++);}assert(downloads==before+2);
         weread_reader_end(now);book_weread_close();weread_runtime_stop();weread_shelf_clear();weread_auth_forget_session();
         assert(book_weread_open("weread://window_book")==ESP_OK);
         for(size_t i=1;i<=3;++i){html_text_t t={0};assert(book_weread_load(i,NULL,NULL,&t)==ESP_OK&&t.len);html_text_free(&t);}
-        assert(downloads==before+1);
+        assert(downloads==before+2);
         puts("PASS: non-contiguous real UIDs; next chapter then cover then farther chapters; three READY open offline even after RAM/auth/shelf reload and fourth remains missing");
     }else if(!strcmp(mode,"space")){
         space=0;assert(step(0,now++)==WR_JOB_PREFETCH&&weread_reader_storage_blocked()&&downloads==1);

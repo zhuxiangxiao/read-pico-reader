@@ -95,30 +95,36 @@ static cJSON *find(cJSON *a, uint32_t n) {
     cJSON_ArrayForEach(v, a) if (uid(v) == n) return v;
     return NULL;
 }
-static esp_err_t sync_toc(const char *id,uint32_t expected,weread_toc_t *out) {
+static esp_err_t sync_toc(const char *id,uint32_t expected,weread_toc_t *out) { WR_MEMORY_SCOPE;
     if (!wr_valid_id(id)) return ESP_ERR_INVALID_ARG;
     char path[512];
-    esp_err_t err = wr_cache_path(id, "chapters.json", path, sizeof(path));
-    if (err != ESP_OK) return err;
-    cJSON *old = NULL, *req = cJSON_CreateObject(), *response = NULL, *next = NULL;
-    if (!req) return ESP_ERR_NO_MEM;
+    cJSON *old = NULL, *req = NULL, *response = NULL, *next = NULL;
     uint64_t key = 0, updated_at = 0;
     weread_toc_t check = {0};
-    if (wr_read_json(path, &old) != ESP_OK || decode(old, &check) != ESP_OK || !check.count ||
-        !wr_string(old, "bookId") || strcmp(wr_string(old, "bookId"), id)) {
-        cJSON_Delete(old); old = NULL;
-    } else { key = check.synckey; updated_at = check.update_time; }
-    weread_toc_free(&check);
-    const char *ids[] = {id};
-    cJSON *id_array = cJSON_CreateStringArray(ids, 1);
-    cJSON *keys = cJSON_CreateArray(), *times = cJSON_CreateArray();
-    if (!id_array || !keys || !times) err = ESP_ERR_NO_MEM;
-    if (err == ESP_OK && (!cJSON_AddItemToArray(keys, cJSON_CreateNumber((double)key)) ||
-        !cJSON_AddItemToArray(times, cJSON_CreateNumber((double)updated_at)))) err = ESP_ERR_NO_MEM;
-    if (id_array) cJSON_AddItemToObject(req, "bookIds", id_array);
-    if (keys) cJSON_AddItemToObject(req, "synckeys", keys);
-    if (times) cJSON_AddItemToObject(req, "updateTimes", times);
+    esp_err_t err = ESP_OK;
+    {
+        WR_GUARD;
+        err = wr_cache_path(id, "chapters.json", path, sizeof(path));
+        if (err != ESP_OK) return err;
+        req = cJSON_CreateObject();
+        if (!req) return ESP_ERR_NO_MEM;
+        if (wr_read_json(path, &old) != ESP_OK || decode(old, &check) != ESP_OK || !check.count ||
+            !wr_string(old, "bookId") || strcmp(wr_string(old, "bookId"), id)) {
+            cJSON_Delete(old); old = NULL;
+        } else { key = check.synckey; updated_at = check.update_time; }
+        weread_toc_free(&check);
+        const char *ids[] = {id};
+        cJSON *id_array = cJSON_CreateStringArray(ids, 1);
+        cJSON *keys = cJSON_CreateArray(), *times = cJSON_CreateArray();
+        if (!id_array || !keys || !times) err = ESP_ERR_NO_MEM;
+        if (err == ESP_OK && (!cJSON_AddItemToArray(keys, cJSON_CreateNumber((double)key)) ||
+            !cJSON_AddItemToArray(times, cJSON_CreateNumber((double)updated_at)))) err = ESP_ERR_NO_MEM;
+        if (id_array) cJSON_AddItemToObject(req, "bookIds", id_array);
+        if (keys) cJSON_AddItemToObject(req, "synckeys", keys);
+        if (times) cJSON_AddItemToObject(req, "updateTimes", times);
+    }
     if (err == ESP_OK) err = wr_request_json("/book/chapterInfos", req, &response);
+    WR_GUARD;
     cJSON *entry = NULL, *v;
     cJSON *data = cJSON_GetObjectItemCaseSensitive(response, "data");
     if (err == ESP_OK && !cJSON_IsArray(data)) err = ESP_ERR_INVALID_RESPONSE;
@@ -181,18 +187,23 @@ static esp_err_t sync_toc(const char *id,uint32_t expected,weread_toc_t *out) {
     cJSON_Delete(old); cJSON_Delete(req); cJSON_Delete(response); cJSON_Delete(next);
     return err;
 }
-esp_err_t weread_toc_sync(const char *id){WR_GUARD;return sync_toc(id,0,NULL);}
-esp_err_t weread_toc_sync_version(const char *id,uint32_t expected){WR_GUARD;return sync_toc(id,expected,NULL);}
-esp_err_t weread_toc_prepare(const char *id,bool force,uint32_t expected,weread_toc_t *out){WR_GUARD;
+esp_err_t weread_toc_sync(const char *id){return sync_toc(id,0,NULL);}
+esp_err_t weread_toc_sync_version(const char *id,uint32_t expected){return sync_toc(id,expected,NULL);}
+esp_err_t weread_toc_prepare(const char *id,bool force,uint32_t expected,weread_toc_t *out){ WR_MEMORY_SCOPE;
     if(!out)return ESP_ERR_INVALID_ARG;
-    uint32_t version=expected?expected:weread_shelf_book_version(id);uint64_t now=(uint64_t)time(NULL);
-    esp_err_t cached=weread_toc_load(id,out);
-    bool matching=cached==ESP_OK&&out->count&&(!version||version==out->book_version);
-    // 已知版本匹配不按时间过期；未知版本用一天兜底发现目录变化。/ Matching known versions do not expire; unknown versions get a daily recheck for catalog changes.
-    if(!force&&matching&&(expected||(out->checked_at>=1700000000&&now>=out->checked_at&&now-out->checked_at<86400)))return ESP_OK;
-    weread_toc_free(out);
+    uint32_t version = 0;
+    {
+        WR_GUARD;
+        version=expected?expected:weread_shelf_book_version(id);uint64_t now=(uint64_t)time(NULL);
+        esp_err_t cached=weread_toc_load(id,out);
+        bool matching=cached==ESP_OK&&out->count&&(!version||version==out->book_version);
+        // 已知版本匹配不按时间过期；未知版本用一天兜底发现目录变化。/ Matching known versions do not expire; unknown versions get a daily recheck for catalog changes.
+        if(!force&&matching&&(expected||(out->checked_at>=1700000000&&now>=out->checked_at&&now-out->checked_at<86400)))return ESP_OK;
+        weread_toc_free(out);
+    }
     esp_err_t err=sync_toc(id,version,out);if(err==ESP_OK)return err;
     // 瞬时离线可复用同版本旧缓存，已知版本变化不能回退旧正文。/ Offline fallback retains a matching version, never a known older text revision.
+    WR_GUARD;
     if(err!=WEREAD_ERR_VERSION&&err!=ESP_ERR_NO_MEM&&err!=ESP_ERR_INVALID_STATE&&weread_toc_load(id,out)==ESP_OK&&out->count&&(!version||out->book_version==version))return ESP_OK;
     weread_toc_free(out);return err;
 }

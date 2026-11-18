@@ -12,7 +12,7 @@
 typedef enum {
     WR_JOB_INIT, WR_JOB_SYNC, WR_JOB_QR, WR_JOB_POLL, WR_JOB_OPEN,
     WR_JOB_LOCAL, WR_JOB_CLOUD, WR_JOB_COVER, WR_JOB_CLEAR, WR_JOB_LOGOUT,
-    WR_JOB_NOTE, WR_JOB_CHAPTER, WR_JOB_PREFETCH, WR_JOB_CONNECT, WR_JOB_STOP,WR_JOB_TOC,WR_JOB_REPORT,WR_JOB_DISCONNECT
+    WR_JOB_NOTE, WR_JOB_CHAPTER, WR_JOB_PREFETCH, WR_JOB_CONNECT, WR_JOB_STOP,WR_JOB_TOC,WR_JOB_REPORT,WR_JOB_DISCONNECT,WR_JOB_CLOUD_SYNC
 } weread_job_t;
 typedef struct {
     weread_job_t job;
@@ -20,6 +20,8 @@ typedef struct {
     bool authenticated, conflict, open_ready, noted;
     int qr_state, http_status;
     uint32_t chapter_uid;
+    size_t chapter_idx;
+    bool prefetch_done;
     unsigned cover_retry_seconds;
     char id[64], uid[64], qr_url[256], nickname[64];
     weread_shelf_item_t *books;
@@ -54,8 +56,14 @@ esp_err_t weread_runtime_connect(void *ctx);
 
 /// 阅读器加载回调前由worker准备章节，前台只解析完整缓存。/ Let the worker prepare a chapter before foreground parsing.
 esp_err_t weread_reader_prepare(const char *uri, size_t chapter);
-/// 本地缓存快速判定，无网络工作；资源交接中的任务返回false。/ Check local readiness without networking.
+/// 本地缓存快速判定，无网络工作；仅当后台正在下载同一章节或清理整书时返回false。/ Check local readiness without blocking on unrelated background jobs.
 bool weread_reader_cached(const char *uri,size_t chapter);
+/// 查询后台预取任务是否正在下载同一本书的同一章节。/ Return true if background prefetch is currently downloading the exact same chapter.
+bool weread_runtime_prefetch_active(const char *id,uint32_t uid);
+void weread_runtime_prefetch_adopt(uint32_t uid);
+/// 提取后台云端同步确认的超前跳转目标，已读超过或非当前书籍则返回false。/ Consume a pending forward cloud-sync jump if still ahead of the active reader.
+bool weread_reader_poll_cloud_jump(const char *uri,size_t *chapter_out,uint32_t *offset_out);
+void weread_reader_commit_cloud_jump(const char *uri,bool committed);
 /// 本地持久化先行；失败不消耗内存中的待保存导航。/ Persist locally without losing a failed navigation sample.
 esp_err_t weread_reader_save(uint64_t now_ms);
 weread_progress_state_t weread_reader_state(void);
@@ -64,8 +72,10 @@ bool weread_reader_pending_save(void);
 /// 已保存在设备应急账本，尚未确认云端同步。/ Durable in the device rescue journal, without a cloud acknowledgement.
 bool weread_reader_rescued(void);
 unsigned weread_reader_offline(void);
+void weread_reader_cached_progress(unsigned *cached, unsigned *total);
 bool weread_reader_storage_blocked(void);
 bool weread_reader_caching(void);
+void weread_reader_pause_bg(void);
 esp_err_t weread_reader_prepare_open(const char *uri);
 bool weread_reader_open_ready(const char *uri);
 void weread_reader_begin(const char *uri, uint64_t now_ms);
@@ -74,6 +84,7 @@ void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsi
 /// 仅正文成功接管后携带实际已加载版本；不从后台元数据猜版本。/ Bind navigation to the content version actually committed by the reader.
 void weread_reader_navigated_version(const char *uri,size_t chapter,uint32_t offset,unsigned percent,const char *summary,uint32_t content_version);
 esp_err_t weread_reader_resume(const char *uri, size_t *chapter, uint32_t *offset);
+esp_err_t weread_reader_resume_chapter(const char *uri, size_t *chapter, uint32_t *source_offset);
 void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsigned percent,
     const char *summary, uint64_t now_ms, bool active);
 void weread_reader_flush(uint64_t now_ms, bool stop_network);

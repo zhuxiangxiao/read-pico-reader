@@ -490,34 +490,45 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
     return ESP_OK;
 }
 
-esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_GUARD;
-    weread_auth_session_t *target = session ? session : &s_current_session;
-
-    if (target->refresh_token[0] == '\0') {
-        return ESP_ERR_INVALID_STATE;
+esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_MEMORY_SCOPE;
+    weread_auth_session_t snap;
+    char dev_id[WEREAD_DEVICE_ID_MAX_LEN], dev_name[WEREAD_DEVICE_NAME_MAX_LEN];
+    {
+        WR_GUARD;
+        weread_auth_session_t *target = session ? session : &s_current_session;
+        if (target->refresh_token[0] == '\0') return ESP_ERR_INVALID_STATE;
+        snap = *target;
+        snprintf(dev_id, sizeof(dev_id), "%s", target->device_id[0] ? target->device_id : weread_auth_get_device_id());
+        snprintf(dev_name, sizeof(dev_name), "%s", target->device_name[0] ? target->device_name : weread_auth_get_device_name());
     }
 
-    const char *dev_id = target->device_id[0] ? target->device_id : weread_auth_get_device_id();
-    const char *dev_name = target->device_name[0] ? target->device_name : weread_auth_get_device_name();
-
-    char url[2048];
-
-    char headers[512];
-    snprintf(headers, sizeof(headers), "CLIENT_TYPE: 1\r\nX-Is-Serverside: 1\r\nfingerprint: %s\r\nContent-Type: application/json\r\n", dev_id);
+    char *url = wr_alloc(2048);
+    char *headers = wr_alloc(512);
+    if (!url || !headers) {
+        weread_secure_zero(&snap, sizeof(snap));
+        free(url); free(headers); return ESP_ERR_NO_MEM;
+    }
+    snprintf(headers, 512, "CLIENT_TYPE: 1\r\nX-Is-Serverside: 1\r\nfingerprint: %s\r\nContent-Type: application/json\r\n", dev_id);
 
     cJSON *body_json = cJSON_CreateObject();
-    cJSON_AddStringToObject(body_json, "vid", target->vid);
-    cJSON_AddStringToObject(body_json, "refreshToken", target->refresh_token);
-    cJSON_AddStringToObject(body_json, "deviceId", dev_id);
-    cJSON_AddNumberToObject(body_json, "deviceType", WEREAD_DEVICE_TYPE_RENEW);
-    cJSON_AddStringToObject(body_json, "deviceName", dev_name);
-    cJSON_AddNumberToObject(body_json, "isFromweb", 0);
+    if (body_json) {
+        cJSON_AddStringToObject(body_json, "vid", snap.vid);
+        cJSON_AddStringToObject(body_json, "refreshToken", snap.refresh_token);
+        cJSON_AddStringToObject(body_json, "deviceId", dev_id);
+        cJSON_AddNumberToObject(body_json, "deviceType", WEREAD_DEVICE_TYPE_RENEW);
+        cJSON_AddStringToObject(body_json, "deviceName", dev_name);
+        cJSON_AddNumberToObject(body_json, "isFromweb", 0);
+    }
 
-    if (!body_json || !login_url(body_json, url, sizeof(url))) { cJSON_Delete(body_json); return ESP_ERR_INVALID_SIZE; }
+    if (!body_json || !login_url(body_json, url, 2048)) {
+        weread_secure_zero(&snap, sizeof(snap));
+        cJSON_Delete(body_json); free(url); free(headers); return ESP_ERR_INVALID_SIZE;
+    }
     char *body_str = cJSON_PrintUnformatted(body_json);
     cJSON_Delete(body_json);
     if (!body_str) {
-        return ESP_ERR_NO_MEM;
+        weread_secure_zero(&snap, sizeof(snap));
+        free(url); free(headers); return ESP_ERR_NO_MEM;
     }
 
     char *resp = NULL;
@@ -526,9 +537,11 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_GUARD;
 
     // Use transport callback directly to avoid recursive renewal loops in client
     esp_err_t err = weread_client_request(url, "POST", headers, body_str, &resp, &resp_len, &status);
-    free(body_str);
+    weread_secure_zero(body_str, strlen(body_str));
+    free(body_str); free(url); free(headers);
 
     if (err != ESP_OK || !resp || (status != 200 && status != 401)) {
+        weread_secure_zero(&snap, sizeof(snap));
         if (resp) free(resp);
         return ESP_FAIL;
     }
@@ -536,6 +549,7 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_GUARD;
     cJSON *root = wr_parse_json(resp,resp_len + 1);
     free(resp);
     if (!root) {
+        weread_secure_zero(&snap, sizeof(snap));
         return ESP_FAIL;
     }
 
@@ -548,26 +562,29 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_GUARD;
         const cJSON *code = auth_alias(root,(const char *const[]){"errCode","errcode","ret",NULL});
         bool revoked = cJSON_IsNumber(code) && code->valuedouble == WEREAD_AUTH_ERRCODE_EXPIRED;
         cJSON_Delete(root);
-        if (revoked) { weread_auth_clear_session(); return ESP_ERR_INVALID_STATE; }
+        weread_secure_zero(&snap, sizeof(snap));
+        if (revoked) { WR_GUARD; weread_auth_clear_session(); return ESP_ERR_INVALID_STATE; }
         return ESP_FAIL;
     }
 
     cJSON *rt_item = auth_alias(root,refresh_keys);
     if (rt_item && (!cJSON_IsString(rt_item) || !credential(rt_item->valuestring, WEREAD_TOKEN_MAX_LEN, true))) {
+        weread_secure_zero(&snap, sizeof(snap));
         cJSON_Delete(root); return ESP_ERR_INVALID_RESPONSE;
     }
-    weread_auth_session_t renewed = *target;
-    snprintf(renewed.access_token, sizeof(renewed.access_token), "%s", tok_item->valuestring);
-    snprintf(renewed.skey, sizeof(renewed.skey), "%.*s", (int)sizeof(renewed.skey) - 1, tok_item->valuestring);
-    if (rt_item) snprintf(renewed.refresh_token, sizeof(renewed.refresh_token), "%s", rt_item->valuestring);
-    renewed.updated_at = (int64_t)time(NULL);
-    esp_err_t saved = weread_auth_save_session(&renewed);
+    snprintf(snap.access_token, sizeof(snap.access_token), "%s", tok_item->valuestring);
+    snprintf(snap.skey, sizeof(snap.skey), "%.*s", (int)sizeof(snap.skey) - 1, tok_item->valuestring);
+    if (rt_item) snprintf(snap.refresh_token, sizeof(snap.refresh_token), "%s", rt_item->valuestring);
+    snap.updated_at = (int64_t)time(NULL);
+    WR_GUARD;
+    weread_auth_session_t *target = session ? session : &s_current_session;
+    esp_err_t saved = weread_auth_save_session(&snap);
     if (saved == ESP_OK) {
-        memcpy(target, &renewed, sizeof(renewed));
-        memcpy(&s_current_session, &renewed, sizeof(renewed));
+        memcpy(target, &snap, sizeof(snap));
+        memcpy(&s_current_session, &snap, sizeof(snap));
         s_authenticated = true;
     }
-    weread_secure_zero(&renewed, sizeof(renewed));
+    weread_secure_zero(&snap, sizeof(snap));
     cJSON_Delete(root); return saved;
 }
 

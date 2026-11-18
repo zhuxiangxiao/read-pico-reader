@@ -4,6 +4,7 @@
 #include "weread_client.h"
 #include "weread_store.h"
 #include "weread_shelf.h"
+#include "weread_chapter.h"
 #include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -119,17 +120,18 @@ int main(int argc,char **argv){
         assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_ERR_INVALID_STATE&&p.dirty&&!p.retry_count&&!writes&&!reads);
         cancelled=false;assert(weread_progress_outbox_report(id,90001,1700000201,&p)==ESP_OK&&!p.dirty);
     }else if(!strcmp(argv[2],"conflict")){
-        cloud.chapter_offset=50;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_PROGRESS_CONFLICT);
-        assert(!writes&&p.sync_conflict&&p.dirty&&weread_progress_state(&p)==WR_PROGRESS_CONFLICT);
-        weread_progress_t c;bool conflict=false;assert(weread_progress_sync(id,&p,&c,&conflict)==ESP_OK&&conflict&&!c.book_version&&c.base_version==100);
-        assert(weread_progress_select(id,&p,false)==ESP_OK);
-        assert(weread_progress_outbox_report(id,90001,1700000201,&p)==ESP_OK&&!p.dirty&&writes==1);
+        cloud.chapter_offset=50;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_OK);
+        assert(!writes&&!p.sync_conflict&&!p.dirty&&p.chapter_offset==50);
+        assert(weread_progress_note(id,1,1,80,35,5,1,"local ahead",1700000250)==ESP_OK);
+        cloud.chapter_offset=40;
+        assert(weread_progress_outbox_report(id,90001,1700000251,&p)==ESP_OK&&!p.dirty&&!p.sync_conflict&&writes==1);
+        weread_progress_t c;bool conflict=false;assert(weread_progress_sync(id,&p,&c,&conflict)==ESP_OK&&!conflict&&!c.book_version&&c.base_version==100&&p.chapter_offset==80);
     }else if(!strcmp(argv[2],"version")){
         p=cloud;p.chapter_offset=20;p.book_version=100;assert(weread_progress_select(id,&p,false)==ESP_OK);
-        cloud.book_version=101;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_PROGRESS_CONFLICT&&!writes&&p.dirty);
+        cloud.book_version=101;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_VERSION&&!writes&&p.dirty&&!p.sync_conflict);
     }else if(!strcmp(argv[2],"unknown-version")){
         p=cloud;p.chapter_offset=20;p.book_version=100;assert(weread_progress_select(id,&p,false)==ESP_OK);
-        cloud.book_version=0;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_PROGRESS_CONFLICT&&!writes&&p.dirty);
+        cloud.book_version=0;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_VERSION&&!writes&&p.dirty&&!p.sync_conflict);
     }else if(!strcmp(argv[2],"reselect")){
         network_fail=true;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_ERR_TIMEOUT&&p.retry_count==1);
         uint32_t revision=p.revision;assert(weread_progress_select(id,&p,false)==ESP_OK);
@@ -165,15 +167,15 @@ int main(int argc,char **argv){
         weread_progress_t delta={.chapter_uid=1,.chapter_index=1,.chapter_offset=30,.progress=30,.pending_pages=1};bool noted=false;
         assert(weread_progress_store_version(id,&delta,true,actual,1700000200,&noted)==ESP_OK&&noted&&delta.book_version==actual&&delta.dirty);
         assert(weread_shelf_book_version(id)==101);
-        esp_err_t expected=actual==101?ESP_OK:WEREAD_ERR_PROGRESS_CONFLICT;
+        esp_err_t expected=actual==101?ESP_OK:WEREAD_ERR_VERSION;
         assert(weread_progress_outbox_report(id,90000,1700000200,&p)==expected);
-        assert(p.book_version==actual&&(actual==101?(!p.dirty&&writes==1):(p.dirty&&!writes)));
+        assert(p.book_version==actual&&(actual==101?(!p.dirty&&writes==1):(p.dirty&&!writes&&!p.sync_conflict)));
     }else if(!strcmp(argv[2],"incomplete-cloud")){
         assert(weread_progress_load(id,&p)==ESP_OK);p.base_uid=p.base_index=p.base_offset=0;
         assert(weread_progress_checkpoint(id,&p)==ESP_OK);cloud_incomplete=true;
         assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_ERR_INVALID_RESPONSE&&!writes&&p.dirty&&!p.sync_conflict);
         weread_progress_t legacy;bool conflict=false;
-        assert(weread_progress_sync(id,&p,&legacy,&conflict)==ESP_OK&&!legacy.chapter_uid&&conflict);
+        assert(weread_progress_sync(id,&p,&legacy,&conflict)==ESP_OK&&!legacy.chapter_uid&&!conflict);
     }else if(!strncmp(argv[2],"corrupt-",8)||!strncmp(argv[2],"load-oom-",9)){
         login(argv[1],"999","second-account");assert(weread_progress_select(id,&cloud,true)==ESP_OK);
         login(argv[1],"123","access-fixture");move(30,2);
@@ -234,7 +236,7 @@ int main(int argc,char **argv){
         assert(weread_progress_load(id,&p)==ESP_OK&&!p.dirty&&p.chapter_offset==10);
     }else if(!strcmp(argv[2],"legacy")){
         assert(weread_progress_load(id,&p)==ESP_OK);p.base_known=false;assert(weread_progress_checkpoint(id,&p)==ESP_OK);
-        assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_PROGRESS_CONFLICT&&!reads&&!writes&&p.dirty);
+        assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_OK&&writes==1&&!p.dirty&&!p.sync_conflict);
     }else assert(false);
     weread_progress_outbox_reset();weread_shelf_clear();puts(argv[2]);return 0;
 }

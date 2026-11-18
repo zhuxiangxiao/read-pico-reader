@@ -5,6 +5,7 @@
  * English: Asynchronous WeRead chapter preparation; local TXT/EPUB retain their existing path.
  */
 static esp_err_t wr_chapter_start(app_ctx_t *ctx){
+    weread_runtime_prefetch_adopt(0);
     wr_reader_sample(ctx->now_ms,false);
     esp_err_t err=weread_reader_save(ctx->now_ms);
     if(err!=ESP_OK)return err;
@@ -16,35 +17,65 @@ static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool la
     char *owned=NULL;
     if(anchor){size_t bytes=strlen(anchor)+1;owned=wr_alloc(bytes);if(!owned)return false;memcpy(owned,anchor,bytes);}
     wr_chapter_cancel();
+    uint32_t target_uid=book_weread_uid(chapter);
+    bool adopting=weread_runtime_prefetch_active(s_path+9,target_uid);
     s_wr_jump.pending=true;s_wr_jump.chapter=chapter;s_wr_jump.offset=offset;
     s_wr_jump.last_page=last_page;s_wr_jump.source_offset=source_offset;s_wr_jump.anchor=owned;s_wr_jump.toc=SIZE_MAX;
-    weread_runtime_cancel();
+    if(adopting){weread_runtime_prefetch_adopt(target_uid);s_wr_jump.started=true;}
+    else{weread_runtime_prefetch_adopt(0);weread_runtime_cancel();}
     s_view=READING;s_reader_panel=READER_PANEL_NONE;
     copy_text(s_reader_notice,sizeof(s_reader_notice),"正在准备章节…");s_reader_notice_until=INT64_MAX;
     s_reader_text_frame=false;
-    // 先启动worker再由主循环推反馈屏；不把物理刷新时间串到下载之前。
-    // Start the worker before feedback presentation rather than delaying downloads behind a physical refresh.
-    if(!weread_runtime_busy()&&!ctx->request_app)s_wr_jump.error=wr_chapter_start(ctx);
+    // 先启动worker再由主循环推反馈屏；若同章预取已在进行则直接接管。
+    // Start the worker before feedback presentation, or adopt an already-running same-chapter prefetch.
+    if(!adopting&&!weread_runtime_busy()&&!ctx->request_app)s_wr_jump.error=wr_chapter_start(ctx);
     return true;
 }
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
-static void wr_chapter_poll(uint32_t expected_uid, bool *matching, esp_err_t *error) {
+static void wr_chapter_poll(uint32_t expected_uid, bool *matching, esp_err_t *error, bool *prefetch_retry) {
     weread_result_t result = {0};
     bool completed = weread_runtime_poll(&result);
-    *matching = completed && result.job == WR_JOB_CHAPTER && !strcmp(result.id, s_path + 9) &&
-        result.chapter_uid == expected_uid;
-    if (*matching) *error = result.error;
+    *matching = completed && (result.job == WR_JOB_CHAPTER || result.job == WR_JOB_PREFETCH) &&
+        !strcmp(result.id, s_path + 9) && result.chapter_uid == expected_uid;
+    if (*matching) {
+        *error = result.error;
+        if (prefetch_retry && result.job == WR_JOB_PREFETCH && result.error != ESP_OK &&
+            result.error != ESP_ERR_INVALID_STATE && result.error != WEREAD_ERR_PURCHASE &&
+            result.error != WEREAD_ERR_SOLD_OUT && result.error != WEREAD_ERR_VERSION) {
+            *prefetch_retry = true;
+        }
+    }
     weread_runtime_result_free(&result);
 }
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
-    if(!s_wr_jump.pending)return APP_REDRAW_NONE;
+    if(!s_wr_jump.pending){
+        if(ctx->request_app||ctx->consumed||(ctx->touch&&ctx->touch->touched)||s_view!=READING||!s_text)return APP_REDRAW_NONE;
+        size_t chapter=0;uint32_t offset=0;
+        if(!weread_reader_poll_cloud_jump(s_path,&chapter,&offset))return APP_REDRAW_NONE;
+        s_wr_jump.committing=true;
+        bool ok=load_chapter_at(ctx,chapter,offset,false,NULL,SIZE_MAX);
+        s_wr_jump.committing=false;
+        weread_reader_commit_cloud_jump(s_path,ok);
+        if(!ok)return APP_REDRAW_NONE;
+        s_selected_toc=SIZE_MAX;s_view=READING;s_reader_panel=READER_PANEL_NONE;
+        copy_text(s_reader_notice,sizeof(s_reader_notice),"已同步云端进度");
+        s_reader_notice_until=ctx->now_ms+2000;
+        save_progress();return APP_REDRAW_PAGE;
+    }
     if(ctx->request_app){wr_chapter_cancel();return APP_REDRAW_NONE;}
     if(weread_runtime_busy()||ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
-    bool matching=false;esp_err_t err=s_wr_jump.error;
-    wr_chapter_poll(book_weread_uid(s_wr_jump.chapter),&matching,&err);
-    if(s_wr_jump.started&&!matching)return APP_REDRAW_NONE;
+    bool matching=false,prefetch_retry=false;esp_err_t err=s_wr_jump.error;
+    wr_chapter_poll(book_weread_uid(s_wr_jump.chapter),&matching,&err,&prefetch_retry);
+    if(matching)weread_runtime_prefetch_adopt(0);
+    if(prefetch_retry){
+        s_wr_jump.started=false;err=wr_chapter_start(ctx);
+        if(s_wr_jump.started)return APP_REDRAW_NONE;
+    }else if(s_wr_jump.started&&!matching){
+        if(!weread_reader_cached(s_path,s_wr_jump.chapter))return APP_REDRAW_NONE;
+        err=ESP_OK;
+    }
     if(!s_wr_jump.started){
         if(err==ESP_OK)err=wr_chapter_start(ctx);
         if(s_wr_jump.started)return APP_REDRAW_NONE;
@@ -65,6 +96,9 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     }
     free(s_wr_jump.anchor);memset(&s_wr_jump,0,sizeof(s_wr_jump));
     if(err!=ESP_OK){
+#if defined(ESP_PLATFORM)
+        ESP_LOGW(TAG,"weread chapter failed err=%d msg=%s",(int)err,s_message);
+#endif
         copy_text(s_reader_notice,sizeof(s_reader_notice),s_message[0]?s_message:
             err==WEREAD_ERR_PURCHASE?"请在手机端购买或领取此章节":
             err==WEREAD_ERR_SOLD_OUT?"章节已下架":

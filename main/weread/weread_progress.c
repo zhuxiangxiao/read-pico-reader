@@ -451,6 +451,58 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
     if(last)*last=last_index;
     return ESP_OK;
 }
+bool weread_progress_ahead(const weread_progress_t *a, const weread_progress_t *b) {
+    if (!a || !b || !a->chapter_uid) return false;
+    if (!b->chapter_uid) return true;
+    if (a->chapter_index != b->chapter_index) return a->chapter_index > b->chapter_index;
+    return a->chapter_offset > b->chapter_offset;
+}
+esp_err_t weread_progress_fetch_version(const char *id, weread_progress_t *cloud, uint32_t *known_version, uint32_t *last_chapter) {
+    if (!wr_valid_id(id) || !cloud) return ESP_ERR_INVALID_ARG;
+    if (known_version) *known_version = 0;
+    if (last_chapter) *last_chapter = 0;
+    memset(cloud, 0, sizeof(*cloud));
+    progress_identity_t session;
+    { WR_GUARD;
+        if (!identity_read(&session)) return ESP_ERR_INVALID_STATE;
+    }
+    uint32_t fresh_version = 0, last_index = 0;
+    esp_err_t err = fetch_progress(id, cloud, &fresh_version, &last_index, &session);
+    if (err != ESP_OK) return err;
+    { WR_GUARD;
+        if (!identity_matches(&session)) return ESP_ERR_INVALID_STATE;
+        if (known_version) *known_version = fresh_version;
+        if (last_chapter) *last_chapter = last_index;
+        if (fresh_version) {
+            esp_err_t updated = weread_shelf_set_version(id, fresh_version);
+            if (updated != ESP_OK && updated != ESP_ERR_NOT_FOUND) return updated;
+        }
+        uint32_t version = fresh_version ? fresh_version : weread_shelf_book_version(id);
+        if (version && cloud->book_version && version != cloud->book_version) return WEREAD_ERR_VERSION;
+        baseline(cloud, cloud);
+        if (fresh_version) cloud->base_version = fresh_version;
+        strcpy(s_observed.id, id); s_observed.session = session_stamp(); s_observed.cloud = *cloud;
+        if (fresh_version) s_observed.cloud.book_version = fresh_version;
+    }
+    return ESP_OK;
+}
+esp_err_t weread_progress_rebase(const char *id, const weread_progress_t *cloud, uint32_t fresh_version, weread_progress_t *out) { WR_GUARD;
+    if (!wr_valid_id(id) || !cloud) return ESP_ERR_INVALID_ARG;
+    weread_progress_t local = {0};
+    esp_err_t err = weread_progress_load(id, &local);
+    if (err != ESP_OK) return err;
+    if (weread_progress_ahead(cloud, &local)) {
+        if (out) *out = local;
+        return ESP_OK;
+    }
+    baseline(&local, cloud);
+    local.base_version = fresh_version ? fresh_version : cloud->base_version;
+    local.sync_conflict = false;
+    local.retry_after = 0; local.retry_count = 0;
+    if (local.chapter_uid) err = weread_progress_checkpoint(id, &local);
+    if (err == ESP_OK && out) *out = local;
+    return err;
+}
 esp_err_t weread_progress_sync_version(const char *id, weread_progress_t *local, weread_progress_t *cloud, bool *conflict,uint32_t *known_version,uint32_t *last_chapter) { WR_GUARD;
     if (!wr_valid_id(id) || !local || !cloud || !conflict) return ESP_ERR_INVALID_ARG;
     if(known_version)*known_version=0;
@@ -467,16 +519,34 @@ esp_err_t weread_progress_sync_version(const char *id, weread_progress_t *local,
         if(updated!=ESP_OK&&updated!=ESP_ERR_NOT_FOUND)return updated;}
     uint32_t version=fresh_version?fresh_version:weread_shelf_book_version(id);
     if(version&&cloud->book_version&&version!=cloud->book_version)return WEREAD_ERR_VERSION;
-    bool different = have_local && (local->chapter_uid != cloud->chapter_uid || local->chapter_offset != cloud->chapter_offset ||
-        local->chapter_index != cloud->chapter_index || (local->book_version && cloud->book_version && local->book_version != cloud->book_version));
     baseline(cloud,cloud);if(fresh_version)cloud->base_version=fresh_version;
     strcpy(s_observed.id,id);s_observed.session=session_stamp();s_observed.cloud=*cloud;
     if(fresh_version)s_observed.cloud.book_version=fresh_version;
-    if(have_local){baseline(local,cloud);local->base_version=cloud->base_version;if(!different)local->progress=cloud->progress;}
-    *conflict = different;
     if (!have_local) {
-        *local = *cloud; local->reading_time = 0;
+        *local = *cloud; local->reading_time = 0; local->pending_pages = 0;
+        local->dirty = local->position_pending = local->sync_conflict = false;
         if (local->chapter_uid) err = save(id, local);
+    } else if (weread_progress_ahead(cloud, local)) {
+        // 云端进度严格领先：自动采用云端位置，取消二选一冲突弹窗。/ Cloud is strictly ahead: adopt cloud automatically without prompting.
+        uint32_t rev = next_revision(local->revision);
+        *local = *cloud;
+        local->reading_time = 0; local->pending_pages = 0;
+        local->dirty = local->position_pending = local->sync_conflict = false;
+        local->retry_after = 0; local->retry_count = 0; local->revision = rev;
+        err = save(id, local);
+    } else {
+        // 本机领先或一致：保留本机位置并静默对齐云端基线。/ Local is ahead or tied: keep local position and rebase cloud baseline silently.
+        bool same = local->chapter_uid == cloud->chapter_uid && local->chapter_offset == cloud->chapter_offset &&
+            local->chapter_index == cloud->chapter_index;
+        bool had_conflict = local->sync_conflict;
+        bool base_changed = !local->base_known || local->base_uid != cloud->base_uid ||
+            local->base_index != cloud->base_index || local->base_offset != cloud->base_offset ||
+            local->base_version != cloud->base_version;
+        baseline(local,cloud);local->base_version=cloud->base_version;local->sync_conflict=false;
+        local->retry_after=0;local->retry_count=0;
+        if(same&&!local->dirty&&!local->position_pending)local->progress=cloud->progress;
+        if(local->chapter_uid&&(had_conflict||base_changed||(same&&!local->dirty&&!local->position_pending)))
+            err=weread_progress_checkpoint(id,local);
     }
     return err;
 }
@@ -485,28 +555,32 @@ esp_err_t weread_progress_sync(const char *id,weread_progress_t *local,weread_pr
 }
 esp_err_t weread_progress_checkpoint(const char *id,const weread_progress_t *p){WR_GUARD;
     if (!p || !p->chapter_uid || p->progress > 100 || !memchr(p->summary, 0, sizeof(p->summary))) return ESP_ERR_INVALID_ARG;
-    weread_progress_t old;
-    if(weread_progress_load(id,&old)==ESP_OK&&old.chapter_uid==p->chapter_uid&&old.chapter_index==p->chapter_index&&
-       old.chapter_offset==p->chapter_offset&&old.progress==p->progress&&old.book_version==p->book_version&&
-       old.reading_time==p->reading_time&&old.pending_pages==p->pending_pages&&old.updated_at==p->updated_at&&
-       old.last_report_ms==p->last_report_ms&&old.dirty==p->dirty&&old.position_pending==p->position_pending&&
-       old.base_known==p->base_known&&old.base_uid==p->base_uid&&old.base_index==p->base_index&&old.base_offset==p->base_offset&&
-       old.base_version==p->base_version&&old.sync_conflict==p->sync_conflict&&old.revision==p->revision&&
-       old.retry_after==p->retry_after&&old.retry_count==p->retry_count&&!strcmp(old.summary,p->summary))return ESP_OK;
+    weread_progress_t *old __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*old));
+    if (!old) return ESP_ERR_NO_MEM;
+    if(weread_progress_load(id,old)==ESP_OK&&old->chapter_uid==p->chapter_uid&&old->chapter_index==p->chapter_index&&
+       old->chapter_offset==p->chapter_offset&&old->progress==p->progress&&old->book_version==p->book_version&&
+       old->reading_time==p->reading_time&&old->pending_pages==p->pending_pages&&old->updated_at==p->updated_at&&
+       old->last_report_ms==p->last_report_ms&&old->dirty==p->dirty&&old->position_pending==p->position_pending&&
+       old->base_known==p->base_known&&old->base_uid==p->base_uid&&old->base_index==p->base_index&&old->base_offset==p->base_offset&&
+       old->base_version==p->base_version&&old->sync_conflict==p->sync_conflict&&old->revision==p->revision&&
+       old->retry_after==p->retry_after&&old->retry_count==p->retry_count&&!strcmp(old->summary,p->summary))return ESP_OK;
     return save(id,p);
 }
 esp_err_t weread_progress_select(const char *id, const weread_progress_t *p, bool from_cloud) { WR_GUARD;
     if(!p)return ESP_ERR_INVALID_ARG;
-    weread_progress_t selected = *p,old;
-    if(weread_progress_load(id,&old)==ESP_OK)selected.revision=next_revision(old.revision);
-    selected.dirty = !from_cloud;
-    selected.sync_conflict=false;selected.retry_after=0;selected.retry_count=0;
-    if(from_cloud){baseline(&selected,p);if(p->base_known)selected.base_version=p->base_version;}
-    else if(!strcmp(s_observed.id,id)&&s_observed.session==session_stamp())baseline(&selected,&s_observed.cloud);
-    selected.position_pending=!from_cloud;
-    if (from_cloud) selected.pending_pages = selected.reading_time = 0;
+    weread_progress_t *selected __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*selected));
+    weread_progress_t *old __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*old));
+    if (!selected || !old) return ESP_ERR_NO_MEM;
+    *selected = *p;
+    if(weread_progress_load(id,old)==ESP_OK)selected->revision=next_revision(old->revision);
+    selected->dirty = !from_cloud;
+    selected->sync_conflict=false;selected->retry_after=0;selected->retry_count=0;
+    if(from_cloud){baseline(selected,p);if(p->base_known)selected->base_version=p->base_version;}
+    else if(!strcmp(s_observed.id,id)&&s_observed.session==session_stamp())baseline(selected,&s_observed.cloud);
+    selected->position_pending=!from_cloud;
+    if (from_cloud) selected->pending_pages = selected->reading_time = 0;
     s_rescue_choice=true;
-    esp_err_t err=weread_progress_checkpoint(id,&selected);
+    esp_err_t err=weread_progress_checkpoint(id,selected);
     s_rescue_choice=false;return err;
 }
 esp_err_t weread_progress_note_time(const char *id,uint32_t seconds,uint64_t timestamp){WR_GUARD;
@@ -712,9 +786,6 @@ esp_err_t weread_progress_outbox_next(char *id,size_t cap,uint64_t now) { WR_GUA
     }
     return ESP_ERR_NOT_FOUND;
 }
-static bool same_position(const weread_progress_t *a,const weread_progress_t *b){
-    return a->chapter_uid==b->chapter_uid&&a->chapter_index==b->chapter_index&&a->chapter_offset==b->chapter_offset;
-}
 static bool same_baseline(const weread_progress_t *a,const weread_progress_t *b){
     return a->base_known==b->base_known&&a->base_uid==b->base_uid&&a->base_index==b->base_index&&
         a->base_offset==b->base_offset&&a->base_version==b->base_version;
@@ -750,21 +821,44 @@ esp_err_t weread_progress_outbox_report(const char *id,uint64_t now_ms,uint64_t 
         if(sent.sync_conflict)return WEREAD_ERR_PROGRESS_CONFLICT;
         if(sent.retry_after>now&&sent.retry_after-now<=300)return ESP_ERR_TIMEOUT;
     }
-    if(!sent.base_known)return outbox_failure(id,&session,&sent,WEREAD_ERR_PROGRESS_CONFLICT,now,out);
     weread_progress_t cloud;uint32_t version=0;
     esp_err_t err=fetch_progress(id,&cloud,&version,NULL,&session);
     if(err!=ESP_OK)return outbox_failure(id,&session,&sent,err,now,out);
     if(version&&cloud.book_version&&version!=cloud.book_version)
-        return outbox_failure(id,&session,&sent,WEREAD_ERR_PROGRESS_CONFLICT,now,out);
+        return outbox_failure(id,&session,&sent,WEREAD_ERR_VERSION,now,out);
     if(version)cloud.book_version=version;
+    bool resolved=false;
     { WR_GUARD;
         if(!identity_matches(&session))return ESP_ERR_INVALID_STATE;
         weread_progress_t latest;err=weread_progress_load(id,&latest);if(err!=ESP_OK)return err;*out=latest;
         if(latest.revision!=sent.revision)return ESP_ERR_INVALID_STATE;
-        bool wrong_version=sent.book_version!=version||(cloud.book_version&&sent.book_version!=cloud.book_version);
-        if(wrong_version||(!cloud_matches_base(&cloud,&sent)&&!same_position(&cloud,&sent)))
-            return outbox_failure(id,&session,&sent,WEREAD_ERR_PROGRESS_CONFLICT,now,out);
+        if((!sent.base_known||!cloud_matches_base(&cloud,&sent))&&weread_progress_ahead(&cloud,&latest)){
+            // 云端严格领先：自动采用云端位置，不再锁定冲突状态。/ Cloud is strictly ahead: adopt cloud automatically without locking conflict.
+            uint32_t rev=next_revision(latest.revision);
+            baseline(&cloud,&cloud);if(version)cloud.base_version=version;
+            latest=cloud;latest.reading_time=0;latest.pending_pages=0;
+            latest.dirty=latest.position_pending=latest.sync_conflict=false;
+            latest.retry_after=0;latest.retry_count=0;latest.last_report_ms=now_ms;
+            latest.revision=rev;
+            err=save(id,&latest);
+            if(err==ESP_OK){*out=latest;resolved=true;}
+            else return err;
+        }else{
+            bool wrong_version=sent.book_version!=version||(cloud.book_version&&sent.book_version!=cloud.book_version);
+            if(wrong_version)return outbox_failure(id,&session,&sent,WEREAD_ERR_VERSION,now,out);
+            if(!sent.base_known||!cloud_matches_base(&cloud,&sent)){
+                // 本机领先或持平但基线缺失/过期：对齐云端基线后再上行，不触发二选一冲突。
+                // Local is ahead or tied with missing/stale baseline: rebase to cloud before POSTing without flagging a conflict.
+                baseline(&cloud,&cloud);if(version)cloud.base_version=version;
+                baseline(&sent,&cloud);sent.base_version=cloud.base_version;
+                baseline(&latest,&cloud);latest.base_version=cloud.base_version;
+                latest.sync_conflict=false;
+                err=save(id,&latest);if(err!=ESP_OK)return err;
+                *out=latest;
+            }
+        }
     }
+    if(resolved)return ESP_OK;
     err=send_progress(id,&sent,&session);
     if(err!=ESP_OK)return outbox_failure(id,&session,&sent,err,now,out);
     { WR_GUARD;

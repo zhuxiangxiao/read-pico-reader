@@ -16,13 +16,14 @@ unit=r'''
 #include <string.h>
 typedef int esp_err_t;
 enum {ESP_OK,ESP_FAIL,ESP_ERR_NO_MEM,ESP_ERR_INVALID_STATE,WEREAD_ERR_PURCHASE,WEREAD_ERR_SOLD_OUT,WEREAD_ERR_VERSION};
-enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER};
+enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER,WR_JOB_PREFETCH};
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE} app_redraw_t;
 typedef struct {bool touched;} touch_t;
 typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;} app_ctx_t;
 typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t;
 static struct {bool pending,started,committing,last_page;esp_err_t error;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
-static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true;
+static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,cached_flag,prefetch_busy,cloud_jump_ready,cloud_jump_committed;
+static size_t cloud_jump_ch;static uint32_t cloud_jump_off,adopted_uid;
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE;
 static char s_path[]="weread://book_A",s_message[128],s_reader_notice[64],s_title[64];
 static int64_t s_reader_notice_until;
@@ -33,6 +34,11 @@ static weread_result_t ready;
 static void *wr_alloc(size_t bytes){return alloc_fail?NULL:calloc(1,bytes);}
 static void copy_text(char *to,size_t cap,const char *from){snprintf(to,cap,"%s",from);}
 static bool weread_runtime_busy(void){return busy;}
+static bool weread_reader_cached(const char *uri,size_t ch){(void)uri;(void)ch;return cached_flag;}
+static bool weread_runtime_prefetch_active(const char *id,uint32_t uid){(void)id;(void)uid;return prefetch_busy;}
+static void weread_runtime_prefetch_adopt(uint32_t uid){adopted_uid=uid;}
+static bool weread_reader_poll_cloud_jump(const char *uri,size_t *ch,uint32_t *off){(void)uri;if(!cloud_jump_ready)return false;*ch=cloud_jump_ch;*off=cloud_jump_off;return true;}
+static void weread_reader_commit_cloud_jump(const char *uri,bool committed){(void)uri;cloud_jump_ready=false;if(committed)cloud_jump_committed=true;}
 static void weread_runtime_cancel(void){++cancels;}
 static bool weread_runtime_poll(weread_result_t *r){if(busy||!done)return false;done=false;*r=ready;return true;}
 static void weread_runtime_result_free(weread_result_t *r){memset(r,0,sizeof(*r));}
@@ -90,7 +96,27 @@ int main(void){
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE);complete(ESP_OK);
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&s_chapter==9&&moves==2);
  wr_chapter_cancel();
- puts("PASS: production chapter controller preserves old content, coalesces targets, validates completion, rejects failed saves and cancels safely");
+ // Adopting an in-flight same-chapter prefetch never cancels or restarts it.
+ unsigned c_before=cancels,s_before=starts;busy=true;prefetch_busy=true;
+ ready=(weread_result_t){.job=WR_JOB_PREFETCH,.chapter_uid=book_weread_uid(10)};strcpy(ready.id,"book_A");
+ assert(wr_chapter_queue(&ctx,10,0,false,NULL,SIZE_MAX));
+ assert(cancels==c_before&&starts==s_before&&s_wr_jump.started&&adopted_uid==book_weread_uid(10));
+ prefetch_busy=false;complete(ESP_OK);
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&s_chapter==10&&!s_wr_jump.pending&&!adopted_uid);
+ // Adopted prefetch failure falls back once to foreground WR_JOB_CHAPTER instead of surfacing a prefetch-only error.
+ busy=true;prefetch_busy=true;s_before=starts;
+ ready=(weread_result_t){.job=WR_JOB_PREFETCH,.chapter_uid=book_weread_uid(11)};strcpy(ready.id,"book_A");
+ assert(wr_chapter_queue(&ctx,11,0,false,NULL,SIZE_MAX));prefetch_busy=false;complete(ESP_FAIL);
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&starts==s_before+1&&busy&&s_wr_jump.pending&&!adopted_uid);
+ complete(ESP_OK);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&s_chapter==11&&!s_wr_jump.pending);
+ // Cloud-jump load failure never commits or overwrites progress.
+ cloud_jump_ready=true;cloud_jump_committed=false;cloud_jump_ch=12;cloud_jump_off=40;load_fail=true;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!cloud_jump_ready&&!cloud_jump_committed&&s_chapter==11);
+ load_fail=false;
+ // Async cloud-sync forward jump commits directly and shows toast.
+ cloud_jump_ready=true;cloud_jump_ch=12;cloud_jump_off=40;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&cloud_jump_committed&&s_chapter==12&&strstr(s_reader_notice,"已同步云端进度"));
+ puts("PASS: production chapter controller adopts prefetch, applies cloud jumps, coalesces targets, and cancels safely");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='weread-chapter-transition-') as folder:

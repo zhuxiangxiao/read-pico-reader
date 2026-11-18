@@ -12,6 +12,7 @@
 #include "reader_controls.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -234,6 +235,31 @@ void app_settings_set_book_reading_line(uint8_t style);
 /// 阅读线范围，false 跟随文字，true 整行/整列；提交成功才生效。/ Guide span, applied after commit.
 bool app_settings_book_reading_line_full(void);
 bool app_settings_set_book_reading_line_full(bool full);
+typedef enum {
+    APP_BOOK_HEADING_RULE,
+    APP_BOOK_HEADING_FLYLEAF,
+    APP_BOOK_HEADING_STAIR,
+    APP_BOOK_HEADING_SIDE,
+    APP_BOOK_HEADING_COUNT,
+} app_book_heading_style_t;
+typedef enum {
+    APP_BOOK_HEADING_ALIGN_CENTER,
+    APP_BOOK_HEADING_ALIGN_LEFT,
+    APP_BOOK_HEADING_ALIGN_RIGHT,
+    APP_BOOK_HEADING_ALIGN_COUNT,
+} app_book_heading_align_t;
+app_book_heading_style_t app_settings_book_heading_style(void);
+bool app_settings_set_book_heading_style(app_book_heading_style_t style);
+app_book_heading_align_t app_settings_book_heading_align(void);
+bool app_settings_set_book_heading_align(app_book_heading_align_t align);
+enum {
+    APP_BOOK_HEADING_SIZE_MIN = 80,
+    APP_BOOK_HEADING_SIZE_MAX = 200,
+    APP_BOOK_HEADING_SIZE_DEFAULT = 150,
+    APP_BOOK_HEADING_SIZE_STEP = 10,
+};
+unsigned app_settings_book_heading_size(void);
+bool app_settings_set_book_heading_size(unsigned percent);
 /// 阅读线相对默认位置 -8..+8 像素，2 像素一步，默认 0。/ Guide offset in 2 px steps.
 int8_t app_settings_book_reading_line_offset(void);
 void app_settings_set_book_reading_line_offset(int8_t offset_px);
@@ -265,6 +291,12 @@ bool app_settings_set_fonts_dir(const char* path);
 /// 将设置、阅读记录和 WiFi 凭据保存到 TF 卡根目录；备份含明文密码，需妥善保管。
 /// Save settings, reading records and WiFi credentials to TF root; keep the plaintext-secret backup private.
 esp_err_t app_settings_backup_save(void);
+/// 导出本机设置备份流到内存（与 TF 卡备份同一字节布局）；成功后调用方 free。
+/// Export the settings backup stream to memory (same byte layout as the card backup); caller frees.
+esp_err_t app_settings_sync_export(uint8_t **data, size_t *length);
+/// 校验并应用内存里的设置备份流；失败时不保留部分设置。
+/// Validate and apply a memory backup stream; a failure leaves no partial settings.
+esp_err_t app_settings_sync_import(const uint8_t *data, size_t length);
 /// 校验备份后恢复 NVS；缺失的外部字体或壁纸回退到内建资源。
 /// Validate before restoring NVS; missing external assets fall back safely.
 esp_err_t app_settings_backup_restore(void);

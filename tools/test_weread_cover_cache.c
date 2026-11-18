@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <time.h>
 #define WR_GUARD ((void)0)
+#define WR_MEMORY_SCOPE ((void)0)
 #define WEREAD_COVER_WIDTH 176
 #define WEREAD_COVER_HEIGHT 240
 typedef int esp_err_t;

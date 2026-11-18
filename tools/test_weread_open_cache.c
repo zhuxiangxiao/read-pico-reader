@@ -73,10 +73,12 @@ int main(int argc,char **argv){
     weread_auth_session_t session={0};strcpy(session.vid,"123");strcpy(session.access_token,"test-token");strcpy(session.refresh_token,"fixture-refresh");
     assert(weread_auth_save_session(&session)==ESP_OK&&weread_auth_load_session(&session)==ESP_OK);
     weread_client_set_transport(request,NULL);weread_client_set_download_transport(download,NULL);
-    assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("test_book_101")==ESP_OK&&weread_chapter_download("test_book_101",2)==ESP_OK);
+    bool predownload=!strcmp(argv[2],"warm")||!strcmp(argv[2],"selfheal-split")||!strcmp(argv[2],"local-stale-shelf");
+    assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("test_book_101")==ESP_OK&&(!predownload||weread_chapter_download("test_book_101",2)==ESP_OK));
     assert(weread_progress_note("test_book_101",missing_uid?1:2,missing_uid?1:2,missing_uid?0:20,missing_uid?0:86,0,0,"fixture",1700000100)==ESP_OK);
     weread_progress_t p;assert(weread_progress_load("test_book_101",&p)==ESP_OK&&weread_progress_select("test_book_101",&p,true)==ESP_OK);
     bool should_fail=!strcmp(argv[2],"stale-progress-version")||!strncmp(argv[2],"split-",6)||!strcmp(argv[2],"known-no-fresh")||!strcmp(argv[2],"selfheal-split");
+    if(!strcmp(argv[2],"local-stale-shelf"))assert(weread_shelf_set_version("test_book_101",101)==ESP_OK);
     if(!strcmp(argv[2],"hint-empty-unread")){empty_hint=true;last_index=3;}
     if(!strcmp(argv[2],"reordered-same-version"))cloud_index=3;
     if(!strcmp(argv[2],"append-same-version")){append_chapter=true;last_index=3;}
@@ -111,8 +113,9 @@ int main(int argc,char **argv){
         }
         weread_shelf_clear();return 0;
     }
-    assert(r.error==ESP_OK&&r.open_ready);weread_runtime_result_free(&r);
-    if(missing_uid||append_chapter||cloud_index!=2)assert(toc_requests==2);else if(!strcmp(argv[2],"warm"))assert(toc_requests==1);
+    assert(r.error==ESP_OK&&r.open_ready&&!r.conflict);weread_runtime_result_free(&r);
+    if(missing_uid||append_chapter||cloud_index!=2)assert(toc_requests==2);
+    else if(!strcmp(argv[2],"warm")||!strcmp(argv[2],"local-stale-shelf"))assert(toc_requests==1&&downloads==(unsigned)predownload);
     else if(!strcmp(argv[2],"fresh-version"))assert(cached==101&&toc_requests==2);
     const char *uri="weread://test_book_101";assert(book_weread_open(uri)==ESP_OK);size_t chapter=42;uint32_t offset=99;
     int resumed=weread_reader_resume(uri,&chapter,&offset);printf("resume=%d chapter=%zu offset=%u\n",resumed,chapter,offset);

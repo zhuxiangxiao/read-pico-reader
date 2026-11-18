@@ -127,7 +127,7 @@ PY
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_open_cache
 python3 - <<'PY'
 import subprocess,tempfile
-for mode in ('warm','missing-uid','fresh-version','split-progress','split-toc','known-no-fresh','selfheal-split','append-same-version','reordered-same-version','stale-progress-version','hint-empty-unread'):
+for mode in ('warm','local-stale-shelf','missing-uid','fresh-version','split-progress','split-toc','known-no-fresh','selfheal-split','append-same-version','reordered-same-version','stale-progress-version','hint-empty-unread'):
     with tempfile.TemporaryDirectory(prefix='weread-open-cache-') as cache:
         subprocess.run(['build/weread-tests/test_weread_open_cache',cache,mode],check=True)
 PY
@@ -194,4 +194,5 @@ python3 tools/weread_io_cache_host_test.py
 
 python3 tools/weread_time_cancel_host_test.py
 python3 tools/weread_reader_lifecycle_host_test.py
+python3 tools/weread_decoupling_host_test.py
 echo "All WeRead host tests passed cleanly!"

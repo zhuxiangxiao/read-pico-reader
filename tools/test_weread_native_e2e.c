@@ -92,12 +92,16 @@ int main(int argc, char **argv) {
     assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset==0);
     book_weread_close();
     assert(weread_progress_note("txt_book_202",1,1,3,25,0,1,"",1700000100)==ESP_OK);
+    // Local > cloud (empty) opens immediately without conflict modal and preserves local offset=3.
+    control("{\"latency\":2.0}");
+    uint64_t fast_started=milliseconds();
     assert(weread_runtime_start(WR_JOB_OPEN,"txt_book_202",NULL));result=completion();
-    assert(result.error==ESP_OK&&result.conflict);cloud=result.cloud;weread_runtime_result_free(&result);
-    assert(weread_runtime_choose("txt_book_202",&cloud,true));result=completion();
-    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(milliseconds()-fast_started<500);
+    assert(result.error==ESP_OK&&!result.conflict&&result.open_ready);weread_runtime_result_free(&result);
+    control("{\"latency\":0}");
     assert(book_weread_open("weread://txt_book_202")==ESP_OK);
-    assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset==0);
+    assert(weread_reader_resume("weread://txt_book_202",&unread_chapter,&unread_offset)==ESP_OK&&unread_chapter==0&&unread_offset>0);
+    assert(weread_progress_outbox_report("txt_book_202",62000,1700000105,&local)==ESP_OK&&!local.dirty);
     html_text_t txt={0};assert(book_weread_load(0,NULL,NULL,&txt)==ESP_OK&&txt.len>3);
     uint32_t txt_version=commit_chapter(0),txt_uid=book_weread_uid(0),txt_oracle=0;
     assert(book_weread_plain_text()&&book_weread_map_version(0,txt_version,true,3,&txt_oracle)==ESP_OK);
@@ -108,13 +112,8 @@ int main(int argc, char **argv) {
     assert(!book_weread_is_open()&&offline_downloads==txt_downloads);weread_client_set_download_transport(NULL,NULL);
     control("{\"progress_data\":{\"test_book_101\":{\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":3,\"progress\":50,\"updateTime\":2000000000}}}");
     assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
-    assert(result.error==ESP_OK&&result.conflict&&!result.open_ready);
-    if(result.conflict){
-        // 合法云端进度未带bookVersion，准备时绑定目录版本。/ Bind a valid cloud reply that omits bookVersion.
-        weread_progress_t choice=result.cloud;assert(!choice.book_version);weread_runtime_result_free(&result);
-        assert(weread_runtime_choose("test_book_101",&choice,true));result=completion();
-    }
-    assert(result.open_ready);weread_runtime_result_free(&result);
+    assert(result.error==ESP_OK&&!result.conflict&&result.open_ready&&result.local.chapter_offset==42);
+    weread_runtime_result_free(&result);
     assert(book_weread_prepared("test_book_101"));
     char toc_file[512],toc_hold[520];snprintf(toc_file,sizeof(toc_file),"%s/cache/test_book_101/chapters.json",argv[1]);snprintf(toc_hold,sizeof(toc_hold),"%s.hold",toc_file);
     assert(!rename(toc_file,toc_hold));
@@ -147,8 +146,11 @@ int main(int argc, char **argv) {
     assert(weread_runtime_start(WR_JOB_NOTE,"test_book_101",NULL));result=completion();
     assert(result.error==ESP_OK);weread_runtime_result_free(&result);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty);
-    weread_reader_tick("weread://test_book_101",0,offset,17,text.utf8+offset,3500,true);
-    result=completion();assert(result.job==WR_JOB_PREFETCH&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    if(!weread_reader_offline()){
+        weread_reader_tick("weread://test_book_101",0,offset,17,text.utf8+offset,3500,true);
+        result=completion();assert(result.job==WR_JOB_PREFETCH&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    }
+    assert(weread_reader_offline()>=1);
     weread_client_set_download_transport(offline,NULL);
     html_text_t next={0};unsigned old_downloads=offline_downloads;
     assert(weread_reader_prepare("weread://test_book_101",1)==ESP_OK);
@@ -188,21 +190,21 @@ int main(int argc, char **argv) {
     // 版本0仍是有效unknown身份；只拒绝与当前目录不同的版本。
     // Zero remains a valid unknown version when it matches the current TOC.
     book_weread_close();
+    assert(!unlink(chapter_manifest));
     control("{\"book_version\":0,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0},{\"bookId\":\"txt_book_202\",\"bookVersion\":1}],\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50}}}");
     assert(weread_shelf_refresh_book("test_book_101")==ESP_OK);
     assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
-    assert(result.error==ESP_OK&&result.conflict);cloud=result.cloud;weread_runtime_result_free(&result);
-    assert(weread_runtime_choose("test_book_101",&cloud,true));result=completion();
-    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(result.error==ESP_OK&&!result.conflict&&result.open_ready);weread_runtime_result_free(&result);
     assert(book_weread_open("weread://test_book_101")==ESP_OK);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     // Measure latency under an explicit stable edition; the unknown-version resume above remains a separate guard.
     book_weread_close();
+    assert(!unlink(chapter_manifest));
     control("{\"book_version\":101,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":101},{\"bookId\":\"txt_book_202\",\"bookVersion\":1}],\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50}}}");
     assert(weread_shelf_refresh_book("test_book_101")==ESP_OK);
     assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
-    assert(result.error==ESP_OK&&result.open_ready);weread_runtime_result_free(&result);
+    assert(result.error==ESP_OK&&!result.conflict&&result.open_ready);weread_runtime_result_free(&result);
     assert(book_weread_open("weread://test_book_101")==ESP_OK);
     assert(weread_reader_resume("weread://test_book_101",&chapter,&offset)==ESP_OK&&chapter==1);
     // Local persistence precedes HTTP; cached chapter reads and newer navigation do not wait for a delayed ACK.
@@ -212,6 +214,37 @@ int main(int argc, char **argv) {
     uint32_t stress_offset=(uint32_t)(word-stress.utf8),expected_raw=0;
     assert(book_weread_map(1,true,stress_offset+9,&expected_raw)==ESP_OK);
     assert(weread_reader_prepare("weread://test_book_101",0)==ESP_OK);
+    {
+        weread_reader_end(4900);book_weread_close();
+        assert(weread_progress_note("test_book_101",1,1,0,10,0,1,"local start",1700000150)==ESP_OK);
+        control("{\"latency\":1.0,\"book_version\":101,\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":101},{\"bookId\":\"txt_book_202\",\"bookVersion\":1}],\"progress_data\":{\"test_book_101\":{\"chapterUid\":2,\"chapterIdx\":2,\"chapterOffset\":3,\"progress\":50,\"bookVersion\":101}}}");
+        uint64_t t0=milliseconds();
+        assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));
+        result=completion();
+        assert(milliseconds()-t0<500&&result.error==ESP_OK&&result.open_ready);
+        weread_runtime_result_free(&result);
+        assert(book_weread_open("weread://test_book_101")==ESP_OK);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_resume("weread://test_book_101",&jch,&joff)==ESP_OK&&jch==0);
+        weread_reader_begin("weread://test_book_101",4950);
+        html_text_t ch0={0};assert(book_weread_load(0,NULL,NULL,&ch0)==ESP_OK);
+        assert(commit_chapter(0)==101);html_text_free(&ch0);
+        control("{\"latency\":0}");
+        for(int s=0;s<6;++s){
+            weread_reader_tick("weread://test_book_101",0,0,10,"local start",5300+(uint64_t)s*100,true);
+            if(weread_runtime_busy()){result=completion();weread_runtime_result_free(&result);}
+        }
+        assert(weread_reader_poll_cloud_jump("weread://test_book_101",&jch,&joff)&&jch==1);
+        weread_reader_commit_cloud_jump("weread://test_book_101",true);
+        weread_reader_end(4990);
+        html_text_free(&stress);memset(&stress,0,sizeof(stress));
+        assert(weread_reader_resume("weread://test_book_101",&jch,&joff)==ESP_OK&&jch==1);
+        assert(book_weread_load(1,NULL,NULL,&stress)==ESP_OK);
+        assert(commit_chapter(1)==101);
+        word=strstr(stress.utf8,"预读成功");assert(word);
+        stress_offset=(uint32_t)(word-stress.utf8);
+        assert(book_weread_map(1,true,stress_offset+9,&expected_raw)==ESP_OK);
+    }
     weread_reader_begin("weread://test_book_101",5000);
     for(unsigned i=0;i<10;++i){uint32_t target=stress_offset+(i%2)*3;
         weread_reader_navigated("weread://test_book_101",1,target,83,stress.utf8+target);

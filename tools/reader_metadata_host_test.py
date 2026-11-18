@@ -56,8 +56,10 @@ static void ui_hairline(uint8_t *fb,int y,int x,int width,int gray){(void)fb;ass
 
 static enum EpdDrawError error;
 static const char *expected_chapter="Chapter name";
-static unsigned percent(size_t page){(void)page;return test_percent;}
-static __attribute__((unused)) size_t book_chapter_count(void){return total_chapters;}
+static size_t s_part_base;
+static bool s_part_more;
+static unsigned percent(size_t page){return (unsigned)page;}
+static size_t book_chapter_count(void){return total_chapters;}
 static void fit_fixed_text(char *text,int px,int width){assert(px>0&&width>0);(void)text;}
 static int ui_text_fixed_width_px(int px,const char *text){return (int)strlen(text)*px/2;}
 static void reader_footer_chapter_name(char *text,size_t cap){snprintf(text,cap,"%s",expected_chapter);}

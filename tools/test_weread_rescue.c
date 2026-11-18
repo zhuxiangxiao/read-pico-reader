@@ -126,7 +126,7 @@ int main(int argc,char **argv){
         assert(weread_progress_outbox_report(id,90000,1700000200,&p)==WEREAD_ERR_PROGRESS_CONFLICT&&!reads&&!writes&&p.sync_conflict);
         if(!strcmp(mode,"choice")){
             cloud.chapter_offset=55;bool conflict=false;weread_progress_t c;
-            assert(weread_progress_sync(id,&p,&c,&conflict)==ESP_OK&&conflict);
+            assert(weread_progress_sync(id,&p,&c,&conflict)==ESP_OK&&!conflict&&p.chapter_offset==55);
             assert(weread_progress_select(id,&c,true)==ESP_OK);p=pending();assert(p.chapter_offset==55&&!p.dirty&&!p.position_pending);
             assert(internal_erases==1);return 0;
         }
@@ -144,7 +144,7 @@ int main(int argc,char **argv){
     block_tf(false);
     if(!strcmp(mode,"version"))cloud.book_version=101;
     esp_err_t err=weread_progress_outbox_report(id,90000,1700000300,&p);
-    if(cloud.book_version==101)assert(err==WEREAD_ERR_PROGRESS_CONFLICT&&!writes&&p.book_version==100&&p.sync_conflict);
+    if(cloud.book_version==101)assert(err==WEREAD_ERR_VERSION&&!writes&&p.book_version==100&&!p.sync_conflict);
     else assert(err==ESP_OK&&!p.dirty);
     printf("PASS %s\n",mode);return 0;
 }

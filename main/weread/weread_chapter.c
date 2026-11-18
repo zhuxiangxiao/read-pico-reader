@@ -372,11 +372,17 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
         char *data = NULL; size_t len = 0;
         err = read_file(path, &data, &len); if (err != ESP_OK) break;
         if (!strcmp(format, "txt")) {
-            const weread_auth_session_t *s = weread_auth_get_current_session();
+            char env_vid[WEREAD_VID_MAX_LEN] = "";
+            {
+                WR_GUARD;
+                const weread_auth_session_t *s = weread_auth_get_current_session();
+                if (s) wr_copy(env_vid, sizeof(env_vid), s->vid);
+            }
             uint8_t *plain = NULL; size_t plain_len = 0;
-            if (s && book_weread_unwrap_envelope((const uint8_t *)data, len, s->vid, NULL, 0, &plain, &plain_len)) {
+            if (env_vid[0] && book_weread_unwrap_envelope((const uint8_t *)data, len, env_vid, NULL, 0, &plain, &plain_len)) {
                 free(data); data = (char *)plain; len = plain_len;
             }
+            weread_secure_zero(env_vid, sizeof(env_vid));
         }
         char background[512]="";
         if(strcmp(format,"txt"))err=background_image(data,len,normalized,background);
@@ -396,7 +402,7 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
     }
     cJSON_Delete(info); return err;
 }
-esp_err_t weread_chapter_download(const char *id, uint32_t uid) { WR_GUARD; return weread_chapter_download_ex(id, uid, false); }
+esp_err_t weread_chapter_download(const char *id, uint32_t uid) { return weread_chapter_download_ex(id, uid, false); }
 // 大型路径/响应/解包缓冲可回收，网络任务只保留小内部栈。/ Reclaim large path/response/extraction buffers while keeping a small internal network stack.
 typedef struct {
     weread_book_t b;
@@ -447,7 +453,7 @@ esp_err_t weread_chapter_prefetch_space(uint64_t *available){WR_GUARD;
     // 32MiB归档和64MiB展开同时存在，另留4MiB正文、映射及事务余量。/ Archive32MiB and expanded64MiB coexist; retain body4MiB plus map/transaction slack.
     return free_bytes>=104u*1024u*1024u?ESP_OK:WEREAD_ERR_STORAGE;
 }
-esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_GUARD;
+esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_MEMORY_SCOPE;
     if (!wr_valid_id(id) || !uid) return ESP_ERR_INVALID_ARG;
     if(weread_chapter_cached(id,uid))return ESP_OK;
     if(preload){esp_err_t space=weread_chapter_prefetch_space(NULL);if(space!=ESP_OK)return space;}
@@ -500,10 +506,22 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         memset(&w->x,0,sizeof(w->x)); wr_copy(w->x.root, sizeof(w->x.root), w->root);
         if (err == ESP_OK && !strcmp(w->b.format, "epub")) {
             size_t n = 0;
-            const weread_auth_session_t *s = weread_auth_get_current_session();
-            const char *secrets[] = {s ? s->vid : "", s ? s->access_token : ""};
+            char sec_vid[WEREAD_VID_MAX_LEN] = "", sec_tok[WEREAD_TOKEN_MAX_LEN] = "";
+            bool has_session = false;
+            {
+                WR_GUARD;
+                const weread_auth_session_t *s = weread_auth_get_current_session();
+                if (s) {
+                    has_session = true;
+                    wr_copy(sec_vid, sizeof(sec_vid), s->vid);
+                    wr_copy(sec_tok, sizeof(sec_tok), s->access_token);
+                }
+            }
+            const char *secrets[] = {has_session ? sec_vid : "", has_session ? sec_tok : ""};
             if (!book_weread_decrypt_encrypt_key_candidates(w->response.encrypt_key, secrets, 2, w->password, sizeof(w->password), &n)) err = ESP_ERR_INVALID_RESPONSE;
             else err = book_weread_unpack_zip_file(archive, w->password, n, extract, &w->x);
+            weread_secure_zero(sec_vid, sizeof(sec_vid));
+            weread_secure_zero(sec_tok, sizeof(sec_tok));
             weread_secure_zero(w->password, sizeof(w->password));
         } else if (err == ESP_OK) err = book_weread_unpack_tar_file(archive, extract, &w->x);
         if (w->x.file) fclose(w->x.file);
@@ -517,23 +535,23 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
 #if defined(ESP_PLATFORM)
         int64_t assembled=esp_timer_get_time();
 #endif
-        cJSON *m = NULL;
+        bool published = false;
         if (err == ESP_OK) {
-            m = cJSON_CreateObject();
+            WR_GUARD;
+            cJSON *m = cJSON_CreateObject();
             if (!m || !wr_set_owner(m) || !cJSON_AddStringToObject(m, "root", w->leaf) ||
                 !cJSON_AddNumberToObject(m, "bookVersion", v) || !cJSON_AddNumberToObject(m, "chapterUid", uid)) err = ESP_ERR_NO_MEM;
+            if (err == ESP_OK && cancelled()) err = ESP_ERR_INVALID_STATE;
+            if (err == ESP_OK && common) {
+                wr_cache_path(id, "resources.json", w->path, sizeof(w->path)); err = wr_write_json(w->path, m);
+                published = err == ESP_OK;
+            }
+            if (err == ESP_OK) {
+                char manifest_leaf[64]; snprintf(manifest_leaf, sizeof(manifest_leaf), "chapter-%u.json", (unsigned)uid);
+                wr_cache_path(id, manifest_leaf, w->path, sizeof(w->path)); err = wr_write_json(w->path, m);
+            }
+            cJSON_Delete(m);
         }
-        if (err == ESP_OK && cancelled()) err = ESP_ERR_INVALID_STATE;
-        bool published = false;
-        if (err == ESP_OK && common) {
-            wr_cache_path(id, "resources.json", w->path, sizeof(w->path)); err = wr_write_json(w->path, m);
-            published = err == ESP_OK;
-        }
-        if (err == ESP_OK) {
-            char manifest_leaf[64]; snprintf(manifest_leaf, sizeof(manifest_leaf), "chapter-%u.json", (unsigned)uid);
-            wr_cache_path(id, manifest_leaf, w->path, sizeof(w->path)); err = wr_write_json(w->path, m);
-        }
-        cJSON_Delete(m);
 #if defined(ESP_PLATFORM)
         ESP_LOGI("weread","chapter timing download=%u unpack=%u assemble=%u commit=%u result=%d preload=%d",
             (unsigned)((downloaded-started)/1000),(unsigned)((unpacked-downloaded)/1000),
@@ -552,7 +570,7 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
     }
     return WEREAD_ERR_VERSION;
 }
-esp_err_t weread_chapter_load(const char *id, uint32_t uid, char **text, size_t *len) { WR_GUARD;
+esp_err_t weread_chapter_load(const char *id, uint32_t uid, char **text, size_t *len) {
     if (!text || !len) return ESP_ERR_INVALID_ARG;
     *text = NULL; *len = 0;
     esp_err_t err = weread_chapter_download(id, uid);
