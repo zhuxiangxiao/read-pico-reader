@@ -676,33 +676,35 @@ esp_err_t weread_reader_save(uint64_t now){
     uint8_t current_media[WEREAD_MEDIA_ID_BYTES];
     bool present=s_reader.media_valid&&weread_progress_capture_media(current_media);
     if(present&&memcmp(current_media,s_reader.media_id,sizeof(current_media))){s_reader.save_failed=true;return ESP_ERR_INVALID_STATE;}
-    weread_progress_t sample={0};bool noted=false,rescued=false;
+    weread_progress_t *sample __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*sample));
+    if(!sample){s_reader.save_failed=true;return ESP_ERR_NO_MEM;}
+    bool noted=false,rescued=false;
     bool mapped=s_reader.anchor||s_reader.pending_coordinate;
-    sample.chapter_uid=mapped?s_reader.anchor_uid:s_reader.nav_uid;
-    sample.chapter_index=mapped?s_reader.anchor_index:s_reader.nav_index;
-    sample.chapter_offset=mapped?s_reader.anchor_offset:s_reader.nav_offset;
-    sample.progress=s_reader.anchor?s_reader.anchor_percent:s_reader.nav_percent;
-    sample.reading_time=(uint32_t)(s_reader.active_ms/1000);sample.pending_pages=s_reader.pages;
-    wr_display_copy(sample.summary,sizeof(sample.summary),s_reader.summary);
+    sample->chapter_uid=mapped?s_reader.anchor_uid:s_reader.nav_uid;
+    sample->chapter_index=mapped?s_reader.anchor_index:s_reader.nav_index;
+    sample->chapter_offset=mapped?s_reader.anchor_offset:s_reader.nav_offset;
+    sample->progress=s_reader.anchor?s_reader.anchor_percent:s_reader.nav_percent;
+    sample->reading_time=(uint32_t)(s_reader.active_ms/1000);sample->pending_pages=s_reader.pages;
+    wr_display_copy(sample->summary,sizeof(sample->summary),s_reader.summary);
     esp_err_t err=mapped?ESP_OK:s_reader.media_valid&&!present?
-        book_weread_map_cached(s_reader.nav_chapter,s_reader.nav_version,true,s_reader.nav_offset,&sample.chapter_offset):
-        book_weread_map_version(s_reader.nav_chapter,s_reader.nav_version,true,s_reader.nav_offset,&sample.chapter_offset);
+        book_weread_map_cached(s_reader.nav_chapter,s_reader.nav_version,true,s_reader.nav_offset,&sample->chapter_offset):
+        book_weread_map_version(s_reader.nav_chapter,s_reader.nav_version,true,s_reader.nav_offset,&sample->chapter_offset);
     if(!mapped&&err==ESP_ERR_INVALID_STATE&&present&&!book_weread_is_open())
         err=book_weread_map_detached(s_reader.id,s_reader.nav_uid,s_reader.nav_version,s_reader.plain_text,
-            s_reader.nav_offset,&sample.chapter_offset);
+            s_reader.nav_offset,&sample->chapter_offset);
     if(err==ESP_OK&&!s_reader.anchor){
         s_reader.owner_version=s_reader.nav_version;
-        s_reader.pending_coordinate=true;s_reader.anchor_uid=sample.chapter_uid;s_reader.anchor_index=sample.chapter_index;
-        s_reader.anchor_offset=sample.chapter_offset;s_reader.anchor_percent=sample.progress;
+        s_reader.pending_coordinate=true;s_reader.anchor_uid=sample->chapter_uid;s_reader.anchor_index=sample->chapter_index;
+        s_reader.anchor_offset=sample->chapter_offset;s_reader.anchor_percent=sample->progress;
     }
-    if(err==ESP_OK)err=weread_progress_store_version_resilient(s_reader.id,&sample,!s_reader.anchor,s_reader.nav_version,
+    if(err==ESP_OK)err=weread_progress_store_version_resilient(s_reader.id,sample,!s_reader.anchor,s_reader.nav_version,
         (uint64_t)time(NULL),&noted,s_reader.durable_valid?&s_reader.durable:NULL,s_reader.media_valid?s_reader.media_id:NULL,&rescued);
     if(noted){
         s_reader.pages=0;s_reader.active_ms%=1000;s_reader.changed=false;s_reader.last_store=now;
-        s_reader.anchor_uid=sample.chapter_uid;s_reader.anchor_index=sample.chapter_index;
-        s_reader.anchor_offset=sample.chapter_offset;s_reader.anchor_percent=sample.progress;s_reader.anchor=true;
-        s_reader.state=weread_progress_state(&sample);s_reader.retry=sample.dirty&&sample.position_pending&&!sample.sync_conflict;
-        s_reader.durable=sample;s_reader.durable_valid=true;s_reader.rescued=rescued;s_reader.pending_coordinate=false;
+        s_reader.anchor_uid=sample->chapter_uid;s_reader.anchor_index=sample->chapter_index;
+        s_reader.anchor_offset=sample->chapter_offset;s_reader.anchor_percent=sample->progress;s_reader.anchor=true;
+        s_reader.state=weread_progress_state(sample);s_reader.retry=sample->dirty&&sample->position_pending&&!sample->sync_conflict;
+        s_reader.durable=*sample;s_reader.durable_valid=true;s_reader.rescued=rescued;s_reader.pending_coordinate=false;
         if(!mapped||s_reader.nav_version!=s_reader.owner_version)s_reader.owner_version=s_reader.nav_version;
     }
     s_reader.save_failed=err!=ESP_OK;
@@ -730,10 +732,11 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         ++s_reader.pages;s_reader.changed=true;s_reader.navigation_pending=false;
     }
     (void)summary;
-    weread_result_t result;
     // 冷章结果由页面准备状态机消费，采样不能提前吞掉错误。
     // The page transition owns cold-chapter completion, including errors.
-    if (!weread_runtime_busy()&&s_result.job!=WR_JOB_CHAPTER&&weread_runtime_poll(&result))weread_runtime_result_free(&result);
+    if (!weread_runtime_busy()&&s_result.job!=WR_JOB_CHAPTER&&atomic_exchange(&s_done,false)){
+        consume_reader_result();weread_runtime_result_free(&s_result);
+    }
     if (weread_runtime_busy() || !active) return;
     if((s_reader.changed&&now-s_reader.last_store>=1000)||s_reader.active_ms>=60000){
         (void)weread_reader_save(now);return;
@@ -757,7 +760,7 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
 }
 void weread_reader_flush(uint64_t now, bool stop) {
     if(stop||!s_reader.id[0]||(weread_runtime_busy()&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT))weread_runtime_cancel_join();
-    weread_result_t result;if(weread_runtime_poll(&result))weread_runtime_result_free(&result);
+    if(!weread_runtime_busy()&&atomic_exchange(&s_done,false)){consume_reader_result();weread_runtime_result_free(&s_result);}
     (void)weread_reader_save(now);
     if(stop)weread_runtime_stop();
 }

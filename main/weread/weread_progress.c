@@ -218,6 +218,22 @@ static esp_err_t owner_path(const char *id,const char *vid,char out[512]){
     char leaf[64];snprintf(leaf,sizeof(leaf),"progress.json.%s",vid);
     return wr_cache_path(id,leaf,out,512);
 }
+typedef struct {
+    weread_progress_t record;
+    char archive[512];
+} foreign_owner_work_t;
+typedef struct {
+    rescue_record_t record;
+    weread_progress_t current;
+} rescue_save_work_t;
+typedef struct {
+    char path[512], recovery[600];
+    weread_progress_t foreign;
+} load_tf_work_t;
+typedef struct {
+    rescue_record_t record;
+    weread_progress_t delta, old, next;
+} rescue_store_work_t;
 // 共享同一书号的账号切换不能覆盖另一账号的待报位置。/ Switching accounts on the same book must retain the previous owner's pending position.
 static esp_err_t retain_foreign_owner(const char *id,const char *path){
     cJSON *old=NULL;esp_err_t err=wr_read_json_primary(path,&old);
@@ -225,23 +241,31 @@ static esp_err_t retain_foreign_owner(const char *id,const char *path){
     if(err==ESP_ERR_NOT_FOUND)return ESP_OK;
     if(err==ESP_ERR_NO_MEM)return err;
     if(err!=ESP_OK){
-        cJSON *backup=NULL;weread_progress_t record;
+        cJSON *backup=NULL;
         if(wr_read_json(path,&backup)==ESP_OK){
+            foreign_owner_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
             const char *saved_id=wr_string(backup,"bookId");
-            if(wr_owner_matches(backup)&&saved_id&&!strcmp(saved_id,id)&&decode(backup,&record,false))err=ESP_OK;
+            if(!w)err=ESP_ERR_NO_MEM;
+            else if(wr_owner_matches(backup)&&saved_id&&!strcmp(saved_id,id)&&decode(backup,&w->record,false))err=ESP_OK;
         }
         cJSON_Delete(backup);return err;
     }
     if(!wr_owner_matches(old)){
-        weread_progress_t record;const char *saved_id=wr_string(old,"bookId");
-        char archive[512];err=saved_id&&!strcmp(saved_id,id)&&decode(old,&record,false)?
-            owner_path(id,wr_string(old,"vid"),archive):ESP_ERR_INVALID_RESPONSE;
-        if(err==ESP_OK)err=wr_write_json(archive,old);
+        foreign_owner_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
+        const char *saved_id=wr_string(old,"bookId");
+        if(!w)err=ESP_ERR_NO_MEM;
+        else{
+            err=saved_id&&!strcmp(saved_id,id)&&decode(old,&w->record,false)?
+                owner_path(id,wr_string(old,"vid"),w->archive):ESP_ERR_INVALID_RESPONSE;
+            if(err==ESP_OK)err=wr_write_json(w->archive,old);
+        }
     }
     cJSON_Delete(old);return err;
 }
 static esp_err_t save_tf(const char *id, const weread_progress_t *p) {
-    char path[512]; esp_err_t err = wr_cache_path(id, "progress.json", path, sizeof(path));
+    char *path __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    if (!path) return ESP_ERR_NO_MEM;
+    esp_err_t err = wr_cache_path(id, "progress.json", path, 512);
     if (err != ESP_OK) return err;
     err=retain_foreign_owner(id,path);if(err!=ESP_OK)return err;
     cJSON *o = encode(p);
@@ -261,18 +285,18 @@ static esp_err_t save(const char *id,const weread_progress_t *p){
     uint8_t card[WEREAD_MEDIA_ID_BYTES];
     if(!rescue_enabled())return save_tf(id,p);
     if(!media_id(card))return ESP_ERR_INVALID_STATE;
-    rescue_record_t *record __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*record));
-    if(!record)return ESP_ERR_NO_MEM;
-    unsigned slot;esp_err_t err=rescue_find(id,card,record,&slot);
+    rescue_save_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
+    if(!w)return ESP_ERR_NO_MEM;
+    unsigned slot;esp_err_t err=rescue_find(id,card,&w->record,&slot);
     if(err==ESP_ERR_NOT_FOUND)return save_tf(id,p);
     if(err!=ESP_OK)return err;
-    weread_progress_t current;err=load_tf(id,&current);
-    bool safe=err==ESP_ERR_NOT_FOUND||(err==ESP_OK&&(progress_equal(&current,&record->expected)||progress_equal(&current,&record->desired)));
-    if(err==ESP_OK&&safe)record->expected=current;
-    record->desired=*p;
-    err=rescue_write(slot,record);if(err!=ESP_OK)return err;
+    err=load_tf(id,&w->current);
+    bool safe=err==ESP_ERR_NOT_FOUND||(err==ESP_OK&&(progress_equal(&w->current,&w->record.expected)||progress_equal(&w->current,&w->record.desired)));
+    if(err==ESP_OK&&safe)w->record.expected=w->current;
+    w->record.desired=*p;
+    err=rescue_write(slot,&w->record);if(err!=ESP_OK)return err;
     if(safe||s_rescue_choice){
-        err=save_tf(id,&record->desired);
+        err=save_tf(id,&w->record.desired);
         // 删除失败时已落卡和NVS内容相同，继续保留应急槽，下次幂等恢复。/ An erase failure retains an identical durable rescue copy for idempotent recovery.
         if(err==ESP_OK)(void)rescue_io(slot,NULL,2);
     }
@@ -287,14 +311,16 @@ static esp_err_t recover_owned(const char *path,const char *id,weread_progress_t
 static esp_err_t load_tf(const char *id, weread_progress_t *out) { WR_GUARD;
     if (!out) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
-    char path[512]; cJSON *o = NULL;
-    esp_err_t err = wr_cache_path(id, "progress.json", path, sizeof(path));
+    load_tf_work_t *w __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*w));
+    if (!w) return ESP_ERR_NO_MEM;
+    cJSON *o = NULL;
+    esp_err_t err = wr_cache_path(id, "progress.json", w->path, sizeof(w->path));
     if(err!=ESP_OK)return err;
-    err=wr_read_json_primary(path,&o);
+    err=wr_read_json_primary(w->path,&o);
     const char *saved_id = wr_string(o, "bookId");
-    const char *vid=wr_string(o,"vid");weread_progress_t foreign;
+    const char *vid=wr_string(o,"vid");
     bool foreign_valid=err==ESP_OK&&!wr_owner_matches(o)&&saved_id&&!strcmp(saved_id,id)&&
-        wr_valid_id(vid)&&strlen(vid)<WEREAD_VID_MAX_LEN&&decode(o,&foreign,false);
+        wr_valid_id(vid)&&strlen(vid)<WEREAD_VID_MAX_LEN&&decode(o,&w->foreign,false);
     bool allow_archive=err==ESP_ERR_NOT_FOUND||foreign_valid;
     if (err == ESP_OK && (!wr_owner_matches(o) || !saved_id || strcmp(saved_id, id) || !decode(o, out, false))) err = ESP_ERR_INVALID_RESPONSE;
     cJSON_Delete(o);
@@ -303,15 +329,15 @@ static esp_err_t load_tf(const char *id, weread_progress_t *out) { WR_GUARD;
     if(err==ESP_OK||err==ESP_ERR_NO_MEM){if(err!=ESP_OK)memset(out,0,sizeof(*out));return err;}
     // 主文件缺失/损坏时优先本账号事务副本；明确切换账号时优先该账号归档。/ Prefer the same-owner transaction backup after interrupted commits, and owner archives after an explicit account switch.
     for(unsigned pass=0;pass<2;++pass){
-        bool archive=pass? !foreign_valid:foreign_valid;char recovery[600];
+        bool archive=pass? !foreign_valid:foreign_valid;
         if(archive){
             const weread_auth_session_t *session=weread_auth_get_current_session();
-            if(!allow_archive||!session||owner_path(id,session->vid,recovery)!=ESP_OK)continue;
+            if(!allow_archive||!session||owner_path(id,session->vid,w->recovery)!=ESP_OK)continue;
         }else{
-            int length=snprintf(recovery,sizeof(recovery),"%s.previous",path);
-            if(length<0||(size_t)length>=sizeof(recovery))continue;
+            int length=snprintf(w->recovery,sizeof(w->recovery),"%s.previous",w->path);
+            if(length<0||(size_t)length>=sizeof(w->recovery))continue;
         }
-        esp_err_t recovered=recover_owned(recovery,id,out,archive);
+        esp_err_t recovered=recover_owned(w->recovery,id,out,archive);
         if(recovered==ESP_OK||recovered==ESP_ERR_NO_MEM){if(recovered!=ESP_OK)memset(out,0,sizeof(*out));return recovered;}
     }
     if(err!=ESP_OK)memset(out,0,sizeof(*out));
@@ -333,14 +359,14 @@ esp_err_t weread_progress_load(const char *id,weread_progress_t *out){WR_GUARD;
 static esp_err_t rescue_restore(const char *id,weread_progress_t *out){
     uint8_t card[WEREAD_MEDIA_ID_BYTES];
     if(!rescue_enabled()||!media_id(card))return ESP_ERR_NOT_FOUND;
-    rescue_record_t *record __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*record));
-    if(!record)return ESP_ERR_NO_MEM;
-    unsigned slot;esp_err_t err=rescue_find(id,card,record,&slot);if(err!=ESP_OK)return err;
-    *out=record->desired;weread_progress_t current;err=load_tf(id,&current);
+    rescue_save_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
+    if(!w)return ESP_ERR_NO_MEM;
+    unsigned slot;esp_err_t err=rescue_find(id,card,&w->record,&slot);if(err!=ESP_OK)return err;
+    *out=w->record.desired;err=load_tf(id,&w->current);
     if(err!=ESP_OK&&err!=ESP_ERR_NOT_FOUND)return err;
-    if(err==ESP_OK&&!progress_equal(&current,&record->expected)&&!progress_equal(&current,&record->desired))return WEREAD_ERR_PROGRESS_CONFLICT;
-    if(err!=ESP_OK||!progress_equal(&current,&record->desired)){
-        err=save_tf(id,&record->desired);if(err!=ESP_OK)return err;
+    if(err==ESP_OK&&!progress_equal(&w->current,&w->record.expected)&&!progress_equal(&w->current,&w->record.desired))return WEREAD_ERR_PROGRESS_CONFLICT;
+    if(err!=ESP_OK||!progress_equal(&w->current,&w->record.desired)){
+        err=save_tf(id,&w->record.desired);if(err!=ESP_OK)return err;
     }
     return rescue_io(slot,NULL,2);
 }
@@ -558,18 +584,20 @@ esp_err_t weread_progress_report(const char *id,bool force,uint64_t now){WR_GUAR
 }
 static esp_err_t store_sample(const char *id,weread_progress_t *sample,bool moved,bool bound,uint32_t content_version,uint64_t timestamp,bool *noted){WR_GUARD;
     if(!sample||!noted||timestamp>9007199254740991ULL)return ESP_ERR_INVALID_ARG;
-    *noted=false;weread_progress_t p;
-    esp_err_t err=weread_progress_load(id,&p);if(err!=ESP_OK&&(!moved||err!=ESP_ERR_NOT_FOUND))return err;
+    *noted=false;
+    weread_progress_t *p __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*p));
+    if(!p)return ESP_ERR_NO_MEM;
+    esp_err_t err=weread_progress_load(id,p);if(err!=ESP_OK&&(!moved||err!=ESP_ERR_NOT_FOUND))return err;
     if(moved){
         if(!sample->chapter_uid||sample->progress>100||!memchr(sample->summary,0,sizeof(sample->summary)))return ESP_ERR_INVALID_ARG;
-        p.chapter_uid=sample->chapter_uid;p.chapter_index=sample->chapter_index;p.chapter_offset=sample->chapter_offset;p.progress=sample->progress;
-        wr_display_copy(p.summary,sizeof(p.summary),sample->summary);p.position_pending=true;
-        uint32_t version=bound?content_version:weread_shelf_book_version(id);if(bound||version)p.book_version=version;
-        p.pending_pages=sample->pending_pages>UINT32_MAX-p.pending_pages?UINT32_MAX:p.pending_pages+sample->pending_pages;
+        p->chapter_uid=sample->chapter_uid;p->chapter_index=sample->chapter_index;p->chapter_offset=sample->chapter_offset;p->progress=sample->progress;
+        wr_display_copy(p->summary,sizeof(p->summary),sample->summary);p->position_pending=true;
+        uint32_t version=bound?content_version:weread_shelf_book_version(id);if(bound||version)p->book_version=version;
+        p->pending_pages=sample->pending_pages>UINT32_MAX-p->pending_pages?UINT32_MAX:p->pending_pages+sample->pending_pages;
     }
-    p.reading_time=sample->reading_time>UINT32_MAX-p.reading_time?UINT32_MAX:p.reading_time+sample->reading_time;
-    if(moved||sample->reading_time){p.updated_at=timestamp;p.dirty=true;p.revision=next_revision(p.revision);err=save(id,&p);if(err!=ESP_OK)return err;}
-    *noted=true;*sample=p;
+    p->reading_time=sample->reading_time>UINT32_MAX-p->reading_time?UINT32_MAX:p->reading_time+sample->reading_time;
+    if(moved||sample->reading_time){p->updated_at=timestamp;p->dirty=true;p->revision=next_revision(p->revision);err=save(id,p);if(err!=ESP_OK)return err;}
+    *noted=true;*sample=*p;
     return ESP_OK;
 }
 esp_err_t weread_progress_store(const char *id,weread_progress_t *sample,bool moved,uint64_t timestamp,bool *noted){
@@ -586,40 +614,40 @@ esp_err_t weread_progress_store_version_resilient(const char *id,weread_progress
     uint8_t card[WEREAD_MEDIA_ID_BYTES];bool present=media_id(card),nonzero=false;
     for(unsigned i=0;i<WEREAD_MEDIA_ID_BYTES;++i)nonzero|=captured[i]!=0;
     if(!nonzero||(present&&memcmp(card,captured,sizeof(card))))return ESP_ERR_INVALID_STATE;
-    rescue_record_t *record __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*record));
-    if(!record)return ESP_ERR_NO_MEM;
-    weread_progress_t delta=*sample,old;esp_err_t loaded=weread_progress_load(id,&old);
+    rescue_store_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
+    if(!w)return ESP_ERR_NO_MEM;
+    w->delta=*sample;esp_err_t loaded=weread_progress_load(id,&w->old);
     esp_err_t err=present?store_sample(id,sample,moved,true,version,timestamp,noted):ESP_ERR_INVALID_STATE;
     if(err==ESP_OK){
-        unsigned slot;if(rescue_find(id,captured,record,&slot)==ESP_OK)*rescued=true;
+        unsigned slot;if(rescue_find(id,captured,&w->record,&slot)==ESP_OK)*rescued=true;
         return ESP_OK;
     }
-    if(!rescue_enabled()||(!moved&&!delta.reading_time))return err;
-    unsigned slot;esp_err_t found=rescue_find(id,captured,record,&slot);
-    if(found==ESP_OK)old=record->desired;
+    if(!rescue_enabled()||(!moved&&!w->delta.reading_time))return err;
+    unsigned slot;esp_err_t found=rescue_find(id,captured,&w->record,&slot);
+    if(found==ESP_OK)w->old=w->record.desired;
     else{
         if(found!=ESP_ERR_NOT_FOUND)return found;
-        if(loaded!=ESP_OK){if(!before||!before->chapter_uid)return err;old=*before;}
+        if(loaded!=ESP_OK){if(!before||!before->chapter_uid)return err;w->old=*before;}
         bool empty=false;
-        for(slot=0;slot<2;++slot)if(rescue_read(slot,record)==ESP_ERR_NOT_FOUND){empty=true;break;}
+        for(slot=0;slot<2;++slot)if(rescue_read(slot,&w->record)==ESP_ERR_NOT_FOUND){empty=true;break;}
         if(!empty)return ESP_ERR_NO_MEM;
-        memset(record,0,sizeof(*record));const weread_auth_session_t *session=weread_auth_get_current_session();
-        if(!session||!wr_copy(record->root,sizeof(record->root),weread_auth_get_storage_root())||
-           !wr_copy(record->vid,sizeof(record->vid),session->vid)||!wr_copy(record->device,sizeof(record->device),session->device_id)||
-           !wr_copy(record->id,sizeof(record->id),id))return ESP_ERR_INVALID_STATE;
-        memcpy(record->media,captured,sizeof(record->media));record->expected=old;
+        memset(&w->record,0,sizeof(w->record));const weread_auth_session_t *session=weread_auth_get_current_session();
+        if(!session||!wr_copy(w->record.root,sizeof(w->record.root),weread_auth_get_storage_root())||
+           !wr_copy(w->record.vid,sizeof(w->record.vid),session->vid)||!wr_copy(w->record.device,sizeof(w->record.device),session->device_id)||
+           !wr_copy(w->record.id,sizeof(w->record.id),id))return ESP_ERR_INVALID_STATE;
+        memcpy(w->record.media,captured,sizeof(w->record.media));w->record.expected=w->old;
     }
-    weread_progress_t p=old;
+    w->next=w->old;
     if(moved){
-        if(!delta.chapter_uid||delta.progress>100||!memchr(delta.summary,0,sizeof(delta.summary)))return ESP_ERR_INVALID_ARG;
-        p.chapter_uid=delta.chapter_uid;p.chapter_index=delta.chapter_index;p.chapter_offset=delta.chapter_offset;p.progress=delta.progress;
-        p.book_version=version;p.position_pending=true;wr_display_copy(p.summary,sizeof(p.summary),delta.summary);
-        p.pending_pages=delta.pending_pages>UINT32_MAX-p.pending_pages?UINT32_MAX:p.pending_pages+delta.pending_pages;
+        if(!w->delta.chapter_uid||w->delta.progress>100||!memchr(w->delta.summary,0,sizeof(w->delta.summary)))return ESP_ERR_INVALID_ARG;
+        w->next.chapter_uid=w->delta.chapter_uid;w->next.chapter_index=w->delta.chapter_index;w->next.chapter_offset=w->delta.chapter_offset;w->next.progress=w->delta.progress;
+        w->next.book_version=version;w->next.position_pending=true;wr_display_copy(w->next.summary,sizeof(w->next.summary),w->delta.summary);
+        w->next.pending_pages=w->delta.pending_pages>UINT32_MAX-w->next.pending_pages?UINT32_MAX:w->next.pending_pages+w->delta.pending_pages;
     }
-    p.reading_time=delta.reading_time>UINT32_MAX-p.reading_time?UINT32_MAX:p.reading_time+delta.reading_time;
-    p.updated_at=timestamp;p.dirty=true;p.revision=next_revision(p.revision);record->desired=p;
-    err=rescue_write(slot,record);if(err!=ESP_OK)return err;
-    *sample=p;*noted=*rescued=true;s_outbox.next_scan=0;wr_copy(s_outbox.hint,sizeof(s_outbox.hint),id);return ESP_OK;
+    w->next.reading_time=w->delta.reading_time>UINT32_MAX-w->next.reading_time?UINT32_MAX:w->next.reading_time+w->delta.reading_time;
+    w->next.updated_at=timestamp;w->next.dirty=true;w->next.revision=next_revision(w->next.revision);w->record.desired=w->next;
+    err=rescue_write(slot,&w->record);if(err!=ESP_OK)return err;
+    *sample=w->next;*noted=*rescued=true;s_outbox.next_scan=0;wr_copy(s_outbox.hint,sizeof(s_outbox.hint),id);return ESP_OK;
 }
 esp_err_t weread_progress_update(const char *id,weread_progress_t *sample,bool moved,bool force,uint64_t now,uint64_t timestamp,bool *noted){WR_GUARD;
     esp_err_t err=weread_progress_store(id,sample,moved,timestamp,noted);

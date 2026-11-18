@@ -135,9 +135,12 @@ void wr_display_copy(char *out, size_t cap, const char *text) {
 }
 
 esp_err_t wr_mkdirs(const char *path) {
-    char buf[768];
     if (!path || !*path) return ESP_ERR_INVALID_ARG;
-    if (!wr_copy(buf, sizeof(buf), path)) return ESP_ERR_INVALID_SIZE;
+    size_t len = strlen(path);
+    if (len >= 768) return ESP_ERR_INVALID_SIZE;
+    char *buf __attribute__((cleanup(wr_release))) = wr_alloc(len + 1);
+    if (!buf) return ESP_ERR_NO_MEM;
+    memcpy(buf, path, len + 1);
     for (char *p = buf + 1; ; ++p) {
         if (*p != '/' && *p) continue;
         char c = *p; *p = 0;
@@ -188,23 +191,32 @@ esp_err_t wr_read_json(const char *path, cJSON **out) {
     esp_err_t err = read_json(path, out);
     if (err == ESP_OK || err == ESP_ERR_NO_MEM) return err;
     // FAT 不支持覆盖 rename；掉电窗口可从上一份完整缓存恢复。/ FAT cannot replace by rename; recover the last complete cache after an interrupted commit.
-    char previous[800];
-    int n = snprintf(previous, sizeof(previous), "%s.previous", path);
-    if (n < 0 || (size_t)n >= sizeof(previous)) return err;
+    size_t len = path ? strlen(path) : 0;
+    if (!path || len + sizeof(".previous") > 800) return err;
+    char *previous __attribute__((cleanup(wr_release))) = wr_alloc(len + sizeof(".previous"));
+    if (!previous) return ESP_ERR_NO_MEM;
+    memcpy(previous, path, len);
+    memcpy(previous + len, ".previous", sizeof(".previous"));
     esp_err_t recovery = read_json(previous, out);
     return recovery == ESP_OK ? ESP_OK : err;
 }
 
 esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
-    char parent[768], tmp[800];
-    if (!wr_copy(parent, sizeof(parent), path)) return ESP_ERR_INVALID_SIZE;
-    char *slash = strrchr(parent, '/');
+    if (!path) return ESP_ERR_INVALID_ARG;
+    size_t path_len = strlen(path);
+    if (path_len >= 768 || path_len + sizeof(".previous") > 800) return ESP_ERR_INVALID_SIZE;
+    size_t cap = path_len + sizeof(".previous");
+    char *buf __attribute__((cleanup(wr_release))) = wr_alloc(cap * 2);
+    if (!buf) return ESP_ERR_NO_MEM;
+    char *tmp = buf, *scratch = buf + cap;
+    memcpy(scratch, path, path_len + 1);
+    char *slash = strrchr(scratch, '/');
     if (!slash) return ESP_ERR_INVALID_ARG;
     *slash = 0;
-    esp_err_t err = wr_mkdirs(parent);
+    esp_err_t err = wr_mkdirs(scratch);
     if (err != ESP_OK) return err;
-    int n = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    if (n < 0 || (size_t)n >= sizeof(tmp)) return ESP_ERR_INVALID_SIZE;
+    memcpy(tmp, path, path_len);
+    memcpy(tmp + path_len, ".tmp", sizeof(".tmp"));
     int flags = O_WRONLY | O_CREAT | O_TRUNC;
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
@@ -218,12 +230,11 @@ esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
     if (fclose(f)) ok = false;
     if (ok && !rename(tmp, path)) return ESP_OK;
     if (ok && errno == EEXIST) {
-        char previous[800];
-        n = snprintf(previous, sizeof(previous), "%s.previous", path);
-        if (n >= 0 && (size_t)n < sizeof(previous) &&
-            (!unlink(previous) || errno == ENOENT) && !rename(path, previous)) {
+        memcpy(scratch, path, path_len);
+        memcpy(scratch + path_len, ".previous", sizeof(".previous"));
+        if ((!unlink(scratch) || errno == ENOENT) && !rename(path, scratch)) {
             if (!rename(tmp, path)) return ESP_OK;
-            (void)rename(previous, path);
+            (void)rename(scratch, path);
         }
     }
     ESP_LOGW("weread","cache commit failed errno=%d",errno);

@@ -142,20 +142,21 @@ bool book_weread_content_identity(const char *uri,uint32_t *identity) { WR_GUARD
 }
 bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
     if (!book_path_is_weread(uri) || !out) return false;
-    weread_book_t book;
-    bool metadata = weread_shelf_find(uri + 9,&book);
+    weread_book_t *book __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*book));
+    if (!book) return false;
+    bool metadata = weread_shelf_find(uri + 9,book);
     uint32_t identity = 0;
     // 书签跟随已显示正文；后台更新元数据不能提前替换阅读中的NVS身份。
     // Bookmarks follow visible content; background metadata must not relabel the reader's NVS identity.
     if (!book_weread_content_identity(uri,&identity)) {
         if (!metadata) return false;
         const weread_auth_session_t *session = weread_auth_get_current_session();
-        identity = content_identity(session ? session->vid : "",uri + 9,book.book_version);
+        identity = content_identity(session ? session->vid : "",uri + 9,book->book_version);
     }
     memset(out,0,sizeof(*out));
     out->st_mode = S_IFREG | 0400;
     out->st_size = identity;
-    out->st_mtime = metadata ? (time_t)book.update_time : 0;
+    out->st_mtime = metadata ? (time_t)book->update_time : 0;
     return true;
 }
 bool book_weread_is_open(void) { return s_id[0] != 0; }
@@ -237,24 +238,26 @@ static bool collect_css(const char *dir, char **css, size_t *used, size_t cap, u
 }
 static const char *chapter_css(size_t i,const char *validated_root,size_t *used) {
     const size_t cap = 256u * 1024u;
-    *used = 0;char resource[512]="", chapter[512]="";
+    *used = 0;
+    struct { char resource[512], chapter[512]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    if (!paths) return NULL;
     const char *bound=bound_resource(validated_root);
-    esp_err_t res=bound?(wr_copy(resource,sizeof(resource),bound)?(*bound?ESP_OK:ESP_ERR_NOT_FOUND):ESP_ERR_INVALID_SIZE):weread_chapter_resource_directory(s_id,resource,sizeof(resource));
-    esp_err_t ch=validated_root?(wr_copy(chapter,sizeof(chapter),validated_root)?ESP_OK:ESP_ERR_INVALID_SIZE):weread_chapter_directory(s_id,book_weread_uid(i),chapter,sizeof(chapter));
+    esp_err_t res=bound?(wr_copy(paths->resource,sizeof(paths->resource),bound)?(*bound?ESP_OK:ESP_ERR_NOT_FOUND):ESP_ERR_INVALID_SIZE):weread_chapter_resource_directory(s_id,paths->resource,sizeof(paths->resource));
+    esp_err_t ch=validated_root?(wr_copy(paths->chapter,sizeof(paths->chapter),validated_root)?ESP_OK:ESP_ERR_INVALID_SIZE):weread_chapter_directory(s_id,book_weread_uid(i),paths->chapter,sizeof(paths->chapter));
     if((res!=ESP_OK&&res!=ESP_ERR_NOT_FOUND)||ch!=ESP_OK)return NULL;
     bool have_res=res==ESP_OK,have_ch=ch==ESP_OK;
-    if(!have_res)resource[0]=0;
-    if(!have_ch)chapter[0]=0;
-    if(s_css.roots&&!strcmp(s_css.roots,resource)&&!strcmp(s_css.roots+strlen(s_css.roots)+1,chapter)){*used=s_css.len;return s_css.text;}
+    if(!have_res)paths->resource[0]=0;
+    if(!have_ch)paths->chapter[0]=0;
+    if(s_css.roots&&!strcmp(s_css.roots,paths->resource)&&!strcmp(s_css.roots+strlen(s_css.roots)+1,paths->chapter)){*used=s_css.len;return s_css.text;}
     // 缓存只保留当前资源代次的CSS，避免每次映射遍历全部图片。/ Keep only the current resource generation's CSS, avoiding image-directory scans on each mapping.
     clear_css();char *css=NULL;
-    if ((have_res&&!collect_css(resource,&css,used,cap,0)) ||
-        (have_ch&&(!have_res||strcmp(resource,chapter))&&!collect_css(chapter,&css,used,cap,0))) {free(css);return NULL;}
+    if ((have_res&&!collect_css(paths->resource,&css,used,cap,0)) ||
+        (have_ch&&(!have_res||strcmp(paths->resource,paths->chapter))&&!collect_css(paths->chapter,&css,used,cap,0))) {free(css);return NULL;}
     if(!css)css=wr_alloc(1);
     if(!css)return NULL;
-    size_t rlen=strlen(resource)+1,clen=strlen(chapter)+1;
+    size_t rlen=strlen(paths->resource)+1,clen=strlen(paths->chapter)+1;
     s_css.roots=wr_alloc(rlen+clen);if(!s_css.roots){free(css);return NULL;}
-    memcpy(s_css.roots,resource,rlen);memcpy(s_css.roots+rlen,chapter,clen);
+    memcpy(s_css.roots,paths->resource,rlen);memcpy(s_css.roots+rlen,paths->chapter,clen);
     char *small=wr_realloc(css,*used+1);s_css.text=small?small:css;s_css.len=*used;
     return s_css.text;
 }
@@ -280,7 +283,9 @@ static esp_err_t parse_loaded(loaded_chapter_t *b,const char *text,size_t len,co
     b->map=wr_alloc(8192u*sizeof(*b->map));
     if(!b->map){if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);}
     b->map_capacity=8192;
-    char path[600];snprintf(path,sizeof(path),"%s/position.map",b->root);FILE *f=fopen(path,"rb");
+    char *path=wr_alloc(600);
+    if(!path){free(b->map);b->map=NULL;b->map_capacity=0;if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);}
+    snprintf(path,600,"%s/position.map",b->root);FILE *f=fopen(path,"rb");free(path);
     weread_position_header_t h={0};
     bool valid=f&&fread(&h,sizeof(h),1,f)==1&&h.magic==WEREAD_POSITION_MAGIC&&h.count&&h.count<=16384&&h.bytes==len;
     weread_position_point_t *points=valid?wr_alloc((size_t)h.count*sizeof(*points)):NULL;
@@ -326,8 +331,10 @@ esp_err_t book_weread_load(size_t i, const char *anchor, size_t *offset, html_te
             if(n==candidate->toc.count)err=WEREAD_ERR_VERSION;else candidate->new_index=n;
         }
     }
-    char path[600];snprintf(path,sizeof(path),"%s/body.html",candidate->root);
-    if(err==ESP_OK)err=weread_chapter_read_validated(path,&text,&len);
+    char *path=wr_alloc(600);
+    if(err==ESP_OK&&!path)err=ESP_ERR_NO_MEM;
+    if(err==ESP_OK){snprintf(path,600,"%s/body.html",candidate->root);err=weread_chapter_read_validated(path,&text,&len);}
+    free(path);
     if(err==ESP_OK&&!len){free(text);text=NULL;err=ESP_ERR_INVALID_RESPONSE;}
     if(err!=ESP_OK){binding_free(&candidate);return err;}
     s_candidate=candidate;
@@ -499,18 +506,19 @@ esp_err_t book_weread_map(size_t i,bool to_cloud,uint32_t input,uint32_t *output
 }
 esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *len, bool *png) { WR_GUARD;
     if (!data || !len || !png || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
-    *data = NULL; *len = 0; char name[512];
-    if (!weread_resource_path(NULL, src, name, sizeof(name))) return ESP_ERR_INVALID_ARG;
+    *data = NULL; *len = 0;
+    struct { char name[512], root[512], path[1024]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    if (!paths) return ESP_ERR_NO_MEM;
+    if (!weread_resource_path(NULL, src, paths->name, sizeof(paths->name))) return ESP_ERR_INVALID_ARG;
     for (unsigned pass = 0; pass < 2; ++pass) {
-        char root[512], path[1024];
         loaded_chapter_t *bound=binding_owned(s_candidate)&&s_candidate->index==i?s_candidate:
             binding_owned(s_loaded)&&s_loaded->index==i?s_loaded:NULL;
-        esp_err_t err=bound?(wr_copy(root,sizeof(root),pass?bound->resources:bound->root)&&root[0]?ESP_OK:ESP_ERR_NOT_FOUND):
-            pass?weread_chapter_resource_directory(s_id,root,sizeof(root)):weread_chapter_directory(s_id,book_weread_uid(i),root,sizeof(root));
+        esp_err_t err=bound?(wr_copy(paths->root,sizeof(paths->root),pass?bound->resources:bound->root)&&paths->root[0]?ESP_OK:ESP_ERR_NOT_FOUND):
+            pass?weread_chapter_resource_directory(s_id,paths->root,sizeof(paths->root)):weread_chapter_directory(s_id,book_weread_uid(i),paths->root,sizeof(paths->root));
         if (err != ESP_OK) continue;
-        int n = snprintf(path, sizeof(path), "%s/%s", root, name);
-        if (n < 0 || (size_t)n >= sizeof(path)) continue;
-        FILE *f = fopen(path, "rb"); if (!f) continue;
+        int n = snprintf(paths->path, sizeof(paths->path), "%s/%s", paths->root, paths->name);
+        if (n < 0 || (size_t)n >= sizeof(paths->path)) continue;
+        FILE *f = fopen(paths->path, "rb"); if (!f) continue;
         struct stat st;
         if (fstat(fileno(f), &st) || st.st_size <= 0 || st.st_size > 8 * 1024 * 1024) { fclose(f); return ESP_ERR_INVALID_SIZE; }
         size_t size = (size_t)st.st_size; uint8_t *buf = wr_alloc(size);
@@ -523,19 +531,20 @@ esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *l
 }
 
 bool book_weread_metadata(const char *uri, char *title, size_t tc, char *author, size_t ac) { WR_GUARD;
-    weread_book_t b;
-    if (!book_path_is_weread(uri) || !weread_shelf_find(uri+9,&b)) return false;
-    if (title && tc) wr_display_copy(title,tc,b.title);
-    if (author && ac) wr_display_copy(author,ac,b.author);
+    weread_book_t *b __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*b));
+    if (!b || !book_path_is_weread(uri) || !weread_shelf_find(uri+9,b)) return false;
+    if (title && tc) wr_display_copy(title,tc,b->title);
+    if (author && ac) wr_display_copy(author,ac,b->author);
     return true;
 }
 bool book_weread_cover(const char *uri, uint8_t *pixels, size_t cap) { WR_GUARD;
-    char path[512],legacy[512];bool migrated=false;
-    if (!book_path_is_weread(uri) || !pixels || cap < 176u*240u ||
-        weread_cover_cache_path(uri+9,"gray",path,sizeof(path)) != ESP_OK) return false;
-    FILE *f=fopen(path,"rb");
-    if(!f&&wr_cache_path(uri+9,"cover.gray",legacy,sizeof(legacy))==ESP_OK){f=fopen(legacy,"rb");migrated=f!=NULL;}
+    if (!book_path_is_weread(uri) || !pixels || cap < 176u*240u) return false;
+    struct { char path[512], legacy[512]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    if (!paths || weread_cover_cache_path(uri+9,"gray",paths->path,sizeof(paths->path)) != ESP_OK) return false;
+    bool migrated=false;
+    FILE *f=fopen(paths->path,"rb");
+    if(!f&&wr_cache_path(uri+9,"cover.gray",paths->legacy,sizeof(paths->legacy))==ESP_OK){f=fopen(paths->legacy,"rb");migrated=f!=NULL;}
     if(!f)return false;
     bool ok=fread(pixels,1,176u*240u,f)==176u*240u && fgetc(f)==EOF;
-    fclose(f);if(ok&&migrated)(void)rename(legacy,path);return ok;
+    fclose(f);if(ok&&migrated)(void)rename(paths->legacy,paths->path);return ok;
 }

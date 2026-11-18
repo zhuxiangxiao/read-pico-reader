@@ -27,14 +27,23 @@ static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool la
     if(!weread_runtime_busy()&&!ctx->request_app)s_wr_jump.error=wr_chapter_start(ctx);
     return true;
 }
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void wr_chapter_poll(uint32_t expected_uid, bool *matching, esp_err_t *error) {
+    weread_result_t result = {0};
+    bool completed = weread_runtime_poll(&result);
+    *matching = completed && result.job == WR_JOB_CHAPTER && !strcmp(result.id, s_path + 9) &&
+        result.chapter_uid == expected_uid;
+    if (*matching) *error = result.error;
+    weread_runtime_result_free(&result);
+}
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(!s_wr_jump.pending)return APP_REDRAW_NONE;
     if(ctx->request_app){wr_chapter_cancel();return APP_REDRAW_NONE;}
     if(weread_runtime_busy()||ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
-    weread_result_t result={0};bool completed=weread_runtime_poll(&result);
-    bool matching=completed&&result.job==WR_JOB_CHAPTER&&!strcmp(result.id,s_path+9)&&result.chapter_uid==book_weread_uid(s_wr_jump.chapter);
-    esp_err_t err=matching?result.error:s_wr_jump.error;
-    weread_runtime_result_free(&result);
+    bool matching=false;esp_err_t err=s_wr_jump.error;
+    wr_chapter_poll(book_weread_uid(s_wr_jump.chapter),&matching,&err);
     if(s_wr_jump.started&&!matching)return APP_REDRAW_NONE;
     if(!s_wr_jump.started){
         if(err==ESP_OK)err=wr_chapter_start(ctx);

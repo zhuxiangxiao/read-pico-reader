@@ -411,14 +411,15 @@ static void release_chapter_work(chapter_download_work_t **p) {
 }
 bool weread_chapter_cached(const char *id,uint32_t uid){WR_GUARD;
     if(!wr_valid_id(id)||!uid)return false;
-    char existing[512];
-    if (weread_chapter_directory(id, uid, existing, sizeof(existing)) == ESP_OK) {
-        char cache_path[600]; struct stat st={0}; join(existing, "body.html", cache_path, sizeof(cache_path));
-        bool body_ok = !stat(cache_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
+    struct { char existing[512], cache_path[600]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    if(!paths)return false;
+    if (weread_chapter_directory(id, uid, paths->existing, sizeof(paths->existing)) == ESP_OK) {
+        struct stat st={0}; join(paths->existing, "body.html", paths->cache_path, sizeof(paths->cache_path));
+        bool body_ok = !stat(paths->cache_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
         off_t body_size=st.st_size;
-        join(existing, "position.map", cache_path, sizeof(cache_path));
-        if (!body_ok || stat(cache_path, &st) || !S_ISREG(st.st_mode)) return false;
-        FILE *f=fopen(cache_path,"rb");if(!f)return false;
+        join(paths->existing, "position.map", paths->cache_path, sizeof(paths->cache_path));
+        if (!body_ok || stat(paths->cache_path, &st) || !S_ISREG(st.st_mode)) return false;
+        FILE *f=fopen(paths->cache_path,"rb");if(!f)return false;
         weread_position_header_t h={0};bool ok=fread(&h,sizeof(h),1,f)==1;
         if(fclose(f))ok=false;
         return ok&&h.magic==WEREAD_POSITION_MAGIC&&h.bytes==(uint32_t)body_size&&h.count&&h.count<=16384&&
