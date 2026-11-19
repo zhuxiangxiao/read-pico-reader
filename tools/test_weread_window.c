@@ -6,6 +6,7 @@
 #include "weread_store.h"
 #include "book_source_weread.h"
 #include <assert.h>
+#include <dirent.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,14 +21,53 @@ static uint64_t space=512u*1024*1024;
 static bool offline;
 static uint32_t server_version=100;
 static atomic_bool gated,entered;
+static bool capture_stages;
+static unsigned stage_log[16],stage_log_count;
+static unsigned fail_mode,fail_uid,fail_attempts;
+static unsigned toc_requests;
+static bool fail_toc_request;
+static size_t last_job_idx;
+static esp_err_t last_job_error;
 int window_statvfs(const char *path,struct statvfs *out){(void)path;memset(out,0,sizeof(*out));out->f_frsize=4096;out->f_bavail=space/4096;return 0;}
+static void record_stage(void){
+    if(!capture_stages)return;
+    weread_stage_t stage;uint64_t bytes;
+    if(!weread_reader_stage(&stage,&bytes))return;
+    if(stage_log_count&&stage_log[stage_log_count-1]==(unsigned)stage)return;
+    if(stage_log_count<sizeof(stage_log)/sizeof(*stage_log))stage_log[stage_log_count++]=(unsigned)stage;
+}
 static uint64_t millis(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000;}
+static void rm_rf(const char *path){
+    DIR *dir=opendir(path);
+    if(!dir){unlink(path);return;}
+    struct dirent *entry;
+    while((entry=readdir(dir))){
+        if(!strcmp(entry->d_name,".")||!strcmp(entry->d_name,".."))continue;
+        char child[600];snprintf(child,sizeof(child),"%s/%s",path,entry->d_name);rm_rf(child);
+    }
+    closedir(dir);rmdir(path);
+}
 static weread_result_t completed(void){
     uint64_t until=millis()+5000;while(weread_runtime_busy()){assert(millis()<until);usleep(1000);}
     weread_result_t r;assert(weread_runtime_poll(&r));return r;
 }
 static esp_err_t request(const char *url,const char *method,const char *headers,const char *body,char **out,size_t *len,int *status,void *ctx){
     (void)method;(void)headers;(void)body;(void)ctx;*status=200;
+    if(capture_stages&&strstr(url,"chapterInfos")){
+        weread_stage_t stage;uint64_t bytes;char label[64];
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_TOC&&!bytes);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在获取目录…"));
+        record_stage();
+    }else if(capture_stages&&strstr(url,"/shelf/syncbook")){
+        weread_stage_t stage;uint64_t bytes;char label[64];
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_PROGRESS&&!bytes);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在同步进度…"));
+        record_stage();
+    }
+    if(strstr(url,"chapterInfos")){
+        ++toc_requests;
+        if(fail_toc_request){*out=NULL;*len=0;return ESP_ERR_TIMEOUT;}
+    }
     char text[4096];const char *r;
     if(strstr(url,"chapterInfos")){
         size_t used=(size_t)snprintf(text,sizeof(text),"{\"data\":[{\"bookId\":\"window_book\",\"bookVersion\":%u,\"synckey\":1,\"clearAll\":1,\"updated\":[",server_version);
@@ -49,6 +89,35 @@ static esp_err_t download(const char *url,const char *headers,FILE *out,size_t l
         return ESP_ERR_INVALID_STATE;
     }
     if(offline)return ESP_ERR_TIMEOUT;
+    // 瞬态超时/硬错误注入：超时验证静默重试一次，硬错误必须原样返回且不重试。
+    // Transient-timeout / hard-error injection: a timeout must replay once, a hard error must return unchanged.
+    if(uid==fail_uid){
+        if(fail_mode==2)return ESP_ERR_INVALID_RESPONSE;
+        if(fail_mode==1&&fail_attempts++==0)return ESP_ERR_TIMEOUT;
+    }
+    if(capture_stages&&uid==fail_uid&&fail_mode==1&&fail_attempts>1){
+        weread_stage_t stage;uint64_t bytes;char label[64];
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_RETRY&&!bytes);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"网络超时，正在重试…"));
+        record_stage();
+    }else if(capture_stages&&uid==11&&!fail_uid){
+        weread_stage_t stage;uint64_t bytes;char label[64];
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_CHAPTER&&!bytes);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在下载章节…"));
+        record_stage();
+        weread_client_report_download_progress(200u*1024u,false);
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_CHAPTER&&bytes==200u*1024u);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在下载章节 200 KB…"));
+        weread_client_report_download_progress(2u*1024u*1024u,false);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在下载章节 2 MB…"));
+        // 正文传输完成后进入解包校验阶段。
+        // Body completion moves the notice to the unpack/verify phase.
+        weread_client_report_download_progress(0,false);
+        weread_client_report_download_progress(0,true);
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_PARSE);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在校验章节…"));
+        record_stage();
+    }
     const char *v=strstr(url,"&bookVersion=");assert(v);
     if((uint32_t)strtoul(v+13,NULL,10)!=server_version){
         const char *error="{\"errcode\":-2063}";info->status=499;info->bytes=strlen(error);
@@ -66,8 +135,8 @@ static weread_job_t step(size_t chapter,uint64_t now){
     weread_reader_tick("weread://window_book",chapter,0,0,"",now,true);
     uint64_t until=millis()+5000;
     while(weread_runtime_busy()){assert(millis()<until);usleep(1000);}
-    weread_result_t r;if(!weread_runtime_poll(&r))return WR_JOB_INIT;
-    weread_job_t job=r.job;weread_runtime_result_free(&r);return job;
+    weread_result_t r;if(!weread_runtime_poll(&r)){last_job_idx=SIZE_MAX;last_job_error=ESP_OK;return WR_JOB_INIT;}
+    weread_job_t job=r.job;last_job_idx=r.chapter_idx;last_job_error=r.error;weread_runtime_result_free(&r);return job;
 }
 static void init(const char *root){
     assert(!setenv("WEREAD_STORAGE_ROOT",root,1)&&weread_auth_init(root)==ESP_OK);
@@ -158,12 +227,14 @@ int main(int argc,char **argv){
         unsigned before=downloads;offline=true;
         for(size_t i=1;i<=3;++i){html_text_t t={0};assert(book_weread_load(i,NULL,NULL,&t)==ESP_OK&&t.len);html_text_free(&t);}
         assert(downloads==before&&!weread_chapter_cached("window_book",404));
-        assert(weread_reader_prepare("weread://window_book",4)==ESP_ERR_TIMEOUT&&downloads==before+1);
-        for(unsigned i=0;i<8;++i){(void)step(0,now++);}assert(downloads==before+2);
+        // 冷章超时静默重试一次：仍失败时返回同一超时，但多一次下载尝试。
+        // A cold-chapter timeout replays once: it still returns the timeout after a second download attempt.
+        assert(weread_reader_prepare("weread://window_book",4)==ESP_ERR_TIMEOUT&&downloads==before+2);
+        for(unsigned i=0;i<8;++i){(void)step(0,now++);}assert(downloads==before+3);
         weread_reader_end(now);book_weread_close();weread_runtime_stop();weread_shelf_clear();weread_auth_forget_session();
         assert(book_weread_open("weread://window_book")==ESP_OK);
         for(size_t i=1;i<=3;++i){html_text_t t={0};assert(book_weread_load(i,NULL,NULL,&t)==ESP_OK&&t.len);html_text_free(&t);}
-        assert(downloads==before+2);
+        assert(downloads==before+3);
         puts("PASS: non-contiguous real UIDs; next chapter then cover then farther chapters; three READY open offline even after RAM/auth/shelf reload and fourth remains missing");
     }else if(!strcmp(mode,"space")){
         space=0;assert(step(0,now++)==WR_JOB_PREFETCH&&weread_reader_storage_blocked()&&downloads==1);
@@ -195,6 +266,136 @@ int main(int argc,char **argv){
         assert(!weread_reader_offline());atomic_store(&gated,false);
         assert(step(4,now+1600)==WR_JOB_PREFETCH&&sequence[downloads-1]==777&&weread_reader_offline()==1);
         puts("PASS: late cancelled old-window result cannot populate new window; next target uses jumped chapter UID");
+    }else if(!strcmp(mode,"stage")){
+        // 删除目录缓存与章节目录，让开书走 进度→目录→下载→校验 的完整阶段链。
+        // Drop the TOC and chapter caches so the open job walks the full progress→TOC→download→verify chain.
+        book_weread_close();
+        char root[512];
+        assert(weread_chapter_directory("window_book",11,root,sizeof(root))==ESP_OK);
+        rm_rf(root);
+        char toc_path[512];
+        assert(wr_cache_path("window_book","chapters.json",toc_path,sizeof(toc_path))==ESP_OK&&!unlink(toc_path));
+        capture_stages=true;stage_log_count=0;
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));
+        weread_result_t r=completed();
+        weread_stage_t stage=WEREAD_STAGE_RETRY;uint64_t bytes=1;char label[64];
+        assert(!weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_NONE&&!bytes);
+        assert(!weread_reader_stage_text(label,sizeof(label))&&!label[0]);
+        capture_stages=false;
+        assert(r.error==ESP_OK&&r.open_ready);weread_runtime_result_free(&r);
+        const unsigned expected[]={WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE};
+        assert(stage_log_count==4);
+        for(unsigned i=0;i<4;++i)assert(stage_log[i]==expected[i]);
+        // 目录任务：缓存删除后联网重取目录，阶段为获取目录。
+        // The TOC job re-fetches a deleted TOC and reports the TOC stage.
+        book_weread_clear_prepared();
+        assert(!unlink(toc_path));
+        capture_stages=true;stage_log_count=0;
+        assert(weread_reader_prepare_open("weread://window_book")==ESP_OK);
+        capture_stages=false;
+        assert(stage_log_count==1&&stage_log[0]==WEREAD_STAGE_TOC);
+        assert(!weread_reader_stage(&stage,&bytes)&&!weread_reader_stage_text(label,sizeof(label)));
+        puts("PASS: foreground open stages progress->TOC->chapter(+bytes)->verify and the TOC job reports fetching; idle clears the notice");
+    }else if(!strcmp(mode,"retry")){
+        const char *uri="weread://window_book";
+        // 超时一次后静默重试成功：重试期间保持「网络超时，正在重试…」。
+        // One transient timeout replays silently and the retry notice stays visible during the replay.
+        fail_uid=404;fail_mode=1;fail_attempts=0;capture_stages=true;stage_log_count=0;
+        unsigned before=downloads;
+        assert(weread_reader_prepare(uri,4)==ESP_OK);
+        capture_stages=false;
+        assert(downloads==before+2&&weread_chapter_cached("window_book",404));
+        assert(stage_log_count==1&&stage_log[0]==WEREAD_STAGE_RETRY);
+        weread_stage_t stage=WEREAD_STAGE_RETRY;uint64_t bytes=1;char label[64];
+        assert(!weread_reader_stage(&stage,&bytes)&&!weread_reader_stage_text(label,sizeof(label)));
+        // 非超时错误不重试：只下载一次并原样上报。
+        // A hard error is reported unchanged after one download attempt.
+        fail_uid=777;fail_mode=2;fail_attempts=0;
+        before=downloads;
+        assert(weread_reader_prepare(uri,5)==ESP_ERR_INVALID_RESPONSE&&downloads==before+1);
+        assert(!weread_reader_stage(&stage,&bytes));
+        fail_uid=0;fail_mode=0;
+        // 目录任务在UI线程同步等待，超时不重试：只发一次目录请求并快速失败。
+        // The TOC job joins the UI thread synchronously, so its timeout never replays: one TOC request and a fast failure.
+        book_weread_clear_prepared();
+        char toc_path[512];
+        assert(wr_cache_path("window_book","chapters.json",toc_path,sizeof(toc_path))==ESP_OK&&!unlink(toc_path));
+        fail_toc_request=true;toc_requests=0;capture_stages=true;stage_log_count=0;
+        assert(weread_reader_prepare_open(uri)==ESP_ERR_TIMEOUT);
+        capture_stages=false;fail_toc_request=false;
+        assert(toc_requests==1&&stage_log_count==1&&stage_log[0]==WEREAD_STAGE_TOC);
+        assert(!weread_reader_stage(&stage,&bytes)&&!weread_reader_stage_text(label,sizeof(label)));
+        puts("PASS: timeout retries the chapter body exactly once with the retry notice; hard errors and the UI-joined TOC job never replay");
+    }else if(!strcmp(mode,"manual")){
+        const char *uri="weread://window_book";
+        assert(weread_chapter_download("window_book",50)==ESP_OK);
+        unsigned before=downloads;
+        uint64_t t=now;
+        // 真实翻页后，自动下一章预读保留；手动关闭时1秒静止窗口内不向后派发。
+        // A real chapter move keeps the automatic next-chapter pre-read; manual off dispatches nothing inside the1s idle window.
+        weread_reader_tick(uri,1,0,0,"",t,true);
+        assert(!weread_reader_cache_forward());
+        assert(step(1,t+400)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==2&&downloads==before);
+        assert(step(1,t+700)==WR_JOB_INIT);
+        // 手动开启后不等1秒静止：封面预热后继续向后补齐下一章。
+        // Manual on skips the1s idle window: after the cover warm it keeps filling the next chapter.
+        weread_reader_cache_forward_set(true);
+        assert(weread_reader_cache_forward());
+        assert(step(1,t+800)==WR_JOB_COVER);
+        assert(step(1,t+900)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==3&&downloads==before+1);
+        // 关闭只停止新派发：已启动章节照常完成，窗口内不再启动下一章。
+        // Off stops only new dispatches: the in-flight chapter still finishes and no further chapter starts inside the window.
+        weread_reader_cache_forward_set(true);
+        weread_reader_tick(uri,1,0,0,"",t+950,true);
+        assert(weread_runtime_busy());
+        weread_reader_cache_forward_set(false);
+        {
+            uint64_t until=millis()+5000;while(weread_runtime_busy()){assert(millis()<until);usleep(1000);}
+            weread_result_t r;assert(weread_runtime_poll(&r)&&r.job==WR_JOB_PREFETCH&&r.error==ESP_OK&&r.chapter_idx==4);
+            weread_runtime_result_free(&r);
+        }
+        assert(downloads==before+2);
+        assert(step(1,t+960)==WR_JOB_INIT);
+        // 前台输入冷却仍暂停手动缓存；冷却结束后按开关继续。
+        // Recent foreground input still pauses manual caching; it resumes once the cooldown expires.
+        weread_reader_cache_forward_set(true);
+        weread_reader_input(false);
+        assert(step(1,t+970)==WR_JOB_INIT);
+        usleep(850000);
+        assert(step(1,t+980)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==5&&downloads==before+3);
+        weread_reader_cache_forward_set(false);
+        assert(step(1,t+990)==WR_JOB_INIT);
+        // 显式关闭也抑制原有的自动空闲整本补齐：静止超过1秒不再派发 forward。
+        // Explicit off also suppresses the pre-existing automatic idle whole-book fill: no forward dispatch even after1s idle.
+        assert(step(1,t+2000)==WR_JOB_INIT&&downloads==before+3);
+        // 自动下一章预读仍保留：翻到第6章后未缓存的第7章照常预读。
+        // The urgent next-chapter pre-read remains: after moving to chapter6 the uncached chapter7 is still pre-read.
+        assert(step(6,t+2400)==WR_JOB_INIT);
+        assert(step(6,t+2800)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==7&&downloads==before+4);
+        puts("PASS: manual forward caching ignores the1s idle window, keeps the automatic pre-read, pauses on input, and explicit off suppresses the whole-book fill only");
+    }else if(!strcmp(mode,"chapter-cache")){
+        const char *uri="weread://window_book";
+        unsigned cached=0,total=0;
+        assert(weread_reader_chapter_cached(uri,0));
+        assert(!weread_reader_chapter_cached(uri,1));
+        assert(!weread_reader_chapter_cached(uri,SIZE_MAX));
+        assert(!weread_reader_chapter_cached("local.epub",0));
+        weread_reader_cached_progress(&cached,&total);
+        assert(total==8&&cached==1);
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        assert(weread_reader_chapter_cached(uri,1));
+        weread_reader_cached_progress(&cached,&total);
+        assert(cached==2);
+        assert(weread_reader_chapter_cached(uri,1));
+        weread_reader_cached_progress(&cached,&total);
+        assert(cached==2);
+        assert(!weread_reader_chapter_cached(uri,2));
+        // 离开阅读后位图释放；单章探测仍返回有界结果且不启动整书扫描。
+        // Leaving the reader releases the bitmap; the probe stays bounded and never starts a full scan.
+        weread_reader_end(now);
+        assert(weread_reader_chapter_cached(uri,0)&&!weread_reader_chapter_cached(uri,2));
+        assert(!weread_reader_chapter_cached("weread://missing_book",0));
+        puts("PASS: TOC chapter probe marks bitmap hits while ready and falls back to one bounded check outside the reader");
     }else assert(false);
     weread_reader_end(now);book_weread_close();weread_runtime_stop();return 0;
 }

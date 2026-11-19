@@ -48,7 +48,7 @@ static app_redraw_t rc_execute(app_ctx_t*ctx,unsigned action){
         {app_redraw_t redraw=toggle_reader_fullscreen(ctx);s_reader_panel=READER_PANEL_TOOLS;rc_invalidate();return redraw;}
     case RC_GUIDE:{unsigned style=app_settings_book_reading_line();app_settings_set_book_reading_line(style?0:1);rc_invalidate();rc_notice(ctx,style?"阅读线已关闭":"阅读线已开启");return APP_REDRAW_PAGE;}
     case RC_CONTENTS:
-        save_progress();set_reader_view(TOC);s_message[0]=0;s_toc_jump_open=s_toc_jump_drag=false;s_reader_panel=READER_PANEL_NONE;ctx->leaf=book_toc_open(current_toc_position());return APP_REDRAW_PAGE;
+        save_progress();set_reader_view(TOC);s_message[0]=0;s_toc_jump_open=s_toc_jump_drag=false;s_reader_panel=READER_PANEL_NONE;ctx->leaf=book_toc_open(current_toc_position());toc_cached_markers_prepare(ctx->leaf);return APP_REDRAW_PAGE;
     case RC_BOOKMARKS:
         s_bookmark_edit=s_bookmark_delete_confirm=s_bookmark_delete_error=false;s_bookmark_selected=0;s_bookmark_page=0;return rc_open(ctx,READER_PANEL_BOOKMARKS);
     case RC_PROGRESS:case RC_STATS:

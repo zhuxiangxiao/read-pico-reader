@@ -90,3 +90,28 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
     const char *summary, uint64_t now_ms, bool active);
 void weread_reader_flush(uint64_t now_ms, bool stop_network);
 void weread_reader_end(uint64_t now_ms);
+
+/* ---- 开书/切章阶段与手动缓存 / Open stages and manual caching ---- */
+/// 前台开书或冷切章阶段；worker 写入，页面只读。
+/// Foreground open or cold-load stage; written by the worker, read by pages.
+typedef enum {
+    WEREAD_STAGE_NONE = 0,
+    WEREAD_STAGE_PROGRESS, ///< 同步云端阅读进度 / Syncing cloud progress
+    WEREAD_STAGE_TOC,      ///< 获取目录 / Fetching the table of contents
+    WEREAD_STAGE_CHAPTER,  ///< 下载章节正文 / Downloading the chapter body
+    WEREAD_STAGE_PARSE,    ///< 校验并解析章节 / Verifying and parsing the loaded chapter
+    WEREAD_STAGE_RETRY,    ///< 瞬时超时后静默重试一次 / One silent retry after a transient timeout
+} weread_stage_t;
+/// 读取当前阶段与章节已下载字节；无前台阶段返回 false。
+/// Read the current stage and downloaded chapter bytes; false when no foreground stage is active.
+bool weread_reader_stage(weread_stage_t *stage, uint64_t *bytes);
+/// 当前阶段的中文短提示；无阶段返回 false。文案为内部缓冲，调用方立即拷贝。
+/// Short Chinese status label for the current stage; false when idle. Copy it immediately.
+bool weread_reader_stage_text(char *out, size_t cap);
+/// 目录页单章缓存查询：整书位图就绪时直接查位图，否则只做一次有界缓存检查，不扫描全书。
+/// Per-chapter cache probe for the TOC: bitmap when scanned, otherwise one bounded cache check.
+bool weread_reader_chapter_cached(const char *uri, size_t chapter);
+/// 手动缓存后续章节开关；开启后阅读中持续向后补齐，关闭抑制所有整本向后补齐，但不取消在飞章节、自动下一章预读与进度上报。
+/// Manual forward-cache toggle: keep filling later chapters while reading; off suppresses all whole-book forward fill without cancelling in-flight chapters, the urgent next-chapter pre-read or reports.
+void weread_reader_cache_forward_set(bool on);
+bool weread_reader_cache_forward(void);

@@ -1819,9 +1819,15 @@ static void draw_list_row(uint8_t *fb,int row,const shelf_entry_t *item) {
 static void draw_shelf_furniture(uint8_t *fb) {
     ui_shelf_furniture(fb,shelf_display_style(),s_view==SHELF?192:224,app_settings_main_fast_refresh()&&s_view==SHELF,draw_shelf_guard);
 }
+// 微信读书在原五个工具后追加“缓存”；本地书保持原五等分，绘制与命中共用同一列数。
+// WeRead appends the cache tool after the five originals; local books keep the five-way split and painting/hits share the count.
+static int book_tool_count(void) {
+    return book_path_is_weread(s_path) ? BOOK_TOOL_COUNT + 1 : BOOK_TOOL_COUNT;
+}
 static EpdRect tool_rect(int i) {
-    int x0 = i * UI_LOCK_WIDTH / BOOK_TOOL_COUNT;
-    int x1 = (i + 1) * UI_LOCK_WIDTH / BOOK_TOOL_COUNT;
+    int count = book_tool_count();
+    int x0 = i * UI_LOCK_WIDTH / count;
+    int x1 = (i + 1) * UI_LOCK_WIDTH / count;
     return (EpdRect){x0, 1096, x1 - x0, 120};
 }
 static int leaves(void) {
@@ -2790,18 +2796,23 @@ bool app_book_ai_bookmark(void){rc_pause_auto();return app_book_reader_body_visi
 #endif
 
 static void draw_reader_tool_icon(uint8_t* fb, int cx, int cy, int kind, bool selected) {
-    // 阅读工具栏图标全部来自 Lucide；已保存的书签用带勾的一档区分未保存。
-    // Reader toolbar icons all come from Lucide; a saved bookmark uses the check variant.
+    // 阅读工具栏图标全部来自 Lucide；已保存的书签用带勾的一档，缓存开启用下载图标加实心点。
+    // Reader toolbar icons all come from Lucide; a saved bookmark uses the check variant and an active cache toggle adds a dot.
     static const ui_icon_t tools[] = {
         UI_ICON_LIST,          // 0 目录
         UI_ICON_BOOKMARK,      // 1 书签
         UI_ICON_CHART_COLUMN,  // 2 阅读统计
         UI_ICON_BOOK_OPEN,     // 3 阅读设置 / Reading settings
         UI_ICON_TYPE,          // 4 字体设置
+        UI_ICON_DOWNLOAD,      // 5 缓存后续章节 / Forward cache
     };
     if (kind < 0 || kind >= (int)(sizeof(tools) / sizeof(tools[0]))) return;
     const ui_icon_t icon = (kind == 1 && selected) ? UI_ICON_BOOKMARK_CHECK : tools[kind];
     ui_draw_icon(fb, cx, cy, READER_TOOL_ICON_PX, icon, 0x38);
+    // 缓存开关只加图标右上角小点，不改变其余五个工具的图标与文字。
+    // The cache toggle only adds a small upper-right dot, leaving the other five icons/labels untouched.
+    if (kind == BOOK_TOOL_COUNT && selected)
+        epd_fill_circle(cx + 26, cy - 20, 6, 0x30, fb);
 }
 
 // 单行辅助文字保持在当前控件内；本机只使用当前活动字库，按原轮廓重新光栅化。
@@ -3806,13 +3817,16 @@ static void draw_reader_panel(uint8_t* fb) {
     if (reader_tools_visible()) {
         ui_fill_rect_fast((EpdRect){0, 1096, UI_LOCK_WIDTH, 120}, s_reader_fullscreen?UI_GRAY_WHITE:UI_NAV_BACKGROUND_GRAY, fb);
         ui_hairline(fb, 1096, 0, UI_LOCK_WIDTH, 0x98);
-        const char* labels[] = {"目录", "书签", "阅读统计", "阅读设置", "文字设置"};
-        for (int i = 0; i < BOOK_TOOL_COUNT; ++i) {
+        const char* labels[] = {"目录", "书签", "阅读统计", "阅读设置", "文字设置", "缓存"};
+        int tool_count = book_tool_count();
+        for (int i = 0; i < tool_count; ++i) {
             EpdRect rect = tool_rect(i);
             int cx = rect.x + rect.width / 2;
-            bool bookmarked = i == 1 && bookmark_is_current();
-            draw_reader_tool_icon(fb, cx, 1138, i, bookmarked);
-            ui_text_box(fb,(EpdRect){rect.x+6,1159,rect.width-12,40},20,bookmarked?"已书签":labels[i],EPD_DRAW_ALIGN_CENTER,false);
+            bool marked = i == 1 ? bookmark_is_current() :
+                          i == BOOK_TOOL_COUNT && weread_reader_cache_forward();
+            draw_reader_tool_icon(fb, cx, 1138, i, marked);
+            ui_text_box(fb,(EpdRect){rect.x+6,1159,rect.width-12,40},20,
+                        i == 1 && marked ? "已书签" : labels[i],EPD_DRAW_ALIGN_CENTER,false);
         }
     } else if (s_reader_panel == READER_PANEL_FONT_SETTINGS) draw_font_settings(fb);
     else if (s_reader_panel == READER_PANEL_WEIGHT_SETTINGS) draw_weight_settings(fb);
@@ -7174,7 +7188,12 @@ static app_redraw_t turn_page(app_ctx_t* ctx, int dir) {
     else if (dir < 0 && s_chapter) { save_progress(); changed = load_chapter(ctx, s_chapter - 1, 0, true); }
     else return reader_turn_chrome(ctx) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
     if(!changed&&s_wr_jump.pending)return APP_REDRAW_PAGE;
-    if (!changed) { set_reader_view(s_text ? TOC : SHELF); ctx->leaf = s_text ? book_toc_open(current_toc_position()) : 0; return APP_REDRAW_PAGE; }
+    if (!changed) {
+        set_reader_view(s_text ? TOC : SHELF);
+        ctx->leaf = s_text ? book_toc_open(current_toc_position()) : 0;
+        if (s_text) toc_cached_markers_prepare(ctx->leaf);
+        return APP_REDRAW_PAGE;
+    }
     skip_hidden_image_pages(ctx, dir);
     if (!s_text) { s_view = SHELF; return APP_REDRAW_PAGE; }
     // 翻页保留当前模式和目标位置，只有切换沉浸才重排。
@@ -7849,7 +7868,8 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
     if (s_reader_panel == READER_PANEL_STATS || s_reader_panel == READER_PANEL_CHAPTER_JUMP)
         return reader_chapter_jump_action(ctx, x, y);
     if (reader_tools_visible()) {
-        for (int i = 0; i < BOOK_TOOL_COUNT; ++i) if (ui_rect_hit(tool_rect(i), x, y)) {
+        int tool_count = book_tool_count();
+        for (int i = 0; i < tool_count; ++i) if (ui_rect_hit(tool_rect(i), x, y)) {
             pause_reader_prep();
             if (i == 0) {
                 save_progress();
@@ -7859,17 +7879,22 @@ static app_redraw_t reader_panel_action(app_ctx_t* ctx, uint16_t x, uint16_t y) 
                 s_reader_panel = READER_PANEL_NONE;
                 size_t toc = current_toc_position();
                 ctx->leaf = book_toc_open(toc);
+                toc_cached_markers_prepare(ctx->leaf);
             } else if (i == 1) {
                 (void)bookmark_toggle();
             } else if (i == 2) {
                 reader_chapter_jump_begin();
             } else if (i == 3) {
                 s_reader_panel = READER_PANEL_REFRESH_SETTINGS;
-            } else {
+            } else if (i == 4) {
                 s_rc_font_root=false;
                 s_line_spacing = app_settings_book_line_spacing();
                 s_reader_slider = -1;
                 s_reader_panel = READER_PANEL_FONT_SETTINGS;
+            } else {
+                // 第 6 个工具只对微信读书出现：切换后台缓存，提示走正文通知。
+                // The 6th tool only exists for WeRead: toggle background caching through the body toast.
+                wr_cache_forward_toggle(ctx);
             }
             return APP_REDRAW_PAGE;
         }
@@ -8600,14 +8625,19 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
                 s_toc_jump_percent = book_toc_jump_percent(x);
                 return APP_REDRAW_PAGE;
             }
-            if (choice == BOOK_TOC_JUMP_CONFIRM)
+            if (choice == BOOK_TOC_JUMP_CONFIRM) {
                 ctx->leaf = book_toc_page_from_percent(s_toc_jump_percent, leaves());
+                toc_cached_markers_prepare(ctx->leaf);
+            }
             s_toc_jump_open = s_toc_jump_drag = false;
             return APP_REDRAW_PAGE;
         }
         int target = book_toc_hit(x, y, ctx->leaf, book_navigation_count());
         if (target == BOOK_TOC_BACK) {
-            if (book_toc_picker_close(&ctx->leaf)) return APP_REDRAW_PAGE;
+            if (book_toc_picker_close(&ctx->leaf)) {
+                toc_cached_markers_prepare(ctx->leaf);
+                return APP_REDRAW_PAGE;
+            }
             s_message[0] = 0;
             set_reader_view(READING);
             s_reader_panel = READER_PANEL_NONE;
@@ -8619,17 +8649,27 @@ static app_redraw_t action_at(app_ctx_t* ctx, uint16_t x, uint16_t y) {
             int next = ctx->leaf + (target == BOOK_TOC_PREV || target == BOOK_TOC_SKIP_PREV ? -step : step);
             if (next < 0) next = 0;
             if (next >= leaves()) next = leaves() - 1;
-            if (next != ctx->leaf) { ctx->leaf = next; return toc_content_redraw(); }
+            if (next != ctx->leaf) {
+                ctx->leaf = next;
+                toc_cached_markers_prepare(ctx->leaf);
+                return toc_content_redraw();
+            }
             return APP_REDRAW_NONE;
         }
-        if (target == BOOK_TOC_SELECT_VOLUME && !s_message[0])
-            return book_toc_picker_toggle(&ctx->leaf) ? APP_REDRAW_PAGE : APP_REDRAW_NONE;
+        if (target == BOOK_TOC_SELECT_VOLUME && !s_message[0]) {
+            if (!book_toc_picker_toggle(&ctx->leaf)) return APP_REDRAW_NONE;
+            toc_cached_markers_prepare(ctx->leaf);
+            return APP_REDRAW_PAGE;
+        }
         if (target == BOOK_TOC_JUMP && book_navigation_count()) {
             s_toc_jump_open = true;
             s_toc_jump_percent = (ctx->leaf + 1) * 100 / leaves();
             return APP_REDRAW_PAGE;
         }
-        if (!s_message[0] && book_toc_toggle(target, &ctx->leaf)) return toc_content_redraw();
+        if (!s_message[0] && book_toc_toggle(target, &ctx->leaf)) {
+            toc_cached_markers_prepare(ctx->leaf);
+            return toc_content_redraw();
+        }
         if (target >= 0 && !s_message[0]) {
             size_t chapter = book_navigation_chapter((size_t)target);
             if (chapter >= book_chapter_count()) return APP_REDRAW_NONE;
@@ -9072,9 +9112,12 @@ static int control_at(app_ctx_t* ctx, uint16_t x, uint16_t y, EpdRect* rect) {
         return -1;
     }
     if (s_view == READING) {
-        if (reader_tools_visible()) for (int i = 0; i < BOOK_TOOL_COUNT; ++i) {
-            *rect = tool_rect(i);
-            if (ui_rect_hit(*rect, x, y)) return 200 + i;
+        if (reader_tools_visible()) {
+            int tool_count = book_tool_count();
+            for (int i = 0; i < tool_count; ++i) {
+                *rect = tool_rect(i);
+                if (ui_rect_hit(*rect, x, y)) return 200 + i;
+            }
         }
         return -1;
     }
@@ -9504,7 +9547,11 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
         }
         if (ev->type == UI_GESTURE_SWIPE_U || ev->type == UI_GESTURE_SWIPE_D) {
             int next = ctx->leaf + (ev->type == UI_GESTURE_SWIPE_U ? 1 : -1);
-            if (next >= 0 && next < leaves()) { ctx->leaf = next; return toc_content_redraw(); }
+            if (next >= 0 && next < leaves()) {
+                ctx->leaf = next;
+                toc_cached_markers_prepare(ctx->leaf);
+                return toc_content_redraw();
+            }
         }
         return APP_REDRAW_NONE;
     }
@@ -9612,6 +9659,7 @@ static app_redraw_t gesture_event(app_ctx_t* ctx, const ui_gesture_event_t* ev) 
             s_message[0] = 0;
             size_t toc = current_toc_position();
             ctx->leaf = book_toc_open(toc);
+            toc_cached_markers_prepare(ctx->leaf);
             return APP_REDRAW_PAGE;
         }
     }
@@ -9706,7 +9754,10 @@ static app_redraw_t on_key(app_ctx_t* ctx, int key) {
     s_reader_tap.pending = false;
     s_pressed_control = -1;
     if((s_view==SHELF||s_view==BULK)&&s_sort_menu){s_sort_menu=false;return APP_REDRAW_PAGE;}
-    if (s_view == TOC && key == UI_KEY_2 && book_toc_picker_close(&ctx->leaf)) return APP_REDRAW_PAGE;
+    if (s_view == TOC && key == UI_KEY_2 && book_toc_picker_close(&ctx->leaf)) {
+        toc_cached_markers_prepare(ctx->leaf);
+        return APP_REDRAW_PAGE;
+    }
     if (s_view == TOC && s_toc_jump_open) {
         if (key == UI_KEY_2) s_toc_jump_open = s_toc_jump_drag = false;
         else if (key == UI_KEY_1 || key == UI_KEY_3) {
@@ -9756,7 +9807,9 @@ static app_redraw_t on_key(app_ctx_t* ctx, int key) {
     int next = ctx->leaf + dir;
     if (next < 0 || next >= leaves()) return APP_REDRAW_NONE;
     ctx->leaf = next;
-    return s_view == TOC ? toc_content_redraw() : APP_REDRAW_PAGE;
+    if (s_view != TOC) return APP_REDRAW_PAGE;
+    toc_cached_markers_prepare(ctx->leaf);
+    return toc_content_redraw();
 }
 static app_redraw_t on_power_short(app_ctx_t* ctx) {
     rc_pause_auto();rc_cancel_side();s_rc_double_pending=false;
@@ -9777,7 +9830,10 @@ static app_redraw_t on_key_long(app_ctx_t* ctx, int key) {
     reader_indent_hold_cancel();
     s_reader_tap.pending = false;
     if (key != UI_KEY_2) return APP_REDRAW_NONE;
-    if (s_view == TOC && key == UI_KEY_2 && book_toc_picker_close(&ctx->leaf)) return APP_REDRAW_PAGE;
+    if (s_view == TOC && key == UI_KEY_2 && book_toc_picker_close(&ctx->leaf)) {
+        toc_cached_markers_prepare(ctx->leaf);
+        return APP_REDRAW_PAGE;
+    }
     if (s_view == TOC && s_toc_jump_open) {
         s_toc_jump_open = s_toc_jump_drag = false;
         return APP_REDRAW_PAGE;

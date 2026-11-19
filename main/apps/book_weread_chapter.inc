@@ -4,6 +4,10 @@
  * 中文：微信章节异步准备，局部接入双板阅读器；本地TXT/EPUB不经过此路径。
  * English: Asynchronous WeRead chapter preparation; local TXT/EPUB retain their existing path.
  */
+// 冷章提示文案的限速状态：下载阶段最多每 2 秒重绘一次，阶段切换立即刷新。
+// Toast rate limiter: a download stage repaints at most every 2 s while a stage change shows immediately.
+static uint64_t s_stage_notice_at;
+static unsigned s_stage_notice_kind;
 static esp_err_t wr_chapter_start(app_ctx_t *ctx){
     weread_runtime_prefetch_adopt(0);
     wr_reader_sample(ctx->now_ms,false);
@@ -24,6 +28,7 @@ static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool la
     if(adopting){weread_runtime_prefetch_adopt(target_uid);s_wr_jump.started=true;}
     else{weread_runtime_prefetch_adopt(0);weread_runtime_cancel();}
     s_view=READING;s_reader_panel=READER_PANEL_NONE;
+    s_stage_notice_at=0;s_stage_notice_kind=0;
     copy_text(s_reader_notice,sizeof(s_reader_notice),"正在准备章节…");s_reader_notice_until=INT64_MAX;
     s_reader_text_frame=false;
     // 先启动worker再由主循环推反馈屏；若同章预取已在进行则直接接管。
@@ -49,6 +54,28 @@ static void wr_chapter_poll(uint32_t expected_uid, bool *matching, esp_err_t *er
     }
     weread_runtime_result_free(&result);
 }
+// 冷章等待期间用后台阶段文案替换同一条提示；文案变化且通过限速时才重绘提示区域。
+// Replace the waiting toast with the worker stage text; repaint only when the text changes and the limiter allows.
+static app_redraw_t wr_chapter_stage_notice(app_ctx_t *ctx){
+    char stage[sizeof(s_reader_notice)];
+    weread_stage_t kind=WEREAD_STAGE_NONE;
+    if(!weread_reader_stage_text(stage,sizeof(stage)))return APP_REDRAW_NONE;
+    if(!strcmp(stage,s_reader_notice))return APP_REDRAW_NONE;
+    if(!weread_reader_stage(&kind,NULL))kind=WEREAD_STAGE_NONE;
+    // 下载字节每 32 KiB 推进一次；同一阶段内按 2 秒合并，阶段切换与重试提示立即显示。
+    // Download bytes advance every 32 KiB; coalesce within one stage to 2 s while stage changes and the retry label show at once.
+    if((unsigned)kind==s_stage_notice_kind&&kind==WEREAD_STAGE_CHAPTER&&(uint64_t)ctx->now_ms<s_stage_notice_at)return APP_REDRAW_NONE;
+    s_stage_notice_kind=(unsigned)kind;s_stage_notice_at=ctx->now_ms+2000;
+    if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
+    copy_text(s_reader_notice,sizeof(s_reader_notice),stage);
+    s_reader_notice_until=INT64_MAX;
+    if(s_view!=READING)return APP_REDRAW_NONE;
+    // 区域刷新不会自动重绘帧缓冲；先重绘提示，再只更新提示所在区域。
+    // Area refreshes do not rerender the framebuffer; repaint the toast before updating its region.
+    render(ctx,ctx->fb);
+    s_area=(EpdRect){208,150,268,68};s_mode=MODE_GL16;
+    return APP_REDRAW_AREA;
+}
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(!s_wr_jump.pending){
         if(ctx->request_app||ctx->consumed||(ctx->touch&&ctx->touch->touched)||s_view!=READING||!s_text)return APP_REDRAW_NONE;
@@ -65,6 +92,7 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
         save_progress();return APP_REDRAW_PAGE;
     }
     if(ctx->request_app){wr_chapter_cancel();return APP_REDRAW_NONE;}
+    app_redraw_t stage=wr_chapter_stage_notice(ctx);if(stage!=APP_REDRAW_NONE)return stage;
     if(weread_runtime_busy()||ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
     bool matching=false,prefetch_retry=false;esp_err_t err=s_wr_jump.error;
     wr_chapter_poll(book_weread_uid(s_wr_jump.chapter),&matching,&err,&prefetch_retry);

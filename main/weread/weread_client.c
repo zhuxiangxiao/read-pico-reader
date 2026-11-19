@@ -139,6 +139,15 @@ static void *s_cancel_context;
 void weread_client_set_cancel(weread_cancel_fn fn, void *ctx) { s_cancel_query = fn; s_cancel_context = ctx; }
 bool weread_client_cancelled(void) { return s_cancel_query && s_cancel_query(s_cancel_context); }
 
+static weread_download_progress_fn s_download_progress;
+static void *s_download_progress_ctx;
+void weread_client_set_download_progress(weread_download_progress_fn fn, void *ctx) {
+    s_download_progress = fn; s_download_progress_ctx = ctx;
+}
+void weread_client_report_download_progress(uint64_t bytes, bool done) {
+    if (s_download_progress) s_download_progress(bytes, done, s_download_progress_ctx);
+}
+
 esp_err_t weread_client_init(void) {
     return ESP_OK;
 }
@@ -1137,6 +1146,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     const size_t chunk_cap = 8192;
     char *buffer __attribute__((cleanup(wr_release))) = err == ESP_OK ? wr_alloc(chunk_cap) : NULL;
     if (err == ESP_OK && !buffer) err = ESP_ERR_NO_MEM;
+    unsigned chunks = 0;
     while (err == ESP_OK) {
         if (cancel && cancel(ctx)) { err = ESP_ERR_INVALID_STATE; break; }
         int n = http_poll_read(client, buffer, (int)chunk_cap, poll);
@@ -1148,6 +1158,8 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         if ((size_t)n > limit - info->bytes) { err = ESP_ERR_INVALID_SIZE; break; }
         if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { err = ESP_FAIL; break; }
         info->bytes += (size_t)n;
+        // 每4块（32KiB）推进一次跨线程进度，节流避免逐块同步。/ Advance cross-thread progress every4 chunks (32KiB), keeping per-chunk sync cheap.
+        if (!(++chunks & 3u)) weread_client_report_download_progress(info->bytes, false);
     }
 #if defined(ESP_PLATFORM)
     if (err != ESP_OK) {
@@ -1199,6 +1211,8 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             free(redirected); redirected = next; next = NULL; current = redirected;
             continue;
         }
+        // 正文传输结束；解包/校验阶段由上层据done状态标记。/ Body transfer finished; the caller marks the unpack/verify phase from done.
+        weread_client_report_download_progress(info->bytes, true);
         int code = 0;
         if (info->bytes <= 4096 && !fseek(file, 0, SEEK_SET)) {
             char *text __attribute__((cleanup(wr_release)))=wr_alloc(4097);

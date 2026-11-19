@@ -63,6 +63,15 @@ typedef esp_err_t (*weread_download_transport_fn)(const char *url, const char *h
     weread_download_info_t *info, void *ctx);
 void weread_client_set_download_transport(weread_download_transport_fn fn, void *ctx);
 void weread_client_set_radio_awake(bool awake);
+/// 下载正文进度回调：bytes 为本次HTTP尝试的已写字节，done 表示正文传输完成、进入解包校验。
+/// Download body progress: bytes are written for this HTTP attempt; done marks body completion before unpacking.
+typedef void (*weread_download_progress_fn)(uint64_t bytes, bool done, void *ctx);
+/// 服务空闲时安装长期有效的下载进度回调；NULL清除。回调由worker同步执行。
+/// Install a lifetime-stable download progress callback while idle; NULL clears it. It runs synchronously on the worker.
+void weread_client_set_download_progress(weread_download_progress_fn fn, void *ctx);
+/// 传输实现上报写入字节数；原生ESP路径每4块调用，宿主替身可在写入后显式调用。
+/// Transport implementations report written bytes; the native ESP path calls it every4 chunks.
+void weread_client_report_download_progress(uint64_t bytes, bool done);
 /// 下载到调用方的空暂存文件；返回前不关闭文件。/ Download into caller-owned empty staging; leave it open on return.
 esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
     weread_cancel_fn cancel, void *ctx, weread_download_info_t *info);

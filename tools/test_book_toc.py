@@ -74,7 +74,11 @@ static int seen_count;
 static int title_fits,title_draws,selected_titles,white_titles;
 void epd_fill_rect(EpdRect rect,uint8_t color,uint8_t *fb){(void)rect;(void)color;(void)fb;}
 void ui_fill_rect_fast(EpdRect rect,uint8_t color,uint8_t *fb){epd_fill_rect(rect,color,fb);}
-void epd_fill_circle(int x,int y,int radius,uint8_t color,uint8_t *fb){(void)x;(void)y;(void)radius;(void)color;(void)fb;}
+static int dots;
+void epd_fill_circle(int x,int y,int radius,uint8_t color,uint8_t *fb){(void)x;(void)y;(void)fb;if(radius==6){assert(color>=0x30&&color<=0x40);++dots;}}
+static size_t probed[8];static int probed_count;static void *probe_user;
+static int probe_tag;
+static bool cached_probe(size_t chapter,void *user){probe_user=user;if(probed_count<8)probed[probed_count++]=chapter;return chapter==1||chapter==3;}
 void epd_draw_circle(int x,int y,int radius,uint8_t color,uint8_t *fb){(void)x;(void)y;(void)radius;(void)color;(void)fb;}
 void ui_clear_page(uint8_t *fb){(void)fb;}
 void ui_fill_round_rect(uint8_t *fb,EpdRect r,int radius,uint8_t gray){(void)fb;(void)r;(void)radius;(void)gray;cards++;}
@@ -154,6 +158,23 @@ int main(void){
     assert(cards==13 && labels>=17 && large_titles==7 && skip_labels==2);
     assert(borders==26 && pager_labels==2 && jump_labels==1);
     assert(title_draws==8&&selected_titles==1&&white_titles==6);
+    // 缓存标记：只为可见章节行探测，当前行与卷行不探测；绘制只在页匹配时加点。
+    // Cache markers probe visible chapter rows only, skip current/volume rows, and draw only for the prepared page.
+    int dots_before=dots;
+    book_toc_set_cached_probe(cached_probe,&probe_tag);
+    book_toc_prepare_page(8,1,0);
+    assert(probed_count==6&&probe_user==&probe_tag);
+    assert(!s_cached_rows[0]&&!s_cached_rows[1]&&!s_cached_rows[2]&&s_cached_rows[3]);
+    book_toc_render(&fb,"书名\n下一行",8,1,0,"");
+    assert(dots-dots_before==1&&s_cached_page==0&&s_cached_chapters==8);
+    dots_before=dots;book_toc_render(&fb,"书名\n下一行",8,1,1,"");
+    assert(dots==dots_before);
+    grouped=true;page=book_toc_open(2);probed_count=0;probe_user=NULL;
+    book_toc_set_cached_probe(cached_probe,&probe_tag);
+    book_toc_prepare_page(4,2,page);
+    assert(probed_count==1&&probed[0]==3&&probe_user==&probe_tag);
+    grouped=false;
+    book_toc_set_cached_probe(NULL,NULL);
     book_toc_render_jump(&fb,168,60);
     assert(jump_summary==1);
     nav_shift=1;seen_count=0;book_toc_render(&fb,"目录",4,1,0,"");

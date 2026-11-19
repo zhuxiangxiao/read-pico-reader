@@ -89,7 +89,53 @@ static struct {
     bool seen, changed, retry, cover_warmed, anchor, navigation_pending, storage_blocked, pending_coordinate, save_failed;
     bool durable_valid, media_valid, rescued, active, urgent, plain_text, cloud_sync_pending;
     bool prefetch_done;
+    bool cache_forward, cache_forward_off;
 } s_reader;
+/* ---- 开书/切章阶段 / Open and cold-chapter stages ---- */
+static atomic_uint s_stage;
+static atomic_uint_fast64_t s_stage_bytes;
+static bool s_retry_phase, s_retry_blocked;
+static void stage_store(weread_stage_t stage, uint64_t bytes) {
+    // 先写字节再写阶段，UI 短暂的新旧组合不越界。/ Publish bytes before the stage; readers tolerate one mixed sample.
+    atomic_store(&s_stage_bytes, bytes);
+    atomic_store(&s_stage, (unsigned)stage);
+}
+static void stage_phase(weread_stage_t stage, uint64_t bytes) {
+    // 静默重试期间保持「正在重试」，不被同一任务体的阶段覆盖。
+    // Hold the retry notice during the silent replay instead of letting the body's phases overwrite it.
+    if (!s_retry_phase) stage_store(stage, bytes);
+}
+static void stage_download_progress(uint64_t bytes, bool done, void *ctx) {
+    (void)ctx;
+    unsigned stage = atomic_load(&s_stage);
+    if (stage != WEREAD_STAGE_CHAPTER && stage != WEREAD_STAGE_PARSE) return;
+    stage_phase(done ? WEREAD_STAGE_PARSE : WEREAD_STAGE_CHAPTER, bytes);
+}
+bool weread_reader_stage(weread_stage_t *stage, uint64_t *bytes) {
+    unsigned value = atomic_load(&s_stage);
+    if (stage) *stage = (weread_stage_t)value;
+    if (bytes) *bytes = atomic_load(&s_stage_bytes);
+    return value != WEREAD_STAGE_NONE;
+}
+bool weread_reader_stage_text(char *out, size_t cap) {
+    if (!out || cap < 2) return false;
+    out[0] = 0;
+    uint64_t bytes = atomic_load(&s_stage_bytes);
+    switch (atomic_load(&s_stage)) {
+        case WEREAD_STAGE_PROGRESS: snprintf(out, cap, "正在同步进度…"); return true;
+        case WEREAD_STAGE_TOC: snprintf(out, cap, "正在获取目录…"); return true;
+        case WEREAD_STAGE_CHAPTER: {
+            uint64_t kb = bytes / 1024u;
+            if (!kb) snprintf(out, cap, "正在下载章节…");
+            else if (kb < 1024u) snprintf(out, cap, "正在下载章节 %u KB…", (unsigned)kb);
+            else snprintf(out, cap, "正在下载章节 %u MB…", (unsigned)(kb / 1024u));
+            return true;
+        }
+        case WEREAD_STAGE_PARSE: snprintf(out, cap, "正在校验章节…"); return true;
+        case WEREAD_STAGE_RETRY: snprintf(out, cap, "网络超时，正在重试…"); return true;
+        default: return false;
+    }
+}
 static uint64_t now_ms(void) {
 #if defined(ESP_PLATFORM)
     return (uint64_t)esp_timer_get_time() / 1000;
@@ -320,6 +366,7 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
                     if (!local.book_version) local.book_version = toc.book_version;
                     book_weread_adopt_prepared_local(s_work.id, &toc);
                     weread_toc_free(&toc);
+                    stage_phase(WEREAD_STAGE_PARSE, 0);
                     esp_err_t verr = book_weread_validate_prepared(s_work.id, local.chapter_uid, local.chapter_index,
                         local.chapter_offset, &local.book_version);
                     if (verr == ESP_OK) {
@@ -340,6 +387,7 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
     }
     if (!choose) {
         weread_progress_t cloud_prog = {0};
+        stage_phase(WEREAD_STAGE_PROGRESS, 0);
         progress = weread_progress_fetch_version(s_work.id, &cloud_prog, &fresh_version, &last_chapter);
         ESP_LOGI("weread","progress result=%d local=%u cloud=%u",(int)progress,(unsigned)s_result.local.progress,(unsigned)cloud_prog.progress);
         WR_GUARD;
@@ -354,6 +402,7 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
         selected = s_result.local;
     }
     phase[1]=now_ms();
+    stage_phase(WEREAD_STAGE_TOC, 0);
     esp_err_t prepared=weread_toc_prepare(s_work.id,false,fresh_version,&toc);
     if(prepared!=ESP_OK||!toc.count){weread_toc_free(&toc);return prepared!=ESP_OK?prepared:ESP_ERR_NOT_FOUND;}
     uint32_t uid = selected.chapter_uid;
@@ -362,7 +411,7 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
         exists=true;moved=selected.chapter_index&&selected.chapter_index!=toc.chapters[i].index;
     }
     if((uid&&(!exists||moved))||last_chapter>toc.chapters[toc.count-1].index){
-        weread_toc_free(&toc);prepared=weread_toc_prepare(s_work.id,true,fresh_version,&toc);
+        weread_toc_free(&toc);stage_phase(WEREAD_STAGE_TOC, 0);prepared=weread_toc_prepare(s_work.id,true,fresh_version,&toc);
         if(prepared!=ESP_OK||!toc.count){weread_toc_free(&toc);return prepared!=ESP_OK?prepared:ESP_ERR_NOT_FOUND;}
         exists=moved=false;
         for(size_t i=0;i<toc.count;++i)if(toc.chapters[i].uid==uid){
@@ -378,14 +427,19 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
     bool chapter_hit=weread_chapter_cached(s_work.id,uid);
     if(chapter_hit){WR_GUARD;book_weread_adopt_prepared(s_work.id,&toc);}
     weread_toc_free(&toc);
+    if (!chapter_hit) stage_phase(WEREAD_STAGE_CHAPTER, 0);
     esp_err_t err = cancelled(NULL) ? ESP_ERR_INVALID_STATE : chapter_hit?ESP_OK:weread_chapter_download(s_work.id, uid);
     phase[3]=now_ms();
     if (err == ESP_OK) {
+        stage_phase(WEREAD_STAGE_PARSE, 0);
         err=book_weread_prepare_open(s_work.id);
         if(err!=ESP_OK)return err;
         WR_GUARD;
         err=book_weread_validate_prepared(s_work.id,uid,selected.chapter_index,selected.chapter_offset,&selected.book_version);
         if(err!=ESP_OK){book_weread_clear_prepared();return err;}
+        // 位置写入从这里开始；重放超时可能重复提交进度，因此此后不再重试。
+        // Persistence starts here; replaying a timeout could duplicate a progress commit, so no retry past this point.
+        s_retry_blocked = true;
         if(choose){
             err=weread_progress_select(s_work.id,&selected,cloud);
             if(err==ESP_OK){selected.dirty=selected.position_pending=!cloud;if(cloud)selected.pending_pages=selected.reading_time=0;}
@@ -710,16 +764,13 @@ static esp_err_t cover_job(const char *url){
 #endif
     return err;
 }
-static void perform_job(void) {
-    s_result.job = s_work.job; strcpy(s_result.id, s_work.id);
+static bool retryable_job(weread_job_t job) {
+    // 仅前台开书/本地/云端开书和冷章在瞬时超时后静默重放一次；目录任务由阅读页在UI线程同步等待，重试只会加倍开书冻结，故不重试。
+    // Only foreground open/local/cloud open and cold chapters replay once after a transient timeout; the TOC job joins synchronously on the UI thread, so replaying it would double the open freeze.
+    return job == WR_JOB_OPEN || job == WR_JOB_LOCAL || job == WR_JOB_CLOUD || job == WR_JOB_CHAPTER;
+}
+static esp_err_t job_run(void) {
     esp_err_t err = ESP_OK;
-#if defined(ESP_PLATFORM)
-    if (s_work.job != WR_JOB_STOP && s_work.job != WR_JOB_CONNECT && s_work.job!=WR_JOB_DISCONNECT && !read_pico_sd_io_ready()) {
-        s_result.error=ESP_ERR_INVALID_STATE;return;
-    }
-#endif
-    weread_client_set_polling(true);
-    weread_client_set_background(s_work.job==WR_JOB_NOTE||s_work.job==WR_JOB_REPORT||s_work.job==WR_JOB_PREFETCH||s_work.job==WR_JOB_COVER||s_work.job==WR_JOB_CLOUD_SYNC);
     switch (s_work.job) {
         case WR_JOB_INIT: weread_runtime_load_local(); snapshot(); break;
         case WR_JOB_SYNC:
@@ -769,6 +820,7 @@ static void perform_job(void) {
         case WR_JOB_CHAPTER:
             s_result.chapter_uid = (uint32_t)s_work.chapter;
             s_result.chapter_idx = s_work.chapter_idx;
+            stage_phase(WEREAD_STAGE_CHAPTER, 0);
             err = weread_chapter_download(s_work.id, (uint32_t)s_work.chapter);
             if (err == ESP_OK && !cancelled(NULL) && s_work.chapter_idx != SIZE_MAX)
                 book_cache_mark(s_work.id, s_work.chapter_idx, true);
@@ -780,8 +832,38 @@ static void perform_job(void) {
         case WR_JOB_CONNECT: err = connect_network(); break;
         case WR_JOB_DISCONNECT: stop_network();break;
         case WR_JOB_STOP: weread_progress_outbox_reset();book_weread_clear_prepared();weread_shelf_sync_discard();stop_network(); break;
-        case WR_JOB_TOC: err=book_weread_prepare_open(s_work.id);break;
+        case WR_JOB_TOC:
+            // 目录准备可能重新联网同步目录；解析与校验仍由目录服务内部完成。
+            // TOC preparation may re-sync the TOC; parsing/validation stay inside the TOC service.
+            stage_phase(WEREAD_STAGE_TOC, 0);
+            err=book_weread_prepare_open(s_work.id);
+            break;
     }
+    return err;
+}
+static void perform_job(void) {
+    s_result.job = s_work.job; strcpy(s_result.id, s_work.id);
+    esp_err_t err = ESP_OK;
+#if defined(ESP_PLATFORM)
+    if (s_work.job != WR_JOB_STOP && s_work.job != WR_JOB_CONNECT && s_work.job!=WR_JOB_DISCONNECT && !read_pico_sd_io_ready()) {
+        s_result.error=ESP_ERR_INVALID_STATE;return;
+    }
+#endif
+    weread_client_set_polling(true);
+    weread_client_set_background(s_work.job==WR_JOB_NOTE||s_work.job==WR_JOB_REPORT||s_work.job==WR_JOB_PREFETCH||s_work.job==WR_JOB_COVER||s_work.job==WR_JOB_CLOUD_SYNC);
+    bool retryable = retryable_job(s_work.job);
+    // 超时只来自网络阶段：目录/版本缓存重写幂等，位置检查点之后的写入禁止重放（s_retry_blocked）。
+    // Timeouts come from network phases: TOC/version cache writes are idempotent, while persistence after the progress checkpoint forbids replay (s_retry_blocked).
+    for (unsigned attempt = 0;; ++attempt) {
+        s_retry_phase = attempt != 0;
+        s_retry_blocked = false;
+        if (s_retry_phase) stage_store(WEREAD_STAGE_RETRY, 0);
+        err = job_run();
+        if (!retryable || err != ESP_ERR_TIMEOUT || s_retry_blocked || cancelled(NULL) || attempt) break;
+        ESP_LOGW("weread", "transient timeout retry job=%u", (unsigned)s_work.job);
+    }
+    s_retry_phase = false;
+    stage_store(WEREAD_STAGE_NONE, 0);
     if (cancelled(NULL) && err == ESP_OK && s_work.job != WR_JOB_STOP) err = ESP_ERR_INVALID_STATE;
     if (err != ESP_OK || s_result.error == ESP_OK) s_result.error = err;
     s_result.authenticated = weread_auth_is_authenticated();
@@ -824,6 +906,7 @@ void weread_runtime_init(void) {
     wr_memory_init();
     weread_client_init(); weread_client_set_cancel(cancelled, NULL);
     weread_client_set_timeout_budget(timeout_budget,NULL);
+    weread_client_set_download_progress(stage_download_progress, NULL);
     weread_chapter_set_cancel(cancelled, NULL); weread_client_set_network(weread_runtime_connect, NULL);
     s_configured = true;
 }
@@ -1010,6 +1093,8 @@ void weread_runtime_stop(void) {
     atomic_store(&s_sync_downloading_uid, 0); atomic_store(&s_prefetch_downloading_uid, 0);
     memset(&s_cloud_jump, 0, sizeof(s_cloud_jump));
     weread_runtime_result_free(&s_result); atomic_store(&s_done, false);
+    s_retry_phase = false;
+    stage_store(WEREAD_STAGE_NONE, 0);
 }
 void weread_runtime_media_lost(void) {
     weread_runtime_stop();
@@ -1047,6 +1132,24 @@ bool weread_reader_cached(const char *uri,size_t chapter){
         if(s_work.job==WR_JOB_CLOUD_SYNC&&!strcmp(s_work.id,uri+9)&&atomic_load(&s_sync_downloading_uid)==uid)return false;
     }
     return weread_chapter_cached(uri+9,uid);
+}
+bool weread_reader_chapter_cached(const char *uri,size_t chapter){
+    // 目录页只查可见章：整本位图已扫描时零IO查位；否则每章一次有界存在性检查，不触发整书扫描。
+    // TOC pages probe visible chapters: a scanned book bitmap answers with zero IO, otherwise one bounded existence check per chapter, never a full scan.
+    if(!uri||!book_path_is_weread(uri))return false;
+    const char *id=uri+9;
+    bool bitmap=false;
+    {
+        WR_GUARD;
+        bitmap=book_cache_ready(id);
+        if(bitmap&&book_cache_scanned(id)&&chapter<s_book_cache.total)return book_cache_bit(id,chapter);
+        bitmap=bitmap&&chapter<s_book_cache.total;
+    }
+    uint32_t uid=book_weread_uid(chapter);
+    if(!uid||!wr_valid_id(id))return false;
+    bool hit=weread_chapter_cached(id,uid);
+    if(hit&&bitmap)book_cache_mark(id,chapter,true);
+    return hit;
 }
 bool weread_runtime_prefetch_active(const char *id,uint32_t uid){
     return weread_runtime_busy()&&s_work.job==WR_JOB_PREFETCH&&id&&uid&&
@@ -1247,6 +1350,15 @@ void weread_reader_cached_progress(unsigned *cached, unsigned *total){
     if(total)*total=atomic_load(&s_total_count);
 }
 bool weread_reader_storage_blocked(void){return s_reader.storage_blocked;}
+// 会话级手动缓存开关：仅由阅读页读写，开书重置；后台worker不读取。
+// Session-only manual cache flag: read/written by the reader page only, reset on book begin; the worker never reads it.
+void weread_reader_cache_forward_set(bool on){
+    s_reader.cache_forward=on;
+    // 显式关闭只抑制整本向后补齐（含自动空闲补齐），不取消在飞章节，也不影响自动下一章预读。
+    // Explicit off only suppresses the whole-book forward fill (including automatic idle fill); in-flight chapters, the urgent next-chapter pre-read and reports stay.
+    s_reader.cache_forward_off=!on;
+}
+bool weread_reader_cache_forward(void){return s_reader.cache_forward;}
 bool weread_reader_caching(void){return weread_runtime_busy()&&s_work.job==WR_JOB_PREFETCH&&!strcmp(s_work.id,s_reader.id);}
 bool weread_reader_poll_cloud_jump(const char *uri,size_t *chapter_out,uint32_t *offset_out){
     if(!book_path_is_weread(uri)||!chapter_out||!offset_out||!atomic_load(&s_cloud_jump_ready)||
@@ -1347,7 +1459,9 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         if(weread_runtime_start(WR_JOB_NOTE,s_reader.id,NULL)){s_reader.report_at=now+15000;s_reader.urgent=false;}
         return;
     }
-    if(now-s_reader.last_move<1000)return;
+    // 手动缓存不等翻页静止1秒，但前台输入冷却仍生效；关闭只停止新的派发，已启动章节照常完成。
+    // Manual caching skips the1s idle-after-move window while foreground input still pauses it; turning it off only stops new dispatches.
+    if(!s_reader.cache_forward&&now-s_reader.last_move<1000)return;
     uint64_t fg_ms = atomic_load(&s_fg_input_ms);
     if (fg_ms) {
         uint64_t sys_now = now_ms();
@@ -1355,14 +1469,17 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
     }
     if(!s_reader.cover_warmed){s_reader.cover_warmed=weread_runtime_start(WR_JOB_COVER,s_reader.id,"warm");return;}
     if(!s_reader.prefetch_done&&!s_reader.storage_blocked&&s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry){
+        // 显式关闭只抑制新的整本向后补齐；目录扫描、自动下一章预读与在飞章节都不受影响。
+        // Explicit off suppresses only new whole-book forward dispatches; the cache scan, urgent next-chapter pre-read and in-flight chapters stay.
+        bool forward=!s_reader.cache_forward_off;
         if (s_reader.total_chapters) {
-            if (bits_ready && s_reader.prefetch_cursor < s_reader.total_chapters &&
+            if (forward && bits_ready && s_reader.prefetch_cursor < s_reader.total_chapters &&
                 weread_runtime_start(WR_JOB_PREFETCH, s_reader.id, "forward")) return;
             if (bits_ready && !book_cache_scanned(s_reader.id) &&
                 weread_runtime_start(WR_JOB_PREFETCH, s_reader.id, "scan")) return;
             if (s_reader.prefetch_cursor >= s_reader.total_chapters && (!bits_ready || book_cache_scanned(s_reader.id)))
                 s_reader.prefetch_done = true;
-        } else if (book_weread_uid(s_reader.prefetch_cursor) &&
+        } else if (forward && book_weread_uid(s_reader.prefetch_cursor) &&
                    weread_runtime_start(WR_JOB_PREFETCH, s_reader.id, "forward")) {
             return;
         }

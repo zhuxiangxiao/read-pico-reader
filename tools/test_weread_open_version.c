@@ -117,7 +117,9 @@ int main(int argc, char **argv) {
             puts("Corrupt cached map re-downloaded once; complete map and auto-adopted cloud coordinates validated before saving.");return 0;
         }
         assert(result.error==(corrupt_fail?ESP_ERR_TIMEOUT:WEREAD_ERR_POSITION)&&!result.open_ready&&!reports);
-        if(corrupt_fail)assert(downloads==2&&!weread_chapter_cached("test_book_101",2));
+        // 原位损坏缓存先被自愈下载一次；开书超时后静默重试再下载一次，共3次尝试。
+        // The corrupt cache is healed once, then the open job replays its timeout once:3 download attempts.
+        if(corrupt_fail)assert(downloads==3&&!weread_chapter_cached("test_book_101",2));
         weread_progress_t saved;assert(weread_progress_load("test_book_101",&saved)==ESP_OK&&saved.chapter_uid==1&&saved.dirty&&saved.reading_time==7);
         weread_runtime_result_free(&result);weread_runtime_stop();weread_shelf_clear();
         puts("Invalid cloud position rejected without replacing dirty local progress.");return 0;

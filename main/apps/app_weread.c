@@ -68,6 +68,13 @@ static uint64_t s_next_poll, s_next_action;
 static EpdRect s_area;
 static bool s_cover_remote, s_requested_home, s_open_home, s_reader_failed;
 static bool s_cover_warm, s_preconnected, s_cover_dirty, s_open_queued;
+// 只有 open_id 发起的开书在途时才刷新阶段提示行，其他任务/错误消息不受影响。
+// The open-stage line refreshes only while an open_id()-initiated open is in flight, never after it ends.
+static bool s_open_stage;
+// 下载字节每 32 KiB 变化一次，书架消息行最多每 2 秒重绘一次，阶段切换仍立即显示。
+// Download bytes change every 32 KiB, so repaint the shelf message line at most every 2 s; a stage change still shows immediately.
+static uint64_t s_open_stage_at;
+static unsigned s_open_stage_kind;
 static uint64_t s_open_owner;static unsigned s_open_epoch;
 static uint64_t s_warm_page, s_cover_paint_at;
 static unsigned s_warm_slot;
@@ -93,10 +100,17 @@ static uint64_t book_id_hash64(const char *id) {
     return h;
 }
 static metalio_cover_key_t raw_cover_ram_key(const weread_shelf_item_t *b) {
+    // 共享缓存按 key.field[0] 归一族、field[2]/field[3] 判旧版本；家族标记必须按书号区分，
+    // 否则同族其他书会被当成旧版本清掉（只剩一本命中）。书号、封面键、账号代次、所有者与
+    // 176x240 尺寸仍全部入键。
+    // The shared cache groups one key.field[0] family and retires stale versions on field[2]/field[3];
+    // the family marker must be per book or sibling books get discarded as stale versions. Book id,
+    // cover key, owner/epoch and the 176x240 dimensions all stay in the key.
+    uint64_t book = book_id_hash64(b ? b->book_id : "");
     return (metalio_cover_key_t){{
-        UINT64_C(0x5752435652310001),
+        UINT64_C(0x5752435652310001) ^ book,
+        book,
         b ? b->cover_key : 0,
-        book_id_hash64(b ? b->book_id : ""),
         ((uint64_t)s_cover_cache_epoch << 32) | (uint32_t)s_epoch,
         s_owner,
         WEREAD_COVER_WIDTH,
@@ -142,7 +156,7 @@ bool app_weread_request_open(const char *uri) {
 void app_weread_reader_failed(void){s_reader_failed=true;}
 static void message(const char *s) { wr_display_copy(s_message, sizeof(s_message), s); }
 static void release_covers(void) { for (int i = 0; i < ROWS; ++i) { free(s_covers[i].pixels); memset(&s_covers[i], 0, sizeof(s_covers[i])); } s_cover_dirty=false;s_cover_paint_at=0;s_next_action=0; }
-static void stop_job(void) { s_open_queued=s_init_pending=false;weread_runtime_cancel_join();s_cover_warm=false; weread_result_t r; if (weread_runtime_poll(&r)) weread_runtime_result_free(&r);s_syncing=false;s_more_sync=weread_shelf_sync_pending(); }
+static void stop_job(void) { s_open_queued=s_init_pending=s_open_stage=false;weread_runtime_cancel_join();s_cover_warm=false; weread_result_t r; if (weread_runtime_poll(&r)) weread_runtime_result_free(&r);s_syncing=false;s_more_sync=weread_shelf_sync_pending(); }
 static int compare_match(const void *a,const void *b){
     const weread_shelf_item_t *x=&s_books[*(const uint16_t*)a],*y=&s_books[*(const uint16_t*)b];
     int mode=ui_shelf_order_mode(s_order),c=0;
@@ -232,9 +246,10 @@ static bool start(weread_job_t job, const char *id, const char *value) {
 static void open_id(const char *id) {
     s_open_home=false;strcpy(s_id,id);s_clear=false;s_more_sync=false;
     message("正在准备阅读…");
+    s_open_stage_at=0;s_open_stage_kind=0;
     if(weread_runtime_busy()){
-        s_open_queued=true;s_open_owner=s_owner;s_open_epoch=s_epoch;weread_runtime_cancel();
-    }else{stop_job();start(WR_JOB_OPEN,id,NULL);}
+        s_open_queued=true;s_open_owner=s_owner;s_open_epoch=s_epoch;s_open_stage=true;weread_runtime_cancel();
+    }else{stop_job();s_open_stage=start(WR_JOB_OPEN,id,NULL);}
 }
 static void enter(app_ctx_t *ctx) {
     int first=s_page*page_rows();s_style=app_settings_shelf_style();s_page=first/page_rows();
@@ -248,20 +263,20 @@ static void enter(app_ctx_t *ctx) {
     s_more_sync=false;
 }
 static void leave(app_ctx_t *ctx) {
-    s_open_queued=s_init_pending=false;
+    s_open_queued=s_init_pending=s_open_stage=false;
     wifi_close(ctx); ui_keyboard_end(); ui_wifi_qr_clear(); s_requested[0]=0;
     if (!s_keep_network) weread_runtime_stop(); else stop_job();
     release_covers(); free(s_books); s_books = NULL; free(s_matches); s_matches = NULL; s_count = s_visible = 0;
     s_more_sync=s_syncing=false;
 }
 static void media_lost(app_ctx_t *ctx) {
-    s_open_queued=s_init_pending=false;
+    s_open_queued=s_init_pending=s_open_stage=false;
     wifi_close(ctx); weread_runtime_media_lost(); release_covers();
     free(s_books); s_books = NULL; free(s_matches); s_matches = NULL; s_count = s_visible = 0;
     s_auth = false; s_requested[0] = s_uid[0] = s_qr[0] = 0;ui_wifi_qr_clear();message("TF 卡不可用，请重新插入");
 }
 static void before_lock(app_ctx_t *ctx) {
-    s_open_queued=s_init_pending=false;
+    s_open_queued=s_init_pending=s_open_stage=false;
     wifi_close(ctx); weread_runtime_stop(); s_wake = true; ui_keyboard_end(); s_search = false;
 }
 static void media_ready(app_ctx_t *ctx) { (void)ctx; s_wake = true; }
@@ -436,12 +451,13 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         if(weread_runtime_poll(&r))weread_runtime_result_free(&r);
         s_open_queued=s_cover_warm=false;
         if(s_open_owner!=weread_cover_key("","")||s_open_epoch!=weread_runtime_cache_epoch()){
-            s_sync_after_init=true;s_auth=false;
+            s_sync_after_init=true;s_auth=false;s_open_stage=false;
             start(WR_JOB_INIT,NULL,NULL);message("登录或存储卡已变化，正在重新加载…");return APP_REDRAW_PAGE;
         }
-        start(WR_JOB_OPEN,s_id,NULL);return APP_REDRAW_NONE;
+        s_open_stage=start(WR_JOB_OPEN,s_id,NULL);return APP_REDRAW_NONE;
     }
     if(weread_runtime_poll(&r)){
+        if(r.job==WR_JOB_OPEN)s_open_stage=false;
         if(r.job==WR_JOB_NOTE||r.job==WR_JOB_PREFETCH||r.job==WR_JOB_CLOUD_SYNC||r.job==WR_JOB_CHAPTER){
             weread_runtime_result_free(&r);
             if(s_init_pending&&!weread_runtime_busy()&&weread_runtime_start(WR_JOB_INIT,NULL,NULL))s_init_pending=false;
@@ -514,7 +530,15 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         }
         if(r.open_ready&&r.error==ESP_OK){
             char uri[80];snprintf(uri,sizeof(uri),"weread://%s",r.id);
-            if(s_open_home?app_book_request_open_from_home(uri):app_book_request_open_from_weread(uri)){s_keep_network=true;ctx->request_app=app_at(1);}
+            if(s_open_home?app_book_request_open_from_home(uri):app_book_request_open_from_weread(uri)){
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
+                // Pico 开书前把 RAM 封面缓存收到 128 KiB，阅读占用才不会跌破 3 MiB 字体缓存回收阈值；
+                // S31 在 app_book 开书路径里自己回收 512 KiB。
+                // Pico trims the RAM cover cache to 128 KiB before opening so the reader stays above the
+                // 3 MiB font-cache reclaim threshold; the S31 trims 512 KiB in app_book itself.
+                metalio_cover_cache_trim(128u*1024u);
+#endif
+                s_keep_network=true;ctx->request_app=app_at(1);}
         }
         if(r.job==WR_JOB_COVER){
 #if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
@@ -523,7 +547,9 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
             s_covers[i].checked=true;
             if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;
-                if(!s_cover_dirty)s_cover_paint_at=ctx->now_ms+150;
+                // 本地命中不叠加 150 ms 合并刷新，封面齐了就直接画；远端封面仍等 150 ms。
+                // Local hits add no 150 ms merge delay and paint once checked; remote fetches keep it.
+                if(!s_cover_dirty)s_cover_paint_at=local_cover?0:ctx->now_ms+150;
                 s_cover_dirty=true;
             }
             else if(r.error==ESP_ERR_NO_MEM||r.error==ESP_ERR_INVALID_STATE)
@@ -581,9 +607,33 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         bool cover_result=r.job==WR_JOB_COVER;
         bool batch_cover=cover_result&&(!local_cover||!covers_checked());
         bool paint_cover=cover_result&&local_cover&&covers_checked()&&s_cover_dirty;
+        // 本地封面结果一回来就继续取下一本，不留 150 ms 节流；远端封面和内存重试仍按原节奏。
+        // Continue the local cover queue immediately on completion; remote fetches and memory retries keep their pacing.
         if(local_cover)s_next_action=ctx->now_ms;
         if(paint_cover){s_cover_dirty=false;s_cover_paint_at=0;}
         weread_runtime_result_free(&r);return unchanged||batch_cover||(cover_result&&!paint_cover)?APP_REDRAW_NONE:APP_REDRAW_PAGE;
+    }
+    // 开书在途时把 worker 的当前阶段写到 render() 的消息行；文字变化才刷该行，结束/取消后不再覆盖错误消息。
+    // While an open is in flight, show the worker's current stage on render()'s message line; repaint only on change.
+    // 搜索/菜单/确认框/扫码页打开时暂不占用消息行，避免阶段提示盖住子页面。
+    // Hold the stage line while a subpage (search, menus, confirm, Wi-Fi) owns the screen.
+    if(s_open_stage&&!s_search&&!s_sort_menu&&!s_more_menu&&!s_clear&&!s_logout&&!s_wifi){
+        weread_stage_t kind=WEREAD_STAGE_NONE;
+        char stage[64];
+        if(weread_reader_stage(&kind,NULL)&&weread_reader_stage_text(stage,sizeof(stage))&&strcmp(stage,s_message)){
+            // 下载阶段的 KB 文案按 2 秒节奏合并，避免每 32 KiB 局刷一次消息行。
+            // Coalesce download KB labels to 2 s so the message line is not repainted every 32 KiB.
+            if((unsigned)kind==s_open_stage_kind&&kind==WEREAD_STAGE_CHAPTER&&ctx->now_ms<s_open_stage_at)return APP_REDRAW_NONE;
+            s_open_stage_kind=(unsigned)kind;s_open_stage_at=ctx->now_ms+2000;
+            message(stage);
+            if(ctx->fb){
+                ui_text_set_system_scale(true);
+                ui_fill_rect_fast((EpdRect){36,990,612,20},UI_GRAY_WHITE,ctx->fb);
+                ui_text_box(ctx->fb,(EpdRect){36,990,612,20},17,s_message,EPD_DRAW_ALIGN_LEFT,false);
+                s_area=(EpdRect){36,988,612,24};
+                return APP_REDRAW_AREA;
+            }
+        }
     }
     if(s_cover_dirty&&covers_checked()&&ctx->now_ms>=s_cover_paint_at&&!s_search&&!s_sort_menu&&!s_more_menu&&!s_clear&&!s_logout){
         s_cover_dirty=false;s_cover_paint_at=0;return APP_REDRAW_PAGE;

@@ -80,6 +80,7 @@ static void ui_root_background(uint8_t*f){}
 static void ui_nav_status(uint8_t*f){}
 static void ui_nav_draw(uint8_t*f,int id){assert(id==6);++drawn_nav;}
 static void ui_text(uint8_t*f,int x,int y,int px,const char*s,int align,bool inverse){remember_text(s);}
+static void ui_text_set_system_scale(bool enabled){(void)enabled;}
 static void ui_text_vc(uint8_t*f,int x,int y,int px,const char*s,int align,bool inverse){remember_text(s);}
 static void ui_text_box(uint8_t*f,EpdRect r,int px,const char*s,int align,bool inverse){remember_text(s);}
 static void ui_fill_rect_fast(EpdRect r,int gray,uint8_t*f){}
@@ -123,6 +124,10 @@ unsigned weread_runtime_cache_epoch(void){return mock_epoch;}
 bool weread_shelf_cache_fresh(uint64_t now){return mock_fresh;}
 bool weread_shelf_sync_pending(void){return mock_pending;}
 bool weread_runtime_choose(const char*id,const weread_progress_t*p,bool cloud){return true;}
+/// 运行时的开书阶段文案由真实worker提供；本测试没有开书阶段，保持既有提示。
+/// The runtime owns the open-stage text; this test has no open stage, so keep existing notices.
+bool weread_reader_stage_text(char*out,size_t cap){(void)out;(void)cap;return false;}
+bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){(void)stage;(void)bytes;return false;}
 #include "cover.inc"
 #include "production.inc"
 static void complete(weread_result_t r){assert(mock_busy&&!mock_ready);mock_authenticated=r.authenticated;mock_result=r;mock_busy=false;mock_ready=true;}

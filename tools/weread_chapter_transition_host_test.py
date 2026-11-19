@@ -16,13 +16,19 @@ unit=r'''
 #include <string.h>
 typedef int esp_err_t;
 enum {ESP_OK,ESP_FAIL,ESP_ERR_NO_MEM,ESP_ERR_INVALID_STATE,WEREAD_ERR_PURCHASE,WEREAD_ERR_SOLD_OUT,WEREAD_ERR_VERSION};
-enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER,WR_JOB_PREFETCH};
-typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE} app_redraw_t;
+enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER,WR_JOB_PREFETCH,MODE_GL16};
+typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE,APP_REDRAW_AREA} app_redraw_t;
+typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {bool touched;} touch_t;
-typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;} app_ctx_t;
+typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;uint8_t *fb;} app_ctx_t;
 typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t;
 static struct {bool pending,started,committing,last_page;esp_err_t error;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
 static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,cached_flag,prefetch_busy,cloud_jump_ready,cloud_jump_committed;
+static bool stage_ready;static char stage_text[64];static EpdRect s_area;static int s_mode,renders;
+typedef enum {WEREAD_STAGE_NONE=0,WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE,WEREAD_STAGE_RETRY} weread_stage_t;
+static bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){(void)bytes;if(!stage_ready)return false;*stage=WEREAD_STAGE_TOC;return true;}
+static bool weread_reader_stage_text(char *out,size_t cap){if(!stage_ready)return false;snprintf(out,cap,"%s",stage_text);return true;}
+static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++renders;}
 static size_t cloud_jump_ch;static uint32_t cloud_jump_off,adopted_uid;
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE;
 static char s_path[]="weread://book_A",s_message[128],s_reader_notice[64],s_title[64];
@@ -65,11 +71,23 @@ unit+=(root/'main/apps/book_weread_chapter.inc').read_text()+'\n'
 unit+=r'''
 static void complete(int err){busy=false;done=true;ready.error=err;}
 int main(void){
- app_ctx_t ctx={.now_ms=1000};
+ app_ctx_t ctx={.now_ms=1000,.fb=(uint8_t*)1};
  busy=true;assert(wr_chapter_queue(&ctx,3,0,false,NULL,SIZE_MAX));
  assert(s_wr_jump.pending&&!starts&&!loads&&s_chapter==2&&s_page==7);
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!starts);
  busy=false;assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&starts==1&&busy);
+ // Cold-stage toast: only a changed worker label repaints the toast region, never every tick.
+ stage_ready=true;snprintf(stage_text,sizeof(stage_text),"同步阅读进度…");
+ int renders_before=renders;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+1);
+ assert(!strcmp(s_reader_notice,"同步阅读进度…")&&s_mode==MODE_GL16&&s_area.x==208&&s_area.width==268);
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+1);
+ ctx.consumed=true;snprintf(stage_text,sizeof(stage_text),"下载章节正文…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!strcmp(s_reader_notice,"同步阅读进度…"));
+ ctx.consumed=false;assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+2);
+ assert(!strcmp(s_reader_notice,"下载章节正文…"));
+ stage_ready=false;snprintf(stage_text,sizeof(stage_text),"解析章节…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+2);
  complete(WEREAD_ERR_PURCHASE);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
  assert(!s_wr_jump.pending&&!loads&&!moves&&s_chapter==2&&s_page==7&&strstr(s_reader_notice,"手机"));
  char anchor[]="owned-anchor";assert(wr_chapter_queue(&ctx,3,0,false,anchor,SIZE_MAX));anchor[0]='X';

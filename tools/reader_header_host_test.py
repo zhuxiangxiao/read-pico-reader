@@ -22,6 +22,10 @@ typedef enum {APP_READER_KEY_PREV,APP_READER_KEY_NEXT,APP_READER_KEY_HOME,APP_RE
 #define UI_LOCK_WIDTH 684
 #define BOOK_TOOL_COUNT 5
 static bool s_reader_fullscreen,s_clear_confirm,s_reader_favorite,save_fail,mode_fail;
+static int cache_toggles,toc_prepares;
+static bool book_path_is_weread(const char *path){return path&&!strncmp(path,"weread://",9);}
+static void wr_cache_forward_toggle(app_ctx_t *ctx){(void)ctx;++cache_toggles;}
+static void toc_cached_markers_prepare(int page){(void)page;++toc_prepares;}
 static const char *s_text="body";
 static int64_t s_stats_activity_ms;
 static int s_reader_panel=READER_PANEL_NONE,s_footnote_note=-1,s_mode,s_view=READING,s_line_spacing,s_reader_slider;
@@ -56,7 +60,7 @@ static app_redraw_t reader_manual_refresh(app_ctx_t *ctx){(void)ctx;return APP_R
 
 '''
 unit+='static bool s_rc_font_root;\n'
-for name in ('tool_rect', 'reader_tools_visible', 'reader_header_action', 'reader_key_action'):
+for name in ('book_tool_count', 'tool_rect', 'reader_tools_visible', 'reader_header_action', 'reader_key_action'):
     unit += function(name, BOOK) + '\n'
 panel = function('reader_panel_action', BOOK)
 a = panel.index('    if (reader_tools_visible()) {')

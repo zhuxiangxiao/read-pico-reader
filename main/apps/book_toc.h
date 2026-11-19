@@ -23,6 +23,12 @@
 #define BOOK_TOC_SELECT_VOLUME (-11)
 
 int book_toc_pages(size_t chapters);
+/// 注入章节缓存探针；目录绘制只读准备好的小位图，绝不在此回调里执行IO。
+/// Inject the cached-chapter probe; drawing reads prepared flags only and never calls it.
+void book_toc_set_cached_probe(bool (*probe)(size_t chapter, void *user), void *user);
+/// 进入目录或翻页后按可见章节行准备缓存标记；卷行和当前行不查询。
+/// Prepare cached markers for visible chapter rows after entry/paging; volume and current rows are skipped.
+void book_toc_prepare_page(size_t chapters, size_t current, int page);
 /// 进入目录时仅展开当前卷，返回当前章节所在页。/ Open only the current volume and return its selected chapter page.
 int book_toc_open(size_t current);
 /// 卷行只展开/折叠，不跳读正文；按新布局定位卷行。/ Toggle a volume without loading text and reposition its header.

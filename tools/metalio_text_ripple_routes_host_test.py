@@ -32,6 +32,7 @@ static bool chrome,background;
 static void reader_zoom_reset(void){}
 static size_t current_toc_position(void){return 0;}
 static int book_toc_open(size_t position){(void)position;return 0;}
+static void toc_cached_markers_prepare(int page){(void)page;}
 static int images,effect,full,s_turns,s_turn_direction,s_view,s_water_turn_dir,s_unsaved;
 static unsigned s_page,s_chapter;
 static int64_t s_last_turn_ms,s_stats_activity_ms;

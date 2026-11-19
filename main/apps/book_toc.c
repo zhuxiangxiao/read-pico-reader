@@ -23,6 +23,21 @@ enum { TOC_VOLUME_HIT = -1000 };
 static size_t s_open_volume=SIZE_MAX;
 static bool s_volume_picker;
 static int s_picker_return_page;
+// 章节缓存标记由页面进入/翻页时一次性准备；绘制阶段只读这份定长位图。
+// Chapter cache markers are prepared once on entry/paging; drawing reads only this fixed flag array.
+static bool (*s_cached_probe)(size_t chapter, void *user);
+static void *s_cached_probe_user;
+static bool s_cached_rows[BOOK_TOC_ROWS];
+static size_t s_cached_chapters;
+static int s_cached_page = -1;
+
+void book_toc_set_cached_probe(bool (*probe)(size_t chapter, void *user), void *user) {
+    s_cached_probe = probe;
+    s_cached_probe_user = user;
+    memset(s_cached_rows, 0, sizeof(s_cached_rows));
+    s_cached_chapters = 0;
+    s_cached_page = -1;
+}
 
 static size_t volume_body_begin(const book_volume_t *v) {
     return v->begin+(!v->include_title && v->title==v->begin);
@@ -52,6 +67,20 @@ static int visible_target(size_t row,size_t chapters) {
         }
     }
     return -1;
+}
+void book_toc_prepare_page(size_t chapters, size_t current, int page) {
+    memset(s_cached_rows, 0, sizeof(s_cached_rows));
+    s_cached_chapters = chapters;
+    s_cached_page = page;
+    if (!s_cached_probe || page < 0) return;
+    // 只探测真实章节行；卷行无缓存语义，当前行不画标记也不探测。
+    // Probe real chapter rows only; volume rows have no cache meaning and the current row shows no marker.
+    for (int row = 0; row < BOOK_TOC_ROWS; ++row) {
+        int target = visible_target((size_t)page * BOOK_TOC_ROWS + row, chapters);
+        if (target == -1) break;
+        if (target <= TOC_VOLUME_HIT || (size_t)target == current) continue;
+        s_cached_rows[row] = s_cached_probe((size_t)target, s_cached_probe_user);
+    }
 }
 int book_toc_open(size_t current) {
     s_volume_picker=false;
@@ -301,6 +330,11 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
                        selected ? 0xc0 : UI_GRAY_WHITE);
             if (selected)
                 ui_text_box(fb,(EpdRect){r.x+r.width-93,r.y+11,71,72},24,"当前",EPD_DRAW_ALIGN_RIGHT,false);
+            if (!selected && s_cached_page == page && s_cached_chapters == chapters && s_cached_rows[row]) {
+                // 已缓存章节在右缘加浅色圆点；选中行位置留给“当前”，不叠加标记。
+                // Cached chapters get a light dot at the right edge; the selected row keeps 当前 without a marker.
+                epd_fill_circle(r.x + r.width - 24, r.y + r.height / 2, 6, 0x40, fb);
+            }
         }
     }
     const int pages = book_toc_pages(chapters);

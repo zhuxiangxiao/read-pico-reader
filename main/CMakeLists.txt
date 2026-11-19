@@ -420,8 +420,11 @@ endif()
 target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_UI_LOCALIZATION=1)
 
 # 解析、设置与页面调度按体积编译，为在线书源保留原分区；S31 保留热点绘制与微信读书/封面路径为性能优化(-O2)。
+# 首页概览、时钟控件与封面裁剪/缩放开销低、可重建，一并换出应用槽余量。
 # Size-optimize cold parsing/settings/setup within original slots; on S31 keep hot UI/cover/WeRead paths at -O2.
+# Home overview, clock widgets and cover crop/scale helpers are cheap and rebuildable, so trade their size for app-slot headroom.
 set(weread_cold_size_sources
+    app_dashboard.c ui_home_clock.c book_cover.c
     book_index_cache.c book_title.c book_toc.c book_weread_cover.c
     book_xteink_sync.c book_history_backup.c book_lock_collage.c book_lock_bookmark.c weread_auth.c
     settings.c app_device_settings.c app_files.c app_transfer.c app_image.c vcom_setup.c
@@ -439,7 +442,12 @@ foreach(weread_source IN LISTS kiiko_selected_sources)
     if(weread_source_name IN_LIST weread_size_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
         # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
-        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery)\\.c$")
+        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock)\\.c$")
+            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
+        endif()
+        # Pico 应用槽更紧：封面裁剪/缩放也走 Oz；S31 保留 Os 以免书架封面生成变慢。
+        # Pico app slots are tighter: cover crop/scale also uses Oz; S31 keeps Os so shelf cover generation stays fast.
+        if(NOT KIIKO_BOARD_METALIO47 AND weread_source_name STREQUAL "book_cover.c")
             set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
         endif()
     endif()
