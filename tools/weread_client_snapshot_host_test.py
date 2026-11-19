@@ -18,7 +18,7 @@ subprocess.run([
     *[f"main/weread/weread_{name}.c" for name in ("auth", "store", "client")],
     "tools/weread_stubs/cJSON.c", "-lm", "-o", str(binary),
 ], cwd=root, check=True)
-for mode in range(9):
+for mode in range(10):
     with tempfile.TemporaryDirectory(prefix="weread-client-snapshot-") as cache:
         subprocess.run([str(binary), cache, str(mode)], check=True, timeout=8,
                        env=dict(os.environ, ASAN_OPTIONS="abort_on_error=1:halt_on_error=1",

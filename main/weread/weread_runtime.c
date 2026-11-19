@@ -4,7 +4,7 @@
  * 中文：网络启停始终由同一工作任务执行；取消只shutdown自有socket，等待后才释放媒体。
  * English: One worker owns network start/stop; cancel shuts down only its socket and joins before media release.
  */
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_runtime.h"
@@ -133,6 +133,7 @@ static esp_err_t connect_network(void) {
                 esp_err_t err=read_pico_transfer_sync_time_online_cancelable(&utc,cancelled,NULL);
                 if(err!=ESP_OK)return err;
             }
+            weread_client_set_radio_awake(true);
             s_network_active=now_ms();return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_OK;
         }
         if(status.state==READ_PICO_TRANSFER_STOPPED){
@@ -156,6 +157,7 @@ static esp_err_t connect_network(void) {
 }
 static void stop_network(void) {
 #if defined(ESP_PLATFORM)
+    weread_client_set_radio_awake(false);
     if (s_owns_network) read_pico_transfer_stop();
 #endif
     s_owns_network = false;s_network_active=0;
@@ -578,6 +580,9 @@ static esp_err_t scan_book_cache(const char *id) {
         WR_GUARD;
         if (!strcmp(s_book_cache.id, id)) s_book_cache.scanned = true;
     }
+    ESP_LOGI("weread", "cache scan id=%s entries=%u verified=%u cached=%u/%u",
+        id, (unsigned)seen, (unsigned)verified,
+        (unsigned)atomic_load(&s_cached_count), (unsigned)atomic_load(&s_total_count));
     return ESP_OK;
 }
 static esp_err_t prefetch_job(void) {
@@ -865,9 +870,14 @@ static void consume_reader_result(void) {
         } else if (s_result.error == WEREAD_ERR_STORAGE) {
             s_reader.storage_blocked = true;
             s_reader.prefetch_retry = s_reader.last_tick + 15000;
+            ESP_LOGW("weread", "prefetch paused: storage low cached=%u/%u",
+                (unsigned)atomic_load(&s_cached_count), (unsigned)atomic_load(&s_total_count));
         } else if (s_result.error != ESP_ERR_INVALID_STATE) {
             ++s_reader.prefetch_failures;
             s_reader.prefetch_retry = s_reader.last_tick + 15000;
+            ESP_LOGW("weread", "prefetch error=%d uid=%u idx=%u failures=%u",
+                (int)s_result.error, (unsigned)s_result.chapter_uid,
+                (unsigned)s_result.chapter_idx, (unsigned)s_reader.prefetch_failures);
         }
     }
 }
@@ -1323,6 +1333,8 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry){
         (void)weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"1");return;
     }
+    if(bits_ready&&!book_cache_scanned(s_reader.id)&&s_reader.cloud_sync_pending&&
+        weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"scan"))return;
     if(s_reader.cloud_sync_pending){
         if(weread_runtime_start(WR_JOB_CLOUD_SYNC,s_reader.id,NULL)){s_reader.cloud_sync_pending=false;return;}
     }

@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nvs.h"
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 

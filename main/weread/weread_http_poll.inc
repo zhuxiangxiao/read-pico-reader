@@ -149,6 +149,10 @@ static const char *http_poll_host(http_poll_t *p) { return p?p->authority:NULL; 
 static esp_err_t http_poll_error(http_poll_t *p,esp_err_t fallback) { return p&&p->error?p->error:fallback; }
 static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_poll_t *p) {
     if(!p)return esp_http_client_open(client,length);
+#if defined(ESP_PLATFORM)
+    uint64_t connect_started=client_now_ms();
+    unsigned connect_retries=0;
+#endif
     for(;;){
         esp_err_t err=http_poll_guard(p);if(err!=ESP_OK)return err;
         unsigned connections=p->connections;
@@ -161,7 +165,19 @@ static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_
             // open rebuilds request headers on reentry; restart an incomplete header on a fresh connection before any body is sent.
             if(p->header_restarts++>=3)return ESP_FAIL;
             esp_http_client_close(client);p->connected=false;
+#if defined(ESP_PLATFORM)
+            connect_started=client_now_ms();
+#endif
         }
+#if defined(ESP_PLATFORM)
+        else if(!p->connected&&!p->hard_deadline&&p->idle_ms==15000&&connect_retries<2&&
+                client_now_ms()-connect_started>=3500){
+            ESP_LOGW("weread","http connect stalled 3.5s (#%u), retrying peer=%s",connect_retries+1,p->peer);
+            esp_http_client_close(client);p->connected=false;
+            connect_started=client_now_ms();++connect_retries;
+            p->deadline=connect_started+(connect_retries==1?11500:8000);
+        }
+#endif
         http_poll_pause();
     }
 }

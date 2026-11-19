@@ -35,7 +35,6 @@ static bool app_settings_reader_immersive(void){return immersive;}
 static bool s_reader_fullscreen=false,s_toolbar,s_clear_confirm,s_reader_footer_pending,s_save_failed;
 static const char *s_text="body";
 static size_t s_chapter=36,total_pages=100;
-static size_t book_layout_page_count(void){return total_pages;}
 static const char *wr_reader_status(void){return "";}
 static void wr_reader_offline_caption(char *out,size_t cap){assert(out&&cap);out[0]=0;}
 static int64_t s_reader_footer_due_ms;
@@ -110,7 +109,7 @@ int main(void){
  s_reader_fullscreen=false;uint8_t none=0;
  for(int style=0;style<2;++style){
   immersive=style;s_reader_favorite=style;text_calls=bar_calls=fill_calls=status_calls=0;title_calls=back_calls=favorite_calls=0;
-  draw_reader_header(&none);draw_reader_metadata(&none,36);
+  draw_reader_header(&none);draw_reader_metadata(&none,74);
   assert(status_calls==1&&text_calls==2&&bar_calls==2&&fill_calls==3&&reader_status_visible());
   assert(title_calls==1&&back_calls==1&&favorite_calls==1&&ui_reader_body(false,style,24,false).y==(style?16:84));
   app_ctx_t ctx={.now_ms=1000};s_reader_footer_pending=true;s_reader_footer_due_ms=900;
@@ -119,7 +118,7 @@ int main(void){
  for(int full=0;full<2;++full){
  s_reader_fullscreen=true;immersive=full;s_reader_footer_pending=false;s_view=READING;calls=guards=text_calls=bar_calls=fill_calls=0;
  assert(reader_status_visible()==!full);status_calls=0;title_calls=back_calls=favorite_calls=0;
- uint8_t fb=0;draw_reader_metadata(&fb,36);assert(text_calls==(full?0:2)&&bar_calls==2&&fill_calls==(full?1:2)&&status_calls==(full?0:1));
+ uint8_t fb=0;draw_reader_metadata(&fb,74);assert(text_calls==(full?0:2)&&bar_calls==2&&fill_calls==(full?1:2)&&status_calls==(full?0:1));
  assert(ui_reader_body(true,false,24,false).y==84&&ui_reader_header().height==80&&!title_calls&&!back_calls&&!favorite_calls);
  touch_t touch={0};app_ctx_t ctx={.now_ms=100,.touch=&touch};
  assert(reader_metadata_tick(&ctx)==APP_REDRAW_NONE&&!calls);
@@ -154,7 +153,7 @@ int main(void){
  puts("PASS: OFF status/chapter/page-count/percentage with fixed1194/downward6px bar; ON release1207/3px line without text/header or minute overwrite; idle deadline, touch/navigation/panel guards, one FOLLOW DU footer crop, retry and exit cancellation");
 }
 '''
-if pico_footer:
+if separate_footer:
     unit=unit.replace('s_reader_footer_due_ms==1700','s_reader_footer_due_ms==1050').replace('ctx.now_ms=1700','ctx.now_ms=1050')
     unit=unit.replace('char text[48];', 'char text[48];reader_footer_progress(text,sizeof(text),74);assert(!strcmp(text,\"48/48  74%\"));')
 with tempfile.TemporaryDirectory(prefix='reader-metadata-') as temporary:

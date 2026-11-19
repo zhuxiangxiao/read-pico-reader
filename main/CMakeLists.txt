@@ -419,14 +419,21 @@ endif()
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_UI_LOCALIZATION=1)
 
-# 解析、设置与页面调度按体积编译，为在线书源保留原分区；覆盖层也使用真正参与构建的路径。
-# Size-optimize parsing/settings/page dispatch within original slots, including the actual selected overlay paths.
-set(weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_reader.c
-    book_index_cache.c settings.c app_device_settings.c app_files.c app_transfer.c
-    app_cloud_sync.c ui_keyboard.c book_title.c app_book.c ota_online.c ota_release.c app_onboarding.c
+# 解析、设置与页面调度按体积编译，为在线书源保留原分区；S31 保留热点绘制与微信读书/封面路径为性能优化(-O2)。
+# Size-optimize cold parsing/settings/setup within original slots; on S31 keep hot UI/cover/WeRead paths at -O2.
+set(weread_cold_size_sources
+    book_index_cache.c book_title.c book_toc.c book_weread_cover.c
+    book_xteink_sync.c book_history_backup.c weread_auth.c
+    settings.c app_device_settings.c app_files.c app_transfer.c
+    app_cloud_sync.c ui_keyboard.c ota_online.c ota_release.c app_onboarding.c
     boot_state.c app_registry.c app_boot_recovery.c ota_update.c
-    app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c book_weread_cover.c
-    ui_ime.c book_toc.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c)
+    app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c
+    ui_ime.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c)
+set(weread_size_sources ${weread_cold_size_sources})
+if(NOT KIIKO_BOARD_METALIO47)
+    list(APPEND weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_reader.c
+        app_book.c)
+endif()
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)

@@ -131,6 +131,26 @@ int main(void) {
     }
     native_response="{\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":2,\"chapterIdx\":45,\"progress\":86},{\"bookId\":\"test_book_101\",\"chapterUid\":1,\"chapterIdx\":1,\"progress\":0}]}";
     assert(weread_progress_sync("test_book_101",&local,&cloud,&conflict)==ESP_ERR_INVALID_RESPONSE);
+    {
+        weread_progress_t unread_cloud; uint32_t fresh_ver = 0, last_ch = 0;
+        const char *unread_syncbooks[] = {
+            "{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":100}],\"bookProgress\":[]}",
+            "{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":100}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":0}]}"
+        };
+        for (size_t i = 0; i < sizeof(unread_syncbooks) / sizeof(*unread_syncbooks); ++i) {
+            native_response = unread_syncbooks[i]; before = requests; fresh_ver = 0; last_ch = 0;
+            assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_OK);
+            assert(requests == before + 1 && !unread_cloud.chapter_uid && fresh_ver == 100);
+        }
+        native_response = "{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":100}]}";
+        progress_response = "{\"bookId\":\"test_book_101\",\"book\":{}}";
+        before = requests;
+        assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_OK);
+        assert(requests == before + 2 && !unread_cloud.chapter_uid && fresh_ver == 100);
+        progress_response = "{}";
+        assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_ERR_INVALID_RESPONSE);
+        progress_response = NULL;
+    }
     native_response=NULL;
     assert(weread_progress_note("test_book_101",1,1,60,25,1,1,"legacy",900)==ESP_OK);
     char path[512];cJSON *legacy=NULL;assert(wr_cache_path("test_book_101","progress.json",path,sizeof(path))==ESP_OK&&wr_read_json(path,&legacy)==ESP_OK);

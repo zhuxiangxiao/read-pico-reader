@@ -126,6 +126,7 @@ static void read_pico_transfer_service_poll(void){}
 static esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc,bool(*check)(void*),void *ctx){++syncs;assert(ctx==NULL);for(int i=0;i<30;++i){mono+=100000;if(sync_cancel&&i==1)atomic_store(&s_cancel,true);if(check(ctx))return ESP_ERR_INVALID_STATE;}if(sync_error)return sync_error;*utc=wall=1800000000;return ESP_OK;}
 static time_t test_time(time_t *out){if(out)*out=wall;return wall;}
 #define time test_time
+#define weread_client_set_radio_awake(awake) ((void)(awake))
 ''' + function(RUNTIME, 'connect_network') + r'''
 static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
 int main(void){

@@ -17,7 +17,7 @@
 #include <stdio.h>
 // 网络/页面控制按体积编译，保留Pico原4MiB应用槽；协议、校验与任务时序不变。
 // Size-optimize IO/page control to retain Pico's4MiB slots without changing protocol,verification or task timing.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include <string.h>

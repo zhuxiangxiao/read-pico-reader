@@ -33,7 +33,7 @@ static struct stat s_io_stat;
 
 // 后台缓存以TF等待为主，按体积优化以保留Pico原4MiB应用分区。
 // Background cache work is IO-bound; size optimization preserves Pico's original 4MiB app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC push_options
 #pragma GCC optimize ("Os")
 #endif
@@ -60,7 +60,7 @@ static void chapter_summary_opened(const char *path) {
     if(count&&count<=UINT16_MAX&&!stat(path,&st)&&S_ISREG(st.st_mode)&&st.st_size>=0&&(uint64_t)st.st_size<=UINT32_MAX)
         chapter_summary_save(path,(uint32_t)st.st_size,(int64_t)st.st_mtime,(uint16_t)count);
 }
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC pop_options
 #endif
 

@@ -62,6 +62,7 @@ typedef esp_err_t (*weread_download_transport_fn)(const char *url, const char *h
     FILE *file, size_t limit, weread_cancel_fn cancel, void *cancel_ctx,
     weread_download_info_t *info, void *ctx);
 void weread_client_set_download_transport(weread_download_transport_fn fn, void *ctx);
+void weread_client_set_radio_awake(bool awake);
 /// 下载到调用方的空暂存文件；返回前不关闭文件。/ Download into caller-owned empty staging; leave it open on return.
 esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
     weread_cancel_fn cancel, void *ctx, weread_download_info_t *info);
@@ -145,6 +146,9 @@ typedef struct {
 bool weread_client_identity_get(weread_client_identity_t *out);
 esp_err_t weread_client_request_bound(const char *url,const char *method,const char *custom_headers,
     const char *body,char **out_resp,size_t *out_len,int *out_status,const weread_client_identity_t *expected);
+/// 允许在短令牌超时(-2012)时原位续期并同步更新绑定身份中的凭据。/ Allow in-place -2012 short-token renewal and refresh the bound identity credentials.
+esp_err_t weread_client_request_bound_renew(const char *url,const char *method,const char *custom_headers,
+    const char *body,char **out_resp,size_t *out_len,int *out_status,weread_client_identity_t *expected);
 
 #ifdef __cplusplus
 }

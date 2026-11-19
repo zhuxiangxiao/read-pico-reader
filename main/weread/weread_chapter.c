@@ -4,7 +4,7 @@
  * 中文：下载归档先写 TF，4 KiB 流式解包到独立目录，按 info.txt 顺序组装。
  * English: Spool archives to TF, extract in 4 KiB chunks to a private directory and follow info.txt order.
  */
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_chapter.h"
@@ -149,7 +149,7 @@ esp_err_t weread_chapter_read_validated(const char *path,char **out,size_t *len)
     if(!path||!out||!len)return ESP_ERR_INVALID_ARG;
     return read_file(path,out,len);
 }
-typedef struct { char root[512], name[512],parent[1024]; FILE *file; esp_err_t error; } extract_t;
+typedef struct { char root[512], name[512],parent[1024]; FILE *file; esp_err_t error; char vbuf[4096]; } extract_t;
 static bool extract(void *ctx, const char *name, const uint8_t *bytes, size_t n, size_t offset, size_t total) {
     extract_t *x = ctx;
     if (cancelled()) return false;
@@ -167,6 +167,7 @@ static bool extract(void *ctx, const char *name, const uint8_t *bytes, size_t n,
         struct stat st;
         if (!stat(path, &st)) { x->error = ESP_ERR_INVALID_RESPONSE; return false; }
         x->file = fopen(path, "wb"); if (!x->file) { x->error = ESP_FAIL; return false; }
+        (void)setvbuf(x->file, x->vbuf, _IOFBF, sizeof(x->vbuf));
         wr_copy(x->name, sizeof(x->name), name);
     }
     if (!x->file || strcmp(name, x->name) || fwrite(bytes, 1, n, x->file) != n) { x->error = ESP_FAIL; return false; }
@@ -343,23 +344,58 @@ static esp_err_t background_image(const char *data,size_t len,const char *source
     }
     return ESP_OK;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((noinline))
+#endif
 static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32_t version, const char *format) {
     char path[1024]; if (join(root, "info.txt", path, sizeof(path)) != ESP_OK) return ESP_ERR_INVALID_SIZE;
     cJSON *info = NULL; esp_err_t err = wr_read_json(path, &info);
+    if (err != ESP_OK) ESP_LOGW("weread", "assemble info read err=%d", (int)err);
     const char *info_id = wr_string(info, "bookId");
-    if (err == ESP_OK && (!info_id || strcmp(info_id, id))) err = ESP_ERR_INVALID_RESPONSE;
+    if (err == ESP_OK && (!info_id || strcmp(info_id, id))) {
+        ESP_LOGW("weread", "assemble bookId mismatch info=%s want=%s", info_id ? info_id : "(null)", id);
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
     if (err == ESP_OK && cJSON_HasObjectItem(info,"bookVersion") && number(info, "bookVersion") != version) err = WEREAD_ERR_VERSION;
-    cJSON *files = cJSON_GetObjectItemCaseSensitive(info, "files"), *entry;
+    cJSON *top_files = cJSON_GetObjectItemCaseSensitive(info, "files");
+    cJSON *files = top_files, *entry, *matched = NULL;
     cJSON *chapters = cJSON_GetObjectItemCaseSensitive(info, "chapters");
-    if (cJSON_IsArray(chapters)) files = NULL;
-    cJSON_ArrayForEach(entry, chapters)
-        if (number(entry, "chapterUid") == uid) { files = cJSON_GetObjectItemCaseSensitive(entry, "files"); break; }
-    if (err == ESP_OK && (!cJSON_IsArray(files) || cJSON_GetArraySize(files) < 1 || cJSON_GetArraySize(files) > 128)) err = ESP_ERR_INVALID_RESPONSE;
+    if (cJSON_IsArray(chapters)) {
+        files = NULL;
+        cJSON_ArrayForEach(entry, chapters)
+            if (number(entry, "chapterUid") == uid) { matched = entry; files = cJSON_GetObjectItemCaseSensitive(entry, "files"); break; }
+        if (!files && cJSON_IsArray(top_files)) files = top_files;
+    }
+    if (err == ESP_OK && !files && matched && !strcmp(format, "txt")) {
+        // 真实微信读书 TXT 章节包 info.txt 常省略 files，正文文件名固定为 <bookId>_<chapterUid>_o。
+        // Real WeRead TXT archives often omit "files" in info.txt; the extracted file is <bookId>_<chapterUid>_o.
+        char txt_leaf[96];
+        snprintf(txt_leaf, sizeof(txt_leaf), "%s_%u_o", id, (unsigned)uid);
+        cJSON *synth = cJSON_CreateArray();
+        cJSON *item = synth ? cJSON_CreateString(txt_leaf) : NULL;
+        if (!synth || !item || !cJSON_AddItemToArray(synth, item)) {
+            cJSON_Delete(item);
+            cJSON_Delete(synth);
+            err = ESP_ERR_NO_MEM;
+        } else {
+            cJSON_AddItemToObject(matched, "files", synth);
+            files = synth;
+        }
+    }
+    if (err == ESP_OK && (!cJSON_IsArray(files) || cJSON_GetArraySize(files) < 1 || cJSON_GetArraySize(files) > 128)) {
+        ESP_LOGW("weread", "assemble files invalid uid=%u fmt=%s files=%d",
+            (unsigned)uid, format, cJSON_IsArray(files) ? cJSON_GetArraySize(files) : -1);
+        err = ESP_ERR_INVALID_RESPONSE;
+    }
     FILE *f = NULL;
     position_writer_t map = {0};
+    char *io_vbuf = NULL;
     if (err == ESP_OK) {
+        io_vbuf = wr_alloc(8192);
         join(root, "body.html", path, sizeof(path)); f = fopen(path, "wb"); if (!f) err = ESP_FAIL;
+        else if (io_vbuf) (void)setvbuf(f, io_vbuf, _IOFBF, 4096);
         join(root, "position.map", path, sizeof(path)); map.file = fopen(path, "wb");
+        if (map.file && io_vbuf) (void)setvbuf(map.file, io_vbuf + 4096, _IOFBF, 4096);
         weread_position_header_t header = {0};
         if (!map.file || fwrite(&header, sizeof(header), 1, map.file) != 1) err = ESP_FAIL;
     }
@@ -368,7 +404,10 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
         if (!cJSON_IsString(entry) || cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
         char normalized[512];
         if (!weread_resource_path(NULL, entry->valuestring, normalized, sizeof(normalized)) ||
-            join(root, normalized, path, sizeof(path)) != ESP_OK || !strcmp(normalized, "body.html")) { err = ESP_ERR_INVALID_RESPONSE; break; }
+            join(root, normalized, path, sizeof(path)) != ESP_OK || !strcmp(normalized, "body.html")) {
+            ESP_LOGW("weread", "assemble bad path=%s", entry->valuestring);
+            err = ESP_ERR_INVALID_RESPONSE; break;
+        }
         char *data = NULL; size_t len = 0;
         err = read_file(path, &data, &len); if (err != ESP_OK) break;
         if (!strcmp(format, "txt")) {
@@ -400,6 +439,7 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
             fwrite(&header, sizeof(header), 1, map.file) != 1 || fflush(map.file))) err = ESP_FAIL;
         if (fclose(map.file)) err = ESP_FAIL;
     }
+    free(io_vbuf);
     cJSON_Delete(info); return err;
 }
 esp_err_t weread_chapter_download(const char *id, uint32_t uid) { return weread_chapter_download_ex(id, uid, false); }
@@ -410,6 +450,7 @@ typedef struct {
     weread_download_info_t response;
     extract_t x;
     uint8_t password[256];
+    char archive_vbuf[8192];
 } chapter_download_work_t;
 static void release_chapter_work(chapter_download_work_t **p) {
     if(*p)weread_secure_zero(*p,sizeof(**p));
@@ -481,6 +522,7 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         join(w->root, "archive.part", w->path, sizeof(w->path));
         FILE *archive = fopen(w->path, "w+b");
         if (!archive) { remove_tree(w->root, 0); return ESP_FAIL; }
+        (void)setvbuf(archive, w->archive_vbuf, _IOFBF, sizeof(w->archive_vbuf));
         snprintf(w->url, sizeof(w->url), "%s/book/chapterdownload?bookId=%s&chapters=%s%u&pf=wechat_wx-2001-android-100-weread&pfkey=pfKey&zoneId=1&bookVersion=%u&bookType=%s&release=1&stopAutoPayWhenBNE=1&preload=%u&preview=0&offline=0",
             weread_client_get_base_url(), id, common ? "0," : "", (unsigned)uid, (unsigned)v, w->b.format, preload ? 1u : 0u);
 #if defined(ESP_PLATFORM)
@@ -494,6 +536,7 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         if (err == ESP_OK && w->response.bytes < 4096) {
             rewind(archive); size_t n = fread(w->json, 1, sizeof(w->json) - 1, archive); w->json[n] = 0;
             cJSON *r = wr_parse_json(w->json,strlen(w->json)+1), *c = cJSON_GetObjectItem(r, "errcode");
+            if (!c) c = cJSON_GetObjectItem(r, "errCode");
             if (!c) c = cJSON_GetObjectItem(r, "ret");
             if (cJSON_IsNumber(c)) code = c->valueint;
             cJSON_Delete(r);

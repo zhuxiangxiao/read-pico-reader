@@ -27,15 +27,42 @@ static uint64_t milliseconds(void) {
 static esp_err_t transport(const char *url, const char *method, const char *headers,
     const char *body, char **out, size_t *bytes, int *http_status, void *ctx) {
     (void)body; (void)ctx;
+    ++requests;
+    if (response_status == 2012) {
+        if (strstr(url, "/weblogin")) {
+            *http_status = 200;
+            *out = strdup("{\"accessToken\":\"fixture-renewed-token\",\"refreshToken\":\"fixture-renewed-refresh\"}");
+            assert(*out); *bytes = strlen(*out); return ESP_OK;
+        }
+        assert(strstr(url, "/book/read") && !strcmp(method, "POST"));
+        if (strstr(headers, "fixture-old-token")) {
+            *http_status = 401;
+            *out = strdup("{\"errCode\":-2012,\"errMsg\":\"timeout\"}");
+            assert(*out); *bytes = strlen(*out); return ESP_OK;
+        }
+        assert(strstr(headers, "fixture-renewed-token"));
+        *http_status = 200;
+        *out = strdup("{\"succ\":1}");
+        assert(*out); *bytes = strlen(*out); return ESP_OK;
+    }
     assert(strstr(url, "/book/read") && !strcmp(method, "POST"));
     assert(strstr(headers, "fixture-old-token"));
-    ++requests;
     assert(!pthread_mutex_lock(&gate)); entered = true; assert(!pthread_cond_broadcast(&changed));
     while (!released) assert(!pthread_cond_wait(&changed, &gate));
     assert(!pthread_mutex_unlock(&gate));
     *http_status = response_status;
     *out = strdup(response_status == 401 ? "{\"errcode\":-2013}" : "{\"succ\":1}");
     assert(*out); *bytes = strlen(*out); return ESP_OK;
+}
+static esp_err_t dl_401_timeout(const char *url, const char *headers, FILE *file, size_t limit,
+    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info, void *user) {
+    (void)url; (void)limit; (void)cancel; (void)ctx; (void)user;
+    ++requests;
+    const char *body = strstr(headers, "fixture-renewed-token") ? "CHAPTER_BYTES_OK" : "{\"errCode\":-2012}";
+    info->status = strstr(headers, "fixture-renewed-token") ? 200 : 401;
+    info->bytes = strlen(body);
+    assert(fwrite(body, 1, info->bytes, file) == info->bytes);
+    return ESP_OK;
 }
 static void *dispatch(void *ctx) {
     (void)ctx;
@@ -57,6 +84,28 @@ int main(int argc, char **argv) {
     weread_auth_session_t original = session(), current;
     assert(weread_auth_save_session(&original) == ESP_OK && weread_auth_load_session(&current) == ESP_OK);
     weread_client_set_transport(transport, NULL); weread_client_set_cancel(cancel_query, NULL);
+    if (mode == 9) {
+        response_status = 2012;
+        weread_client_identity_t bound; assert(weread_client_identity_get(&bound));
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_OK && status == 200 && requests == 3 && !strcmp(bound.token, "fixture-renewed-token"));
+        free(response); response = NULL;
+        weread_auth_session_t reset_tok = session();
+        assert(weread_auth_save_session(&reset_tok) == ESP_OK && weread_auth_load_session(&reset_tok) == ESP_OK);
+        requests = 0;
+        weread_client_set_background(true);
+        weread_client_set_download_transport(dl_401_timeout, NULL);
+        FILE *tmp = tmpfile(); assert(tmp);
+        weread_download_info_t dinfo = {0};
+        result = weread_client_download("https://i.weread.qq.com/book/chapterdownload?preload=1",
+            tmp, 4096, NULL, NULL, &dinfo);
+        weread_client_set_background(false);
+        assert(result == ESP_OK && dinfo.status == 200 && requests == 3);
+        fclose(tmp);
+        puts("mode9: unified background -2012 HTTP 401 renewal passed for bound and download paths");
+        return 0;
+    }
     if(mode>=6){
         weread_client_identity_t expected;assert(weread_client_identity_get(&expected));
         if(mode==8)assert(weread_auth_init(other)==ESP_OK);

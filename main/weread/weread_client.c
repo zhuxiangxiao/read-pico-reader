@@ -3,7 +3,7 @@
  * WeRead secure HTTPS client with sensitive header stripping and renewal replay.
  */
 // 网络和缓存按体积优化，保留双板原应用分区。/ Optimize network/cache code for size within the original app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_client.h"
@@ -20,6 +20,31 @@
 #include <time.h>
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
+#include "esp_wifi.h"
+typedef struct { wifi_ps_type_t previous; bool restore; } radio_ps_guard_t;
+static radio_ps_guard_t radio_ps_enter(void) {
+    radio_ps_guard_t g = { .previous = WIFI_PS_MIN_MODEM, .restore = false };
+    g.restore = esp_wifi_get_ps(&g.previous) == ESP_OK &&
+        g.previous != WIFI_PS_NONE && esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK;
+    return g;
+}
+static void radio_ps_leave(radio_ps_guard_t *g) {
+    if (g && g->restore) { (void)esp_wifi_set_ps(g->previous); g->restore = false; }
+}
+static bool s_global_ps_restore;
+static wifi_ps_type_t s_global_ps_prev = WIFI_PS_MIN_MODEM;
+void weread_client_set_radio_awake(bool awake) {
+    if (awake) {
+        if (!s_global_ps_restore && esp_wifi_get_ps(&s_global_ps_prev) == ESP_OK &&
+            s_global_ps_prev != WIFI_PS_NONE && esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK)
+            s_global_ps_restore = true;
+    } else if (s_global_ps_restore) {
+        (void)esp_wifi_set_ps(s_global_ps_prev);
+        s_global_ps_restore = false;
+    }
+}
+#else
+void weread_client_set_radio_awake(bool awake) { (void)awake; }
 #endif
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
@@ -472,6 +497,7 @@ static esp_err_t weread_client_dispatch_raw(
         .timeout_ms = request_timeout_ms(url),
         .crt_bundle_attach = esp_crt_bundle_attach,
         .disable_auto_redirect = true,
+        .buffer_size_tx = 2048,
         .event_handler = login_header, .user_data = &login,
     };
     http_poll_config(poll,&config);
@@ -528,6 +554,10 @@ static esp_err_t weread_client_dispatch_raw(
     // 按流读取含 chunked 的响应；禁止跨域自动重定向凭据。/ Read streamed/chunked bodies; never redirect credentials automatically.
     // 轮询传输仅由worker关闭，避免SDK内部重连与跨线程shutdown的fd复用竞态。
     // The polling worker owns close/reconnect; cancellation polls avoid cross-thread fd reuse races.
+#if defined(ESP_PLATFORM)
+    radio_ps_guard_t ps_guard __attribute__((cleanup(radio_ps_leave))) = radio_ps_enter();
+    (void)ps_guard;
+#endif
     http_active(poll?NULL:client);
     size_t body_len = body ? strlen(body) : 0;
     esp_err_t err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : http_poll_open(client, (int)body_len,poll);
@@ -651,6 +681,27 @@ static bool request_headers(const char *url, const char *custom_headers, char fi
 
 }
 
+static int extract_error_code(const char *resp, size_t resp_len) {
+    if (!resp || !resp_len) return 0;
+    cJSON *chk = wr_parse_json(resp, resp_len + 1);
+    int out = 0;
+    if (chk) {
+        cJSON *code = cJSON_GetObjectItem(chk, "errcode");
+        if (!code) code = cJSON_GetObjectItem(chk, "errCode");
+        if (!code) code = cJSON_GetObjectItem(chk, "ret");
+        if (cJSON_IsNumber(code)) out = (int)code->valuedouble;
+        cJSON_Delete(chk);
+    }
+    return out;
+}
+
+static int classify_session_code(const char *resp, size_t resp_len) {
+    if (!resp || !resp_len) return 0;
+    if (strstr(resp, "-2013") == NULL && strstr(resp, "-2012") == NULL) return 0;
+    int c = extract_error_code(resp, resp_len);
+    return (c == WEREAD_AUTH_ERRCODE_EXPIRED || c == WEREAD_AUTH_ERRCODE_TIMEOUT) ? c : 0;
+}
+
 static esp_err_t weread_client_request_internal(
     const char *url,
     const char *method,
@@ -681,31 +732,12 @@ static esp_err_t weread_client_request_internal(
     }
 
     // 区分超时与会话撤销，超时保留本地凭据以供 Web 进度回退。/ Distinguish timeout from revocation; preserve credentials for web-progress fallback.
-    int session_code = 0;
-    bool is_expired = (status == 401);
-    // HTTP状态与业务码分别判断；401也可能明确撤销会话。/ Classify revocation even in HTTP401 bodies.
-    if (resp && resp_len > 0) {
-        if (strstr(resp, "-2013") != NULL || strstr(resp, "-2012") != NULL) {
-            cJSON *chk = wr_parse_json(resp,resp_len + 1);
-            if (chk) {
-                cJSON *code = cJSON_GetObjectItem(chk, "errcode");
-                if (!code) code = cJSON_GetObjectItem(chk, "errCode");
-                if (!code) code = cJSON_GetObjectItem(chk, "ret");
-                if (code && cJSON_IsNumber(code)) {
-                    int c = (int)code->valuedouble;
-                    if (c == WEREAD_AUTH_ERRCODE_EXPIRED || c == WEREAD_AUTH_ERRCODE_TIMEOUT) {
-                        session_code = c;
-                        is_expired = true;
-                    }
-                }
-                cJSON_Delete(chk);
-            }
-        }
-    }
+    int session_code = classify_session_code(resp, resp_len);
+    bool is_expired = (status == 401) || (session_code == WEREAD_AUTH_ERRCODE_EXPIRED || session_code == WEREAD_AUTH_ERRCODE_TIMEOUT);
 
     bool is_weblogin = (strstr(url, "/weblogin") != NULL);
 
-    bool allow_bg_timeout = s_background && status != 401 && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT;
+    bool allow_bg_timeout = s_background && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT;
     bool authed = false;
     if ((!s_background || allow_bg_timeout) && !weread_client_cancelled() && err == ESP_OK && is_expired && !is_weblogin && weread_client_is_trusted_url(url)) {
         WR_GUARD;
@@ -788,28 +820,56 @@ static void release_snapshot(request_snapshot_t **p) {
     if (*p) { weread_secure_zero(*p, sizeof(**p)); free(*p); *p = NULL; }
 }
 static esp_err_t request_captured(const char *url, const char *method,
-    const char *custom_headers, const char *body, char **out_resp, size_t *out_len, int *out_status,const weread_client_identity_t *expected) {
+    const char *custom_headers, const char *body, char **out_resp, size_t *out_len, int *out_status,
+    weread_client_identity_t *expected, bool allow_timeout_renew) {
     if (out_resp) *out_resp = NULL;
     if (out_len) *out_len = 0;
     if (out_status) *out_status = 0;
     if (!url || !method || !weread_client_is_trusted_url(url)) return ESP_ERR_INVALID_ARG;
     request_snapshot_t *snapshot __attribute__((cleanup(release_snapshot))) = wr_alloc(sizeof(*snapshot));
     if (!snapshot) return ESP_ERR_NO_MEM;
-    {
-        WR_GUARD;
-        if(weread_client_cancelled()||(expected&&!identity_matches(expected))||!weread_client_identity_get(&snapshot->identity))return ESP_ERR_INVALID_STATE;
-        if(!request_headers(url,custom_headers,snapshot->headers))return ESP_ERR_NO_MEM;
-    }
-    // 网络只使用拥有的凭据；本地读取和保存不等待后台HTTP。/ Transport owns its credentials so local reads/saves do not wait for background HTTP.
     char *response = NULL; size_t bytes = 0; int status = 0;
-    esp_err_t err = weread_client_dispatch_raw(url, method, snapshot->headers, body, &response, &bytes, &status,true);
+    esp_err_t err = ESP_OK;
+    bool is_weblogin = strstr(url, "/weblogin") != NULL;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        free(response); response = NULL; bytes = 0; status = 0;
+        {
+            WR_GUARD;
+            if (weread_client_cancelled() || (expected && !identity_matches(expected)) ||
+                !weread_client_identity_get(&snapshot->identity)) return ESP_ERR_INVALID_STATE;
+            if (!request_headers(url, custom_headers, snapshot->headers)) return ESP_ERR_NO_MEM;
+        }
+        // 网络只使用拥有的凭据；本地读取和保存不等待后台HTTP。/ Transport owns its credentials so local reads/saves do not wait for background HTTP.
+        err = weread_client_dispatch_raw(url, method, snapshot->headers, body, &response, &bytes, &status, true);
+        int session_code = err == ESP_OK ? classify_session_code(response, bytes) : 0;
+        if (!attempt && allow_timeout_renew && err == ESP_OK && !weread_client_cancelled() &&
+            !is_weblogin && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT) {
+            {
+                WR_GUARD;
+                if (!identity_matches(&snapshot->identity)) { free(response); return ESP_ERR_INVALID_STATE; }
+            }
+            esp_err_t renew_err = weread_auth_renew_session(NULL);
+            if (renew_err != ESP_OK) { free(response); return renew_err; }
+            {
+                WR_GUARD;
+                const weread_auth_session_t *live = weread_auth_get_current_session();
+                if (!live || strcmp(snapshot->identity.root, weread_auth_get_storage_root()) ||
+                    strcmp(snapshot->identity.vid, live->vid) || strcmp(snapshot->identity.device, live->device_id) ||
+                    !weread_client_identity_get(&snapshot->identity)) {
+                    free(response); return ESP_ERR_INVALID_STATE;
+                }
+                if (expected) *expected = snapshot->identity;
+            }
+            continue;
+        }
+        break;
+    }
     {
         WR_GUARD;
-        if(weread_client_cancelled()||!identity_matches(&snapshot->identity)) {
+        if (weread_client_cancelled() || !identity_matches(&snapshot->identity)) {
             free(response); return ESP_ERR_INVALID_STATE;
         }
     }
-    // 后台失效响应不续期、不清会话；调用方保留待同步记录。/ Background expiry never renews or clears login; the caller retains pending work.
     if (out_resp) *out_resp = response; else free(response);
     if (out_len) *out_len = bytes;
     if (out_status) *out_status = status;
@@ -817,12 +877,17 @@ static esp_err_t request_captured(const char *url, const char *method,
 }
 esp_err_t weread_client_request_snapshot(const char *url,const char *method,const char *headers,
     const char *body,char **out,size_t *bytes,int *status) {
-    return request_captured(url,method,headers,body,out,bytes,status,NULL);
+    return request_captured(url,method,headers,body,out,bytes,status,NULL,true);
 }
 esp_err_t weread_client_request_bound(const char *url,const char *method,const char *headers,
     const char *body,char **out,size_t *bytes,int *status,const weread_client_identity_t *expected) {
     if(!expected){if(out)*out=NULL;if(bytes)*bytes=0;if(status)*status=0;return ESP_ERR_INVALID_ARG;}
-    return request_captured(url,method,headers,body,out,bytes,status,expected);
+    return request_captured(url,method,headers,body,out,bytes,status,(weread_client_identity_t *)expected,false);
+}
+esp_err_t weread_client_request_bound_renew(const char *url,const char *method,const char *headers,
+    const char *body,char **out,size_t *bytes,int *status,weread_client_identity_t *expected) {
+    if(!expected){if(out)*out=NULL;if(bytes)*bytes=0;if(status)*status=0;return ESP_ERR_INVALID_ARG;}
+    return request_captured(url,method,headers,body,out,bytes,status,expected,true);
 }
 
 void weread_client_set_download_transport(weread_download_transport_fn fn, void *ctx) {
@@ -857,6 +922,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     download_event_t event = {.info = info, .redirect = redirect};
     esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
         .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
+        .buffer_size = 2048, .buffer_size_tx = 2048,
         .event_handler = download_event, .user_data = &event};
     http_poll_config(poll,&cfg);
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -877,6 +943,10 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         p = *end ? end + 1 : end;
     }
     if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
+#if defined(ESP_PLATFORM)
+    radio_ps_guard_t ps_guard __attribute__((cleanup(radio_ps_leave))) = radio_ps_enter();
+    (void)ps_guard;
+#endif
     http_active(poll?NULL:client);
     esp_err_t err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : http_poll_open(client,0,poll);
     if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
@@ -887,10 +957,12 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         http_cleanup(client);return ESP_OK;
     }
     if (esp_http_client_get_content_length(client) > (int64_t)limit) err = ESP_ERR_INVALID_SIZE;
-    char buffer[2048];
+    const size_t chunk_cap = 8192;
+    char *buffer __attribute__((cleanup(wr_release))) = err == ESP_OK ? wr_alloc(chunk_cap) : NULL;
+    if (err == ESP_OK && !buffer) err = ESP_ERR_NO_MEM;
     while (err == ESP_OK) {
         if (cancel && cancel(ctx)) { err = ESP_ERR_INVALID_STATE; break; }
-        int n = http_poll_read(client,buffer,sizeof(buffer),poll);
+        int n = http_poll_read(client, buffer, (int)chunk_cap, poll);
         if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         if (!n) {
             if (!esp_http_client_is_complete_data_received(client)) err = ESP_ERR_INVALID_RESPONSE;
@@ -900,6 +972,13 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { err = ESP_FAIL; break; }
         info->bytes += (size_t)n;
     }
+#if defined(ESP_PLATFORM)
+    if (err != ESP_OK) {
+        int tls=0,flags=0;(void)esp_http_client_get_and_clear_last_tls_error(client,&tls,&flags);
+        ESP_LOGW("weread", "HTTP download failed result=%d status=%d bytes=%u tls=%d flags=%x",
+            (int)err,info->status,(unsigned)info->bytes,tls,flags);
+    }
+#endif
     http_cleanup(client);
     return err;
 }
@@ -944,14 +1023,11 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             char *text __attribute__((cleanup(wr_release)))=wr_alloc(4097);
             if(!text)return ESP_ERR_NO_MEM;
             size_t n = fread(text, 1, 4096, file); text[n] = 0;
-            cJSON *r = wr_parse_json(text,strlen(text)+1), *v = cJSON_GetObjectItem(r, "errcode");
-            if (!v) v = cJSON_GetObjectItem(r, "ret");
-            if (cJSON_IsNumber(v)) code = v->valueint;
-            cJSON_Delete(r);
+            code = extract_error_code(text, n);
         }
         if (!weread_client_is_trusted_url(current) ||
             (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
-        if (s_background && (info->status == 401 || code != WEREAD_AUTH_ERRCODE_TIMEOUT)) return ESP_ERR_INVALID_RESPONSE;
+        if (s_background && code != WEREAD_AUTH_ERRCODE_TIMEOUT) return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
             if (attempt && code == -2013 && !s_background) { WR_GUARD; weread_auth_clear_session(); }
             return ESP_FAIL;

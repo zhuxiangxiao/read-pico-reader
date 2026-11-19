@@ -5,13 +5,16 @@
  * English: Bounded reads and atomic cache commits, retaining old files on failure.
  */
 // 网络和缓存按体积优化，保留双板原应用分区。/ Optimize network/cache code for size within the original app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_store.h"
 #include "weread_auth.h"
 #include "weread_client.h"
 #include "esp_log.h"
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+#include "read_pico_sd_access.h"
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -212,6 +215,11 @@ esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
     if (!path) return ESP_ERR_INVALID_ARG;
     size_t path_len = strlen(path);
     if (path_len >= 768 || path_len + sizeof(".previous") > 800) return ESP_ERR_INVALID_SIZE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(path);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
     size_t cap = path_len + sizeof(".previous");
     char *buf __attribute__((cleanup(wr_release))) = wr_alloc(cap * 2);
     if (!buf) return ESP_ERR_NO_MEM;
@@ -277,6 +285,7 @@ esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out) 
         *out = wr_parse_json(response, len + 1);
         if (!cJSON_IsObject(*out)) err = wr_memory_failed()?ESP_ERR_NO_MEM:ESP_ERR_INVALID_RESPONSE;
         const cJSON *code = cJSON_GetObjectItem(*out, "errcode");
+        if (!code) code = cJSON_GetObjectItem(*out, "errCode");
         if (!code) code = cJSON_GetObjectItem(*out, "ret");
         if (cJSON_IsNumber(code) && code->valuedouble != 0) err = ESP_ERR_INVALID_RESPONSE;
     }

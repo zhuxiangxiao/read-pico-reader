@@ -4,7 +4,7 @@
  * 中文：进度写卡先于联网；Web 回退必须收到 succ=1，空对象不算成功。
  * English: Persist before networking; web fallback requires succ=1 and never accepts an empty object.
  */
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_progress.h"
@@ -372,6 +372,7 @@ static esp_err_t rescue_restore(const char *id,weread_progress_t *out){
 }
 static int error_code(const cJSON *r) {
     const cJSON *v = cJSON_GetObjectItem(r, "errcode");
+    if (!v) v = cJSON_GetObjectItem(r, "errCode");
     if (!v) v = cJSON_GetObjectItem(r, "ret");
     return cJSON_IsNumber(v) ? v->valueint : 0;
 }
@@ -382,11 +383,11 @@ static const char *web_base(void) {
 #endif
     return "https://weread.qq.com";
 }
-static esp_err_t request_mode(const char *url, const char *body, cJSON **out, int *status,const progress_identity_t *identity) {
+static esp_err_t request_mode(const char *url, const char *body, cJSON **out, int *status, progress_identity_t *identity) {
     char *text = NULL; size_t len = 0; *out = NULL;
     if(identity){WR_GUARD;if(!identity_matches(identity)){*status=0;return ESP_ERR_INVALID_STATE;}}
     const char *headers=body?"Content-Type: application/json\r\n":NULL;
-    esp_err_t err=identity?weread_client_request_bound(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client):
+    esp_err_t err=identity?weread_client_request_bound_renew(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client):
         weread_client_request(url,body?"POST":"GET",headers,body,&text,&len,status);
     if(identity){WR_GUARD;if(!identity_matches(identity)){free(text);*status=0;return ESP_ERR_INVALID_STATE;}}
     if (text && len && len <= 65536) { WR_GUARD; *out = wr_parse_json(text,len+1); }
@@ -396,7 +397,7 @@ static esp_err_t request_mode(const char *url, const char *body, cJSON **out, in
     return err;
 }
 static bool fallback(const cJSON *r, int status) { return status == 401 || error_code(r) == -2012; }
-static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t *version,uint32_t *last,const progress_identity_t *identity){
+static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t *version,uint32_t *last, progress_identity_t *identity, bool allow_unread){
     memset(cloud,0,sizeof(*cloud));
     // 原生syncbook同时返回完整进度，避免不兼容getProgress引发续期/重放/Web链。
     // Native syncbook supplies complete positions without the unsupported getProgress renewal/replay/web chain.
@@ -407,6 +408,7 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
     esp_err_t err = request_mode(url,body,&r,&status,identity);
     if(err!=ESP_OK && (!status || err==ESP_ERR_NO_MEM)){cJSON_Delete(r);return err;}
     const cJSON *book = NULL;uint32_t fresh_version=0,last_index=0;
+    bool unread_syncbook = false;
     if(err==ESP_OK){
         const cJSON *detail=NULL,*entry;
         cJSON_ArrayForEach(entry,cJSON_GetObjectItemCaseSensitive(r,"books")){
@@ -420,12 +422,26 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
             const char *saved_id=wr_string(p,"bookId");
             if(saved_id&&!strcmp(saved_id,id)){if(book){cJSON_Delete(r);return ESP_ERR_INVALID_RESPONSE;}book=p;}
         }
-        const char *required[]={"chapterUid","chapterIdx","chapterOffset","progress"};
-        for(unsigned i=0;i<sizeof(required)/sizeof(*required)&&book;++i)
-            if(!cJSON_GetObjectItemCaseSensitive(book,required[i]))book=NULL;
-        if(book&&!decode(book,cloud,true))book=NULL;
+        if(book){
+            bool has_all=true;
+            const char *required[]={"chapterUid","chapterIdx","chapterOffset","progress"};
+            for(unsigned i=0;i<sizeof(required)/sizeof(*required);++i)
+                if(!cJSON_GetObjectItemCaseSensitive(book,required[i]))has_all=false;
+            // 原生syncbook对未读书籍可只给chapterUid=0或空进度数组，避免回退不兼容的getProgress/Web链。
+            // Native syncbook may report unread books with chapterUid=0 or an empty bookProgress entry; avoid falling back to getProgress/web.
+            if(has_all){
+                if(!decode(book,cloud,true)){memset(cloud,0,sizeof(*cloud));book=NULL;}
+            }else if(allow_unread&&detail&&cJSON_IsArray(positions)&&cJSON_HasObjectItem(book,"chapterUid")&&
+                     decode(book,cloud,true)&&!cloud->chapter_uid){
+                unread_syncbook=true;
+            }else{
+                memset(cloud,0,sizeof(*cloud));book=NULL;
+            }
+        }else if(allow_unread&&detail&&cJSON_IsArray(positions)){
+            unread_syncbook=true;
+        }
     }
-    if (!book) {
+    if (!book && !unread_syncbook) {
         cJSON_Delete(r); r = NULL;
         snprintf(url, sizeof(url), "%s/book/getProgress?bookId=%s", weread_client_get_base_url(), id);
         err = request_mode(url,NULL,&r,&status,identity);
@@ -434,12 +450,12 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
             snprintf(url, sizeof(url), "%s/web/book/getProgress?bookId=%s", web_base(), id);
             err = request_mode(url,NULL,&r,&status,identity);
         }
-        book = cJSON_GetObjectItemCaseSensitive(r, "book");
-        if (!book) book = r;
+        const cJSON *explicit_book = cJSON_GetObjectItemCaseSensitive(r, "book");
+        book = explicit_book ? explicit_book : r;
         const char *server_id=wr_string(r,"bookId"),*nested_id=wr_string(book,"bookId");
         bool wrong_id=(cJSON_HasObjectItem(r,"bookId")&&(!server_id||strcmp(server_id,id)))||
             (cJSON_HasObjectItem(book,"bookId")&&(!nested_id||strcmp(nested_id,id)));
-        if(identity){
+        if(!allow_unread || (identity && !cJSON_IsObject(explicit_book))){
             const char *required[]={"chapterUid","chapterIdx","chapterOffset","progress"};
             for(size_t i=0;i<sizeof(required)/sizeof(*required);++i)if(!cJSON_HasObjectItem(book,required[i]))wrong_id=true;
         }
@@ -467,7 +483,7 @@ esp_err_t weread_progress_fetch_version(const char *id, weread_progress_t *cloud
         if (!identity_read(&session)) return ESP_ERR_INVALID_STATE;
     }
     uint32_t fresh_version = 0, last_index = 0;
-    esp_err_t err = fetch_progress(id, cloud, &fresh_version, &last_index, &session);
+    esp_err_t err = fetch_progress(id, cloud, &fresh_version, &last_index, &session, true);
     if (err != ESP_OK) return err;
     { WR_GUARD;
         if (!identity_matches(&session)) return ESP_ERR_INVALID_STATE;
@@ -510,7 +526,7 @@ esp_err_t weread_progress_sync_version(const char *id, weread_progress_t *local,
     bool have_local = weread_progress_load(id, local) == ESP_OK;
     memset(cloud, 0, sizeof(*cloud)); *conflict = false;
     uint32_t fresh_version=0,last_index=0;
-    esp_err_t err=fetch_progress(id,cloud,&fresh_version,&last_index,NULL);
+    esp_err_t err=fetch_progress(id,cloud,&fresh_version,&last_index,NULL,true);
     if(err!=ESP_OK)return err;
     // 只有本次书籍元数据可证明当前版本；阅读位置快照不能回写旧版。/ Only fresh book metadata proves the current version; progress snapshots cannot restore an older version.
     if(known_version)*known_version=fresh_version;
@@ -602,7 +618,7 @@ esp_err_t weread_progress_note(const char *id, uint32_t uid, uint32_t index, uin
     weread_book_t book; if (weread_shelf_find(id, &book)) p.book_version = book.book_version;
     return save(id, &p);
 }
-static esp_err_t send_progress(const char *id,const weread_progress_t *p,const progress_identity_t *identity){
+static esp_err_t send_progress(const char *id,const weread_progress_t *p, progress_identity_t *identity){
     esp_err_t err=ESP_OK;
     cJSON *body=NULL,*r=NULL;char *text=NULL;
     { WR_GUARD; body=encode(p);
@@ -822,7 +838,7 @@ esp_err_t weread_progress_outbox_report(const char *id,uint64_t now_ms,uint64_t 
         if(sent.retry_after>now&&sent.retry_after-now<=300)return ESP_ERR_TIMEOUT;
     }
     weread_progress_t cloud;uint32_t version=0;
-    esp_err_t err=fetch_progress(id,&cloud,&version,NULL,&session);
+    esp_err_t err=fetch_progress(id,&cloud,&version,NULL,&session,false);
     if(err!=ESP_OK)return outbox_failure(id,&session,&sent,err,now,out);
     if(version&&cloud.book_version&&version!=cloud.book_version)
         return outbox_failure(id,&session,&sent,WEREAD_ERR_VERSION,now,out);

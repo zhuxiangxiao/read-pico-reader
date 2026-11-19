@@ -1088,7 +1088,7 @@ static bool book_cover_load_gray_impl(const char *path, const char *title, const
 
 // 后台缓存以TF等待为主，按体积优化以保留Pico原4MiB应用分区。
 // Background cache work is IO-bound; size optimization preserves Pico's original 4MiB app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC push_options
 #pragma GCC optimize ("Os")
 #endif
@@ -1228,7 +1228,7 @@ static bool book_cover_load_list_gray_impl(const char *path,const char *title,co
         uint8_t *out,bool decode,bool *pending,unsigned *width,unsigned *height,bool allow_auto,bool *auto_cache) {
     return book_cover_load_list_gray_sized_impl(path,title,author,out,decode,pending,width,height,allow_auto,auto_cache,BOOK_COVER_W,BOOK_COVER_H);
 }
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC pop_options
 #endif
 

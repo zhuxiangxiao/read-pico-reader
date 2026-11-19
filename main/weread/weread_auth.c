@@ -3,7 +3,7 @@
  * WeRead authentication, QR login state machine, and persistence.
  */
 // 网络和缓存按体积优化，保留双板原应用分区。/ Optimize network/cache code for size within the original app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_auth.h"

@@ -27,7 +27,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#if defined(__GNUC__) && !defined(__clang__)
+#if defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #endif

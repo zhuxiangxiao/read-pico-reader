@@ -4,7 +4,7 @@
  * 中文：微信读书目录快照与离线章节适配；网络只在书源加载回调中执行。
  * English: Adapt WeRead TOC snapshots/offline chapters; networking belongs to source load callbacks.
  */
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "book_source_weread.h"
@@ -133,14 +133,21 @@ esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t ind
     if(!file)return ESP_ERR_NOT_FOUND;
     weread_position_header_t header={0};bool ok=fread(&header,sizeof(header),1,file)==1;
     ok=ok&&header.magic==WEREAD_POSITION_MAGIC&&header.bytes&&header.count&&header.count<=16384;
-    weread_position_point_t point={0},previous={0};
-    for(uint32_t n=0;ok&&n<header.count;++n){
-        if(!(n%128)&&weread_client_cancelled()){fclose(file);return ESP_ERR_INVALID_STATE;}
-        ok=fread(&point,sizeof(point),1,file)==1&&point.byte<=header.bytes&&point.unit<=header.units&&
-            (!n||(point.byte>=previous.byte&&point.unit>=previous.unit));
-        previous=point;
+    if(ok){
+        if(weread_client_cancelled()){fclose(file);return ESP_ERR_INVALID_STATE;}
+        size_t points_bytes=(size_t)header.count*sizeof(weread_position_point_t);
+        weread_position_point_t *points __attribute__((cleanup(wr_release)))=wr_alloc(points_bytes);
+        if(!points){fclose(file);return ESP_ERR_NO_MEM;}
+        ok=fread(points,sizeof(weread_position_point_t),header.count,file)==header.count&&
+            fgetc(file)==EOF&&!ferror(file);
+        weread_position_point_t previous={0};
+        for(uint32_t n=0;ok&&n<header.count;++n){
+            ok=points[n].byte<=header.bytes&&points[n].unit<=header.units&&
+                (!n||(points[n].byte>=previous.byte&&points[n].unit>=previous.unit));
+            previous=points[n];
+        }
     }
-    ok=ok&&fgetc(file)==EOF&&!ferror(file);fclose(file);
+    fclose(file);
     strcpy(strrchr(path,'/')+1,"body.html");struct stat st;
     if(!ok||stat(path,&st)||!S_ISREG(st.st_mode)||st.st_size!=(off_t)header.bytes)return ESP_ERR_INVALID_RESPONSE;
     if(offset>header.units)return WEREAD_ERR_POSITION;

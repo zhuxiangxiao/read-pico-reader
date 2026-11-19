@@ -6,10 +6,12 @@
  * 冻结：内容下载由单一worker执行；退页/锁屏/拔卡先取消并等待，只有进入阅读时保留自有WiFi。
  * Frozen: One worker downloads content; cancel/join on exit/lock/media loss, retaining owned WiFi only for reader entry.
  */
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
+#include "kiiko_board_config.h"
 #include "app.h"
+#include "display.h"
 #include "esp_log.h"
 #include "app_registry.h"
 #include "app_content_open.h"
@@ -32,6 +34,9 @@
 #include "read_pico_search.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+#include "metalio_cover_cache.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +77,63 @@ static row_cover_t s_covers[ROWS];
 static int display_style(void){return s_query[0]?5:s_style;}
 static int page_rows(void){return ui_shelf_rows(display_style());}
 static int page_count(void){return s_visible?(int)((s_visible+page_rows()-1)/page_rows()):1;}
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+static unsigned s_cover_cache_epoch;
+static const weread_shelf_item_t *find_shelf_book(const char *book_id) {
+    if (!book_id || !book_id[0]) return NULL;
+    for (size_t i = 0; i < s_count; ++i)
+        if (!strcmp(s_books[i].book_id, book_id)) return &s_books[i];
+    return NULL;
+}
+static uint64_t book_id_hash64(const char *id) {
+    uint64_t h = UINT64_C(14695981039346656037);
+    if (!id) return h;
+    for (const unsigned char *p = (const unsigned char *)id; *p; ++p)
+        h = (h ^ *p) * UINT64_C(1099511628211);
+    return h;
+}
+static metalio_cover_key_t raw_cover_ram_key(const weread_shelf_item_t *b) {
+    return (metalio_cover_key_t){{
+        UINT64_C(0x5752435652310001),
+        b ? b->cover_key : 0,
+        book_id_hash64(b ? b->book_id : ""),
+        ((uint64_t)s_cover_cache_epoch << 32) | (uint32_t)s_epoch,
+        s_owner,
+        WEREAD_COVER_WIDTH,
+        WEREAD_COVER_HEIGHT,
+        0
+    }};
+}
+static void cache_store_raw_cover(const char *book_id, const uint8_t *pixels) {
+    if (!pixels) return;
+    const weread_shelf_item_t *b = find_shelf_book(book_id);
+    if (!b || !b->has_cover) return;
+    metalio_cover_key_t key = raw_cover_ram_key(b);
+    (void)metalio_cover_cache_put(&key, pixels, (size_t)WEREAD_COVER_WIDTH * WEREAD_COVER_HEIGHT,
+        (metalio_cover_meta_t){WEREAD_COVER_WIDTH, WEREAD_COVER_HEIGHT, false});
+}
+static void prime_covers_from_ram(void) {
+    const size_t bytes = (size_t)WEREAD_COVER_WIDTH * WEREAD_COVER_HEIGHT;
+    for (int i = 0; i < page_rows(); ++i) {
+        weread_shelf_item_t *b = s_visible && s_matches && (size_t)s_page * page_rows() + (size_t)i < s_visible
+            ? &s_books[s_matches[(size_t)s_page * page_rows() + (size_t)i]] : NULL;
+        if (!b || !b->has_cover || s_covers[i].pixels || s_covers[i].checked) continue;
+        metalio_cover_key_t key = raw_cover_ram_key(b);
+        metalio_cover_meta_t meta = {0};
+        if (!metalio_cover_cache_get(&key, NULL, 0, &meta) ||
+            meta.width != WEREAD_COVER_WIDTH || meta.height != WEREAD_COVER_HEIGHT) continue;
+        uint8_t *buf = wr_alloc(bytes);
+        if (!buf) continue;
+        if (metalio_cover_cache_get(&key, buf, bytes, &meta)) {
+            s_covers[i].pixels = buf;
+            s_covers[i].key = b->cover_key;
+            s_covers[i].checked = true;
+        } else {
+            free(buf);
+        }
+    }
+}
+#endif
 
 bool app_weread_request_open(const char *uri) {
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_requested)) return false;
@@ -98,7 +160,11 @@ static bool filter_page(bool reset) {
         if(!s_query[0]||read_pico_search_match(s_books[i].title,s_query)||read_pico_search_match(s_books[i].author,s_query))matches[count++]=(uint16_t)i;
     if(count>1)qsort(matches,count,sizeof(*matches),compare_match);
     free(s_matches);s_matches=matches;s_visible=count;
-    if(reset){s_page=0;release_covers();}
+    if(reset){s_page=0;release_covers();
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+        prime_covers_from_ram();
+#endif
+    }
     else if(s_page>=page_count())s_page=page_count()-1;
     return true;
 }
@@ -142,6 +208,9 @@ static void adopt_books(weread_result_t *r) {
         s_covers[i].key=b->cover_key;
     }
     for(int i=0;i<ROWS;++i)free(old[i].pixels);
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+    prime_covers_from_ram();
+#endif
 }
 static EpdRect row_rect(int i){return ui_shelf_entry(display_style(),i);}
 static EpdRect more_rect(int i){return i<0?(EpdRect){378,160,270,242}:(EpdRect){390,172+i*70,246,70};}
@@ -217,13 +286,46 @@ static void render(app_ctx_t *ctx,uint8_t *fb) {
     ui_text_vc(fb,466,121,20,"更多",EPD_DRAW_ALIGN_CENTER,false);
     ui_shelf_order_button(fb,(EpdRect){524,94,124,54},s_order,s_sort_menu,false,"更新时间",true);
     ui_shelf_begin();
+    bool binary=app_settings_main_fast_refresh();
     for(int i=0;i<page_rows();++i){weread_shelf_item_t *book=row_book(i);if(!book)break;
         EpdRect cover=ui_shelf_cover(display_style(),i);ui_shelf_cover_begin(fb,cover,display_style());
-        if(s_covers[i].pixels)ui_shelf_cover_pixels(fb,cover,s_covers[i].pixels,WEREAD_COVER_WIDTH,WEREAD_COVER_HEIGHT,app_settings_main_fast_refresh());
-        else ui_shelf_cover_placeholder(fb,cover,book->title);
-        ui_shelf_cover_end(fb,cover,display_style(),app_settings_main_fast_refresh());
+        if(s_covers[i].pixels){
+#if defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47 && defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            EpdRect physical=ui_rotate_rect_to_fb(cover);
+            bool raster=display_pipeline_enabled()&&
+                !(physical.x&1)&&!(physical.width&1)&&physical.x>=0&&physical.y>=0&&
+                physical.x+physical.width<=epd_width()&&physical.y+physical.height<=epd_height();
+            metalio_cover_key_t raster_key={0};
+            uint8_t *physical_pixels=raster?fb+(size_t)physical.y*epd_width()/2+physical.x/2:NULL;
+            if(raster){
+                raster_key=(metalio_cover_key_t){{
+                    UINT64_C(0x5333315752726173),
+                    book->cover_key,
+                    book_id_hash64(book->book_id),
+                    ((uint64_t)s_cover_cache_epoch<<32)|((uint32_t)display_style()<<1)|(uint32_t)binary,
+                    s_owner,
+                    (uint64_t)(unsigned)epd_get_rotation()<<32|((unsigned)cover.width<<16)|(unsigned)cover.height,
+                    (uint64_t)(unsigned)app_settings_system_contrast()<<32|((cover.x&3)|((cover.y&3)<<2)),
+                    (uint64_t)(unsigned)physical.width<<32|(unsigned)physical.height
+                }};
+                if(metalio_cover_cache_get_rows(&raster_key,physical_pixels,epd_width()/2,physical.width/2,physical.height))goto weread_cover_raster_done;
+            }
+#endif
+            ui_shelf_cover_pixels(fb,cover,s_covers[i].pixels,WEREAD_COVER_WIDTH,WEREAD_COVER_HEIGHT,binary);
+#if defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47 && defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            if(raster)(void)metalio_cover_cache_put_rows(&raster_key,physical_pixels,epd_width()/2,physical.width/2,physical.height);
+weread_cover_raster_done:;
+#endif
+        } else ui_shelf_cover_placeholder(fb,cover,book->title);
+        ui_shelf_cover_end(fb,cover,display_style(),binary);
     }
-    ui_shelf_furniture(fb,display_style(),192,app_settings_main_fast_refresh(),NULL);
+    ui_shelf_furniture(fb,display_style(),192,binary,NULL);
+#if defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    if(display_style()!=5&&app_settings_main_refresh_mode()==APP_MAIN_REFRESH_NORMAL){
+        const EpdRect artwork={0,192,UI_LOCK_WIDTH,800};
+        display_main_transition_cover_bands(&artwork,1);
+    }
+#endif
     for(int i=0;i<page_rows();++i){weread_shelf_item_t *book=row_book(i);if(!book)break;
         if(display_style()==5)ui_shelf_list_row(fb,row_rect(i),book->title,book->author,book->progress,book->chapter_index,0);
         else ui_shelf_progress(fb,ui_shelf_cover(display_style(),i),display_style(),book->progress);
@@ -304,7 +406,11 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *e) {
         s_search=true;wr_copy(s_search_draft,sizeof(s_search_draft),s_query);ui_text_edit_init(&s_edit,s_search_draft,sizeof(s_search_draft));ui_keyboard_begin(&s_edit,false);return APP_REDRAW_PAGE;
     }
     int hit=ui_pager_hit(x,y),target=ui_pager_target(hit,s_page,page_count());
-    if(hit>=0&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();return APP_REDRAW_PAGE;}
+    if(hit>=0&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+        prime_covers_from_ram();
+#endif
+        return APP_REDRAW_PAGE;}
     for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&ui_rect_hit(row_rect(i),x,y)){
         if(e->type==UI_GESTURE_LONG_PRESS){stop_job();strcpy(s_id,b->book_id);s_clear=true;}
         else open_id(b->book_id);
@@ -360,6 +466,9 @@ static app_redraw_t tick(app_ctx_t *ctx) {
         // 不可见预热与预连接不改变当前画面，也不弹出后台网络错误。/ Invisible warming and preconnection never repaint or surface background network errors.
         if((r.job==WR_JOB_COVER&&s_cover_warm)||r.job==WR_JOB_CONNECT||r.job==WR_JOB_DISCONNECT){
             bool expired=s_auth&&!r.authenticated;
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            if(r.job==WR_JOB_COVER&&s_cover_warm&&r.cover)cache_store_raw_cover(r.id,r.cover);
+#endif
             s_cover_warm=false;weread_runtime_result_free(&r);
             if(expired){s_auth=false;start(WR_JOB_QR,NULL,NULL);message("登录已失效，请重新扫码");return APP_REDRAW_PAGE;}
             return APP_REDRAW_NONE;
@@ -407,7 +516,11 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             char uri[80];snprintf(uri,sizeof(uri),"weread://%s",r.id);
             if(s_open_home?app_book_request_open_from_home(uri):app_book_request_open_from_weread(uri)){s_keep_network=true;ctx->request_app=app_at(1);}
         }
-        if(r.job==WR_JOB_COVER){for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
+        if(r.job==WR_JOB_COVER){
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            if(r.cover)cache_store_raw_cover(r.id,r.cover);
+#endif
+            for(int i=0;i<ROWS;++i){weread_shelf_item_t *b=row_book(i);if(b&&!strcmp(b->book_id,r.id)){
             s_covers[i].checked=true;
             if(r.cover){free(s_covers[i].pixels);s_covers[i].pixels=r.cover;r.cover=NULL;
                 if(!s_cover_dirty)s_cover_paint_at=ctx->now_ms+150;
@@ -420,9 +533,17 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             if(r.cover_retry_seconds&&(!s_cover_remote||s_covers[i].retry.failures>=3))
                 s_covers[i].retry.not_before_ms=ctx->now_ms+(uint64_t)r.cover_retry_seconds*1000;
         }}}
-        if(r.job==WR_JOB_CLEAR){release_covers();message(r.error==ESP_OK?"离线内容已清理":"清理失败，请重试");}
+        if(r.job==WR_JOB_CLEAR){
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            if(r.error==ESP_OK)++s_cover_cache_epoch;
+#endif
+            release_covers();
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+            if(r.error!=ESP_OK)prime_covers_from_ram();
+#endif
+            message(r.error==ESP_OK?"离线内容已清理":"清理失败，请重试");}
         if(r.error!=ESP_OK&&r.job!=WR_JOB_COVER&&r.job!=WR_JOB_POLL)
-            message(r.error==ESP_ERR_NO_MEM?"内存不足，请稍后重试":r.error==WEREAD_ERR_POSITION?"阅读位置与目录不匹配，请先在手机打开本书后重试":r.error==ESP_ERR_INVALID_RESPONSE?"返回数据不完整，请稍后重试":r.error==WEREAD_ERR_PURCHASE?"请在微信读书手机端购买或领取此章节":r.error==WEREAD_ERR_SOLD_OUT?"这本书已下架，暂时无法下载":"网络暂不可用，可阅读已缓存章节");
+            message(r.error==ESP_ERR_NO_MEM?"内存不足，请稍后重试":r.error==WEREAD_ERR_POSITION?"阅读位置与目录不匹配，请先在手机打开本书后重试":r.error==ESP_ERR_INVALID_RESPONSE?"返回数据不完整，请稍后重试":r.error==WEREAD_ERR_PURCHASE?"请在微信读书手机端购买或领取此章节":r.error==WEREAD_ERR_SOLD_OUT?"这本书已下架，暂时无法下载":r.error==WEREAD_ERR_VERSION?"书籍版本已更新，请同步书架后重试":r.error==ESP_ERR_NOT_SUPPORTED?"暂不支持此书籍格式":"网络暂不可用，可阅读已缓存章节");
         if(r.job==WR_JOB_INIT){
             bool initial=s_sync_after_init;
             s_init_pending=false;
@@ -521,7 +642,11 @@ static bool main_key(app_ctx_t *ctx,int key,app_redraw_t *redraw){
     if(key==UI_KEY_2){s_key_mode=!s_key_mode;*redraw=APP_REDRAW_PAGE;return true;}
     if(!s_key_mode)return false;
     int target=s_page+(key==UI_KEY_1?-1:1);
-    if(target>=0&&target<page_count()&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();*redraw=APP_REDRAW_PAGE;}
+    if(target>=0&&target<page_count()&&target!=s_page){stop_job();s_warm_direction=target<s_page?-1:1;s_page=target;release_covers();
+#if defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+        prime_covers_from_ram();
+#endif
+        *redraw=APP_REDRAW_PAGE;}
     else *redraw=APP_REDRAW_NONE;
     return true;
 }

@@ -1445,7 +1445,7 @@ static void prepare_covers(app_ctx_t* ctx) {
 
 // 后台缓存以TF等待为主，按体积优化以保留Pico原4MiB应用分区。
 // Background cache work is IO-bound; size optimization preserves Pico's original 4MiB app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC push_options
 #pragma GCC optimize ("Os")
 #endif
@@ -1582,7 +1582,7 @@ void app_book_home_shelf_warm_stop(void) {
 }
 #endif
 
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC pop_options
 #endif
 // 首帧短暂汇合TF缓存命中，让题头、书架和封面一起显示；冷解码不无限阻塞。
