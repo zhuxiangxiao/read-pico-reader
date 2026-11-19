@@ -236,7 +236,7 @@ static void more_draw(uint8_t *fb){
 static void wifi_close(app_ctx_t *ctx) { if (s_wifi && app_transfer.on_exit) app_transfer.on_exit(ctx); s_wifi = false; }
 static void wifi_open(app_ctx_t *ctx) {
     weread_runtime_stop(); ui_wifi_qr_clear(); s_uid[0]=s_qr[0]=0;
-    s_more_sync=s_syncing=false;
+    s_more_sync=s_syncing=s_open_stage=false;
     s_wifi = true; app_transfer_request_wifi_setup(); if (app_transfer.on_enter) app_transfer.on_enter(ctx);
 }
 static bool start(weread_job_t job, const char *id, const char *value) {
@@ -312,11 +312,16 @@ static void render(app_ctx_t *ctx,uint8_t *fb) {
                 physical.x+physical.width<=epd_width()&&physical.y+physical.height<=epd_height();
             metalio_cover_key_t raster_key={0};
             uint8_t *physical_pixels=raster?fb+(size_t)physical.y*epd_width()/2+physical.x/2:NULL;
+            uint64_t raster_book=book_id_hash64(book->book_id);
             if(raster){
+                // 光栅键也按书号分家族：共享缓存的旧版本淘汰规则以 field[0] 归族，
+                // 固定家族标记会把同页其他书当旧版本清掉，只剩最后一张有效。
+                // Raster keys also group per book: the shared cache retires stale versions within one field[0]
+                // family, so a constant family marker would drop every sibling book's raster.
                 raster_key=(metalio_cover_key_t){{
-                    UINT64_C(0x5333315752726173),
+                    UINT64_C(0x5333315752726173) ^ raster_book,
                     book->cover_key,
-                    book_id_hash64(book->book_id),
+                    raster_book,
                     ((uint64_t)s_cover_cache_epoch<<32)|((uint32_t)display_style()<<1)|(uint32_t)binary,
                     s_owner,
                     (uint64_t)(unsigned)epd_get_rotation()<<32|((unsigned)cover.width<<16)|(unsigned)cover.height,
@@ -628,7 +633,11 @@ static app_redraw_t tick(app_ctx_t *ctx) {
             message(stage);
             if(ctx->fb){
                 ui_text_set_system_scale(true);
-                ui_fill_rect_fast((EpdRect){36,990,612,20},UI_GRAY_WHITE,ctx->fb);
+                // 九宫格是浅灰根底，列表样式才是白底；消息行清底与周围背景一致，范围对齐 area。
+                // The grid sits on the light-gray root canvas while the list style is white; clear the line
+                // with the matching background and keep the dirty area identical.
+                ui_fill_rect_fast((EpdRect){36,988,612,24},
+                    display_style()!=5?UI_ROOT_GRAY:UI_GRAY_WHITE,ctx->fb);
                 ui_text_box(ctx->fb,(EpdRect){36,990,612,20},17,s_message,EPD_DRAW_ALIGN_LEFT,false);
                 s_area=(EpdRect){36,988,612,24};
                 return APP_REDRAW_AREA;
@@ -677,7 +686,7 @@ static app_redraw_t tick(app_ctx_t *ctx) {
     return APP_REDRAW_NONE;
 }
 static app_redraw_t key(app_ctx_t *ctx,int key) {
-    s_open_queued=false;
+    s_open_queued=s_open_stage=false;
     s_last_input=ctx->now_ms;
     if(s_wifi&&app_transfer.on_key)return app_transfer.on_key(ctx,key);
     if(s_search){ui_keyboard_end();s_search=false;return APP_REDRAW_PAGE;}

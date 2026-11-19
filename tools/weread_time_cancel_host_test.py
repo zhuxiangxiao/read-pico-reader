@@ -107,6 +107,8 @@ CONNECT = r'''
 static atomic_bool s_cancel;
 static atomic_uint_fast64_t s_deadline;
 static bool s_owns_network;
+// 生产代码用该标志阻止建连超时被静默重放。/ Production uses this flag to keep connect timeouts out of the silent replay.
+static bool s_connect_timed_out;
 static uint64_t s_network_active;
 static uint64_t now_ms(void){return mono/1000;}
 static void pause_ms(unsigned ms){mono+=(int64_t)ms*1000;}
@@ -128,7 +130,7 @@ static time_t test_time(time_t *out){if(out)*out=wall;return wall;}
 #define time test_time
 #define weread_client_set_radio_awake(awake) ((void)(awake))
 ''' + function(RUNTIME, 'connect_network') + r'''
-static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
+static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=s_connect_timed_out=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
 int main(void){
  reset();sync_cancel=true;assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==200000&&syncs==1);
  reset();atomic_store(&s_deadline,1800);assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==1800000&&syncs==1);

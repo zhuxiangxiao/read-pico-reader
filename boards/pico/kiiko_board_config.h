@@ -92,15 +92,16 @@
 /// 封面缓存目录；两块板用各自的目录，互不污染。
 /// Cover-cache directory; each board keeps its own so the two never share entries.
 #define KIIKO_BOARD_COVER_CACHE_DIR KIIKO_BOARD_CACHE_DIR "/covers"
-/// 两板的成品灰阶封面都放进 PSRAM：Pico 16 槽×42,240 B≈660 KiB、上限 768 KiB，
-/// 微信读书书架翻回看过的页可直接出图；S31 保持更大的 4 MiB/96 槽预算。
-/// Both boards budget finished gray covers in PSRAM: the Pico keeps 16 slots x 42,240 B ~= 660 KiB
-/// within a 768 KiB budget so revisiting a WeRead shelf page paints from RAM; the S31 keeps its
-/// larger 4 MiB / 96-slot budget.
+/// 两板的成品灰阶封面都放进 PSRAM：Pico 24 槽、768 KiB 预算（字节上限约 18 张 42,240 B
+/// 成品封面，其余槽位容纳本地书架的 1-bit/标记小项），微信读书书架翻回看过的页可直接出图；
+/// S31 保持更大的 4 MiB/96 槽预算。
+/// Both boards budget finished gray covers in PSRAM: the Pico keeps 24 slots within a 768 KiB budget
+/// (~18 finished 42,240 B covers; spare slots hold the local shelf's small 1-bit/marker entries) so
+/// revisiting a WeRead shelf page paints from RAM; the S31 keeps its larger 4 MiB / 96-slot budget.
 #define KIIKO_BOARD_RAM_COVER_CACHE 1
 /// 以下数值单位 KiB；Pico 沿用较小的本板预算，S31 的 16 MB PSRAM 才放大。
 /// KiB units below; the Pico keeps its smaller local budget and only the S31's 16 MB PSRAM scales up.
-#define KIIKO_BOARD_COVER_RAM_SLOTS 16
+#define KIIKO_BOARD_COVER_RAM_SLOTS 24
 #define KIIKO_BOARD_COVER_RAM_BUDGET_KB 768
 #define KIIKO_BOARD_CACHE_PSRAM_RESERVE_KB 2048
 #define KIIKO_BOARD_CACHE_BLOCK_RESERVE_KB 1024

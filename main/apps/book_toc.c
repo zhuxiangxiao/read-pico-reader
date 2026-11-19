@@ -331,8 +331,9 @@ void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
             if (selected)
                 ui_text_box(fb,(EpdRect){r.x+r.width-93,r.y+11,71,72},24,"当前",EPD_DRAW_ALIGN_RIGHT,false);
             if (!selected && s_cached_page == page && s_cached_chapters == chapters && s_cached_rows[row]) {
-                // 已缓存章节在右缘加浅色圆点；选中行位置留给“当前”，不叠加标记。
-                // Cached chapters get a light dot at the right edge; the selected row keeps 当前 without a marker.
+                // 已缓存章节在右缘加深灰圆点（0x40，墨水屏上清晰可辨）；选中行位置留给“当前”，不叠加标记。
+                // Cached chapters get a dark-gray dot (0x40, legible on e-ink) at the right edge;
+                // the selected row keeps 当前 without a marker.
                 epd_fill_circle(r.x + r.width - 24, r.y + r.height / 2, 6, 0x40, fb);
             }
         }

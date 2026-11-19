@@ -128,6 +128,8 @@ bool weread_runtime_choose(const char*id,const weread_progress_t*p,bool cloud){r
 /// The runtime owns the open-stage text; this test has no open stage, so keep existing notices.
 bool weread_reader_stage_text(char*out,size_t cap){(void)out;(void)cap;return false;}
 bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){(void)stage;(void)bytes;return false;}
+/// 书架消息行沿用根底浅灰色；宿主桩与 ui_root_style.h 保持一致。/ Shelf message line reuses the root canvas gray; keep the host stub equal to ui_root_style.h.
+#define UI_ROOT_GRAY 0xf0
 #include "cover.inc"
 #include "production.inc"
 static void complete(weread_result_t r){assert(mock_busy&&!mock_ready);mock_authenticated=r.authenticated;mock_result=r;mock_busy=false;mock_ready=true;}

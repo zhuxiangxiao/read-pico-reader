@@ -57,19 +57,22 @@ static void wr_chapter_poll(uint32_t expected_uid, bool *matching, esp_err_t *er
 // 冷章等待期间用后台阶段文案替换同一条提示；文案变化且通过限速时才重绘提示区域。
 // Replace the waiting toast with the worker stage text; repaint only when the text changes and the limiter allows.
 static app_redraw_t wr_chapter_stage_notice(app_ctx_t *ctx){
+    // 只有本页起的异步章节任务才有自己的阶段；子页面、触摸、消费态或无帧缓冲时不启动新的限速窗口。
+    // Only this page's asynchronous chapter job owns a stage; subpages, touch, consumed ticks or a missing
+    // framebuffer return before the rate limiter is armed, so a skipped update cannot swallow the next one.
+    if(!s_wr_jump.started||s_view!=READING||!ctx->fb)return APP_REDRAW_NONE;
+    if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
     char stage[sizeof(s_reader_notice)];
     weread_stage_t kind=WEREAD_STAGE_NONE;
     if(!weread_reader_stage_text(stage,sizeof(stage)))return APP_REDRAW_NONE;
     if(!strcmp(stage,s_reader_notice))return APP_REDRAW_NONE;
     if(!weread_reader_stage(&kind,NULL))kind=WEREAD_STAGE_NONE;
-    // 下载字节每 32 KiB 推进一次；同一阶段内按 2 秒合并，阶段切换与重试提示立即显示。
-    // Download bytes advance every 32 KiB; coalesce within one stage to 2 s while stage changes and the retry label show at once.
+    // 下载字节每 32 KiB 推进一次；同一阶段内按 3 秒合并，阶段切换与重试提示立即显示。
+    // Download bytes advance every 32 KiB; coalesce within one stage to 3 s while stage changes and the retry label show at once.
     if((unsigned)kind==s_stage_notice_kind&&kind==WEREAD_STAGE_CHAPTER&&(uint64_t)ctx->now_ms<s_stage_notice_at)return APP_REDRAW_NONE;
-    s_stage_notice_kind=(unsigned)kind;s_stage_notice_at=ctx->now_ms+2000;
-    if(ctx->consumed||(ctx->touch&&ctx->touch->touched))return APP_REDRAW_NONE;
+    s_stage_notice_kind=(unsigned)kind;s_stage_notice_at=ctx->now_ms+3000;
     copy_text(s_reader_notice,sizeof(s_reader_notice),stage);
     s_reader_notice_until=INT64_MAX;
-    if(s_view!=READING)return APP_REDRAW_NONE;
     // 区域刷新不会自动重绘帧缓冲；先重绘提示，再只更新提示所在区域。
     // Area refreshes do not rerender the framebuffer; repaint the toast before updating its region.
     render(ctx,ctx->fb);

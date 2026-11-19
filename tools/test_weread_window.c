@@ -335,6 +335,9 @@ int main(int argc,char **argv){
         // A real chapter move keeps the automatic next-chapter pre-read; manual off dispatches nothing inside the1s idle window.
         weread_reader_tick(uri,1,0,0,"",t,true);
         assert(!weread_reader_cache_forward());
+        // 默认自动整本补齐处于启用态（工具栏圆点亮），一次点击即暂停。
+        // The automatic whole-book fill is enabled by default (toolbar dot lit) and one tap pauses it.
+        assert(weread_reader_cache_fill_enabled());
         assert(step(1,t+400)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==2&&downloads==before);
         assert(step(1,t+700)==WR_JOB_INIT);
         // 手动开启后不等1秒静止：封面预热后继续向后补齐下一章。
@@ -349,6 +352,7 @@ int main(int argc,char **argv){
         weread_reader_tick(uri,1,0,0,"",t+950,true);
         assert(weread_runtime_busy());
         weread_reader_cache_forward_set(false);
+        assert(!weread_reader_cache_fill_enabled());
         {
             uint64_t until=millis()+5000;while(weread_runtime_busy()){assert(millis()<until);usleep(1000);}
             weread_result_t r;assert(weread_runtime_poll(&r)&&r.job==WR_JOB_PREFETCH&&r.error==ESP_OK&&r.chapter_idx==4);
@@ -359,6 +363,7 @@ int main(int argc,char **argv){
         // 前台输入冷却仍暂停手动缓存；冷却结束后按开关继续。
         // Recent foreground input still pauses manual caching; it resumes once the cooldown expires.
         weread_reader_cache_forward_set(true);
+        assert(weread_reader_cache_fill_enabled());
         weread_reader_input(false);
         assert(step(1,t+970)==WR_JOB_INIT);
         usleep(850000);

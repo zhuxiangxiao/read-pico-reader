@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: Apache-2.0
  * 中文：执行共享缓存，覆盖淘汰、版本、容量、内存失败、微信读书原始封面键族与并发复制；
- * Pico 配置另跑 16 槽/768 KiB 的 176x240 成品封面档位与开书前 128 KiB 回收。
+ * Pico 配置另跑 24 槽/768 KiB（字节上限约 18 张）的 176x240 成品封面档位与开书前 128 KiB 回收。
  * English: Exercise production cache eviction, versions, capacity, OOM, WeRead raw-cover key
- * families and concurrent copies; the Pico profile also checks its 16-slot/768 KiB 176x240
+ * families and concurrent copies; the Pico profile also checks its 24-slot/768 KiB (byte-capped) 176x240
  * raster budget and the 128 KiB trim before opening the reader.
  */
 #include "metalio_cover_cache.h"
@@ -56,18 +56,24 @@ int main(void) {
     k=key(0);assert(metalio_cover_cache_get(&k,out,CHUNK,NULL));
     assert(!metalio_cover_cache_get(&k,out,CHUNK-1,NULL));
 #else
-    // Pico：微信读书书架把 176x240 成品灰阶（42,240 B）塞进 16 槽/768 KiB，开书前收到 128 KiB。
-    // Pico: the WeRead shelf stores 176x240 gray rasters (42,240 B) in 16 slots/768 KiB and trims to 128 KiB before opening.
+    // Pico：24 槽/768 KiB 预算真正约束 176x240 成品灰阶（42,240 B，约 18 张），
+    // 额外槽位留给本地书架的 1-bit/标记小项；开书前统一收到 128 KiB。
+    // Pico: the 24-slot/768 KiB budget caps 176x240 gray rasters (42,240 B, ~18 covers) while spare slots
+    // hold the local shelf's small 1-bit/marker entries; opening always trims to 128 KiB.
     uint8_t *cover=malloc(COVER_BYTES);assert(cover);memset(cover,0x3c,COVER_BYTES);
     const unsigned slots=KIIKO_BOARD_COVER_RAM_SLOTS;
-    assert(slots<=16&&(size_t)slots*COVER_BYTES<=(size_t)KIIKO_BOARD_COVER_RAM_BUDGET_KB*1024u);
-    for(unsigned i=0;i<slots;++i){k=key(i);assert(metalio_cover_cache_put(&k,cover,COVER_BYTES,meta));}
-    assert(metalio_cover_cache_stats().entries==slots);
-    assert(metalio_cover_cache_stats().bytes==(size_t)slots*COVER_BYTES);
-    k=key(slots);assert(metalio_cover_cache_put(&k,cover,COVER_BYTES,meta));
-    assert(metalio_cover_cache_stats().entries==slots&&metalio_cover_cache_stats().bytes==(size_t)slots*COVER_BYTES);
+    const size_t limit=(size_t)KIIKO_BOARD_COVER_RAM_BUDGET_KB*1024u;
+    const unsigned covers=(unsigned)(limit/COVER_BYTES);
+    assert(slots>=covers&&slots<=32);
+    for(unsigned i=0;i<covers;++i){k=key(i);assert(metalio_cover_cache_put(&k,cover,COVER_BYTES,meta));}
+    assert(metalio_cover_cache_stats().entries==covers);
+    assert(metalio_cover_cache_stats().bytes==(size_t)covers*COVER_BYTES);
+    // 再塞一张会按 LRU 淘汰最旧一张，成品封面数仍被预算限制。
+    // One more raster evicts the oldest and the finished-cover count stays capped by the byte budget.
+    k=key(covers);assert(metalio_cover_cache_put(&k,cover,COVER_BYTES,meta));
+    assert(metalio_cover_cache_stats().entries==covers&&metalio_cover_cache_stats().bytes==(size_t)covers*COVER_BYTES);
     k=key(0);assert(!metalio_cover_cache_get(&k,out,COVER_BYTES,NULL));
-    k=key(slots);assert(metalio_cover_cache_get(&k,out,COVER_BYTES,&got)&&got.width==176&&got.height==240);
+    k=key(covers);assert(metalio_cover_cache_get(&k,out,COVER_BYTES,&got)&&got.width==176&&got.height==240);
     metalio_cover_cache_trim(128u*1024u);
     assert(metalio_cover_cache_stats().bytes==(128u*1024u/COVER_BYTES)*COVER_BYTES);
     metalio_cover_cache_clear();free(cover);
@@ -134,7 +140,7 @@ int main(void) {
 #if KIIKO_BOARD_METALIO47
     puts("PASS: dynamic 4MiB cap, LRU recency, copy ownership, raster metadata, file-version invalidation, per-book raw-cover keys, 2.5MiB shared reserve, trim/OOM fallback and 4000 concurrent copy cycles");
 #else
-    puts("PASS: pico 16-slot/768KiB gray-cover budget, per-book raw-cover keys, LRU cap, 128KiB open trim, copy ownership and 4000 concurrent copy cycles");
+    puts("PASS: pico 24-slot/768KiB gray-cover budget (byte-capped covers), per-book raw-cover keys, LRU cap, 128KiB open trim, copy ownership and 4000 concurrent copy cycles");
 #endif
     return 0;
 }

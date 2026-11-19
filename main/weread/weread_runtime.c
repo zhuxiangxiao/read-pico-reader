@@ -95,6 +95,9 @@ static struct {
 static atomic_uint s_stage;
 static atomic_uint_fast64_t s_stage_bytes;
 static bool s_retry_phase, s_retry_blocked;
+// Wi-Fi 建连 15 秒未就绪也算超时；静默重试只会让离线用户多等一倍时间，故不重放。
+// A 15 s Wi-Fi connect timeout also maps to ESP_ERR_TIMEOUT; replaying it would double an offline wait.
+static bool s_connect_timed_out;
 static void stage_store(weread_stage_t stage, uint64_t bytes) {
     // 先写字节再写阶段，UI 短暂的新旧组合不越界。/ Publish bytes before the stage; readers tolerate one mixed sample.
     atomic_store(&s_stage_bytes, bytes);
@@ -108,8 +111,21 @@ static void stage_phase(weread_stage_t stage, uint64_t bytes) {
 static void stage_download_progress(uint64_t bytes, bool done, void *ctx) {
     (void)ctx;
     unsigned stage = atomic_load(&s_stage);
-    if (stage != WEREAD_STAGE_CHAPTER && stage != WEREAD_STAGE_PARSE) return;
-    stage_phase(done ? WEREAD_STAGE_PARSE : WEREAD_STAGE_CHAPTER, bytes);
+    if (stage == WEREAD_STAGE_NONE) {
+        // 阅读页接管正在下载的预取章时，从字节回调发布阶段，避免 UI 线程写阶段状态。
+        // When the reader adopts an in-flight prefetch download, publish the stage from the byte callback
+        // instead of writing stage state from the UI thread.
+        unsigned adopted = atomic_load(&s_adopting_prefetch_uid);
+        if (!adopted || s_work.job != WR_JOB_PREFETCH ||
+            (s_work.chapter != adopted && atomic_load(&s_prefetch_downloading_uid) != adopted)) return;
+    } else if (stage == WEREAD_STAGE_RETRY) {
+        // 重试已重新进入下载：让 KB 进度覆盖“正在重试”，否则大包下载全程看不到推进。
+        // The retry is downloading again: let KB progress replace the retry label, otherwise a large package shows no movement.
+        s_retry_phase = false;
+    } else if (stage != WEREAD_STAGE_CHAPTER && stage != WEREAD_STAGE_PARSE) {
+        return;
+    }
+    stage_store(done ? WEREAD_STAGE_PARSE : WEREAD_STAGE_CHAPTER, bytes);
 }
 bool weread_reader_stage(weread_stage_t *stage, uint64_t *bytes) {
     unsigned value = atomic_load(&s_stage);
@@ -197,7 +213,9 @@ static esp_err_t connect_network(void) {
         // 已有STA正在连接时等待IP，不中断外部会话。/ Wait for an existing STA's IP without interrupting its owner.
         read_pico_transfer_service_poll();pause_ms(100);
     }
-    return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_ERR_TIMEOUT;
+    if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+    s_connect_timed_out = true;
+    return ESP_ERR_TIMEOUT;
 #else
     s_owns_network = true;s_network_active=now_ms(); return ESP_OK;
 #endif
@@ -857,9 +875,13 @@ static void perform_job(void) {
     for (unsigned attempt = 0;; ++attempt) {
         s_retry_phase = attempt != 0;
         s_retry_blocked = false;
+        s_connect_timed_out = false;
+        memset(&s_result.local, 0, sizeof(s_result.local));
+        memset(&s_result.cloud, 0, sizeof(s_result.cloud));
         if (s_retry_phase) stage_store(WEREAD_STAGE_RETRY, 0);
         err = job_run();
-        if (!retryable || err != ESP_ERR_TIMEOUT || s_retry_blocked || cancelled(NULL) || attempt) break;
+        if (!retryable || err != ESP_ERR_TIMEOUT || s_retry_blocked || s_connect_timed_out ||
+            cancelled(NULL) || attempt) break;
         ESP_LOGW("weread", "transient timeout retry job=%u", (unsigned)s_work.job);
     }
     s_retry_phase = false;
@@ -1357,8 +1379,21 @@ void weread_reader_cache_forward_set(bool on){
     // 显式关闭只抑制整本向后补齐（含自动空闲补齐），不取消在飞章节，也不影响自动下一章预读。
     // Explicit off only suppresses the whole-book forward fill (including automatic idle fill); in-flight chapters, the urgent next-chapter pre-read and reports stay.
     s_reader.cache_forward_off=!on;
+    if(on){
+        // 重新开启时清掉自动预取的失败/退避/空间暂停与“已到末尾”闩锁，否则按钮亮起却不再派发下载。
+        // Re-enabling clears the automatic prefetch failure/backoff/space pause and the end-of-book latch;
+        // otherwise the toggle can light up while no download is ever dispatched again.
+        s_reader.prefetch_failures=0;
+        s_reader.prefetch_retry=0;
+        s_reader.storage_blocked=false;
+        if(s_reader.prefetch_done){
+            s_reader.prefetch_done=false;
+            s_reader.prefetch_cursor=s_reader.chapter+1;
+        }
+    }
 }
 bool weread_reader_cache_forward(void){return s_reader.cache_forward;}
+bool weread_reader_cache_fill_enabled(void){return !s_reader.cache_forward_off;}
 bool weread_reader_caching(void){return weread_runtime_busy()&&s_work.job==WR_JOB_PREFETCH&&!strcmp(s_work.id,s_reader.id);}
 bool weread_reader_poll_cloud_jump(const char *uri,size_t *chapter_out,uint32_t *offset_out){
     if(!book_path_is_weread(uri)||!chapter_out||!offset_out||!atomic_load(&s_cloud_jump_ready)||

@@ -76,7 +76,6 @@ static void wr_reader_offline_caption(char *out,size_t cap){
         unsigned ready=weread_reader_offline();
         if(ready)snprintf(out,cap,"后续%u章已缓存 · ",ready);
         else if(weread_reader_caching())snprintf(out,cap,"缓存后续章节 · ");
-        else if(weread_reader_cache_forward())snprintf(out,cap,"缓存后续章节已开启 · ");
         else snprintf(out,cap,"本章已缓存 · ");
     }
 }
@@ -85,13 +84,14 @@ static void wr_reader_offline_caption(char *out,size_t cap){
 // Manual cache toggle: flip the background fill switch and toast briefly; never wait for a download or touch the body.
 static void wr_cache_forward_toggle(app_ctx_t *ctx){
     if(!book_path_is_weread(s_path))return;
-    bool on=!weread_reader_cache_forward();
+    // 开关反映“整本向后补齐是否启用”：默认启用；点一次暂停，再点一次立即恢复并清掉失败/退避/空间暂停。
+    // The toggle mirrors whether whole-book fill is enabled: on by default, one tap pauses and the next resumes
+    // eagerly after clearing automatic-prefetch failures/backoff/space pauses.
+    bool on=!weread_reader_cache_fill_enabled();
     weread_reader_cache_forward_set(on);
     unsigned cached=0,total=0;
     weread_reader_cached_progress(&cached,&total);
-    const char *text=on?"开始缓存后续章节":"已停止后台缓存";
-    if(on&&weread_reader_storage_blocked())text="缓存空间不足";
-    else if(on&&total&&cached>=total)text="本书已缓存完";
+    const char *text=on?(total&&cached>=total?"本书已缓存完":"开始缓存后续章节"):"已暂停后台缓存";
     copy_text(s_reader_notice,sizeof(s_reader_notice),text);
     s_reader_notice_until=ctx->now_ms+2000;
     // 页脚下一次采样会看到缓存状态变化；这里只标记一次待刷新，避免依赖恰好快照。

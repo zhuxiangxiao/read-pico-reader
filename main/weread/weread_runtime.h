@@ -115,3 +115,6 @@ bool weread_reader_chapter_cached(const char *uri, size_t chapter);
 /// Manual forward-cache toggle: keep filling later chapters while reading; off suppresses all whole-book forward fill without cancelling in-flight chapters, the urgent next-chapter pre-read or reports.
 void weread_reader_cache_forward_set(bool on);
 bool weread_reader_cache_forward(void);
+/// 整本向后补齐当前是否启用（默认启用；暂停后为false）。工具栏开关应显示此状态。
+/// Whether whole-book forward fill is enabled (on by default, false after a pause). The toolbar toggle mirrors this.
+bool weread_reader_cache_fill_enabled(void);

@@ -1211,8 +1211,6 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             free(redirected); redirected = next; next = NULL; current = redirected;
             continue;
         }
-        // 正文传输结束；解包/校验阶段由上层据done状态标记。/ Body transfer finished; the caller marks the unpack/verify phase from done.
-        weread_client_report_download_progress(info->bytes, true);
         int code = 0;
         if (info->bytes <= 4096 && !fseek(file, 0, SEEK_SET)) {
             char *text __attribute__((cleanup(wr_release)))=wr_alloc(4097);
@@ -1221,7 +1219,12 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             code = extract_error_code(text, n);
         }
         if (!weread_client_is_trusted_url(current) ||
-            (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
+            (info->status != 401 && code != -2013 && code != -2012)) {
+            // 正文传输结束且不再续签时才进入解包/校验；401/续签重下不会先跳到“校验”再倒回下载。
+            // Only a finished, non-renewing body moves on to unpack/verify; a 401 renewal replay cannot jump to verify first.
+            if (info->status == 200) weread_client_report_download_progress(info->bytes, true);
+            return ESP_OK;
+        }
         if (s_background && code != WEREAD_AUTH_ERRCODE_TIMEOUT) return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
             if (attempt && code == -2013 && !s_background) {

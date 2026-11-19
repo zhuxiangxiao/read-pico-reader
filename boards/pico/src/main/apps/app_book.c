@@ -3424,7 +3424,7 @@ static void draw_reader_panel(uint8_t* fb) {
             EpdRect rect = tool_rect(i);
             int cx = rect.x + rect.width / 2;
             bool marked = i == 1 ? bookmark_is_current() :
-                          i == BOOK_TOOL_COUNT && weread_reader_cache_forward();
+                          i == BOOK_TOOL_COUNT && weread_reader_cache_fill_enabled();
             draw_reader_tool_icon(fb, cx, 1138, i, marked);
             ui_text_box(fb,(EpdRect){rect.x+6,1159,rect.width-12,40},20,
                         i == 1 && marked ? "已书签" : labels[i],EPD_DRAW_ALIGN_CENTER,false);
@@ -4184,7 +4184,9 @@ static void draw_reader_outer(uint8_t *fb,size_t page) {
         EpdRect notice = {218, 160, 248, 48};
         ui_fill_round_rect(fb, notice, 24, 0xd0);
         ui_draw_round_rect(fb,notice,24,UI_GRAY_BLACK);
-        ui_text_vc(fb, 342, 184, 19, s_reader_notice, EPD_DRAW_ALIGN_CENTER, false);
+        // 长阶段文案（下载章节 KB）用 ui_text_box 自动缩字号，避免越过圆角药丸。
+        // Long stage labels (download KB) auto-shrink through ui_text_box instead of crossing the rounded pill.
+        ui_text_box(fb,(EpdRect){232,168,220,32},19,s_reader_notice,EPD_DRAW_ALIGN_CENTER,false);
     }
     if (reader_chapter_undo_visible()) {
         EpdRect notice={104,160,476,126};
@@ -5161,7 +5163,9 @@ static bool open_book_impl(app_ctx_t* ctx, const char* path) {
     // 书架封面和上一本书的预渲染缓冲可以重建；先释放，再解析 EPUB。
     // Cover and previous-page caches are rebuildable; release them before EPUB parsing.
     book_shelf_page_release();
-    metalio_cover_cache_trim(512u * 1024u);
+    // Pico 的封面预算更小：开书前收到 128 KiB，给阅读和字体留住 PSRAM。
+    // The Pico budget is smaller: trim covers to 128 KiB before opening so reading and fonts keep PSRAM.
+    metalio_cover_cache_trim(128u * 1024u);
     invalidate_covers();
     app_home_release_clock_cache();
     lock_draw();
