@@ -1695,7 +1695,7 @@ static void reader_footer_strip_number(char *dst, size_t cap, const char *source
             if (*after == ' ' || *after == '\t' || *after == ':' || *after == '-') ++after;
             else after += strlen("：");
         }
-        name = after;
+        if (*after) name = after;
     }
     // 无名页不给占位名：底栏只留页码与全书进度。
     // Unnamed pages get no placeholder label; the footer keeps only page and book progress.
@@ -4565,7 +4565,11 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
             // 普通翻页沿用正文GL16，和水波纹/速读共用内容范围；信息栏独立局刷。
             // Ordinary turns retain body GL16 with the ripple/Fast BW content extent; metadata updates independently.
             : s_reader_turn_pending && s_mode == MODE_GL16
-                ? update_display_reader_area(ctx->hl, display_reader_soft_turn_waveform(), s_mode, turn_area, true)
+                // 普通翻页整屏推白并重推黑，状态栏和页脚也一起擦，避免阳光下淡墨。
+                // Ordinary turns push white and re-drive black across the whole panel, metadata included,
+                // so nothing stays faint in sunlight.
+                ? update_display_reader_area(ctx->hl, display_reader_soft_turn_waveform(), s_mode,
+                                             (EpdRect){0, 0, UI_LOCK_WIDTH, UI_LOCK_HEIGHT}, true)
                 : separate_metadata
                     ? update_display_reader_area(ctx->hl,
                         s_mode == MODE_DU ? &E0470_FOLLOW_WAVEFORM : display_reader_soft_turn_waveform(),

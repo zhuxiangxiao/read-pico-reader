@@ -1,5 +1,24 @@
 # 版本变更 / Changelog
 
+## 本地测试 / Local test — 2026-11-18
+
+- Pico 普通翻页改为整屏推白并重推黑：顶部状态栏、书名与底部章节/进度一起擦白；波形把厂商定稿保持挪到擦白之前，重推黑作为最后一段驱动，减少阳光下黑字发灰。
+- Pico ordinary turns push white and re-drive black across the whole panel, status bar and footer included; the waveform runs the vendor settle holds before the erase and ends on the black re-drive so blacks stay dense in sunlight.
+
+- 两款机型不再给目录、版权、序言等书前资料套章节题头。阅读器生成的卷名居中独占一页，下一章新页；分开的卷号/章号与副题合排，保留原书精排、卷后正文和偏移。页脚在后续页继续显示实际章名，仅有章号时不再显示为空。
+- Both boards exclude front matter from reader heading styles. Reader-generated volume dividers center on a separate page, chapters start afresh, and adjacent number/subtitle blocks compose together while retaining authored layouts, intervening prose and offsets. Continuation-page footers resolve the current chapter and keep number-only labels.
+- 阅读设置里的「全屏沉浸」改名为「关闭上下状态栏」，保留原有开关行为。
+- Rename the reader's immersive toggle to “Hide top and bottom bars” without changing its behavior.
+
+- S31 普通翻页提前灰边的有效驱动，保留完整灰阶与脉冲数量；水波纹只扫描正文，状态栏与进度单独局刷。进入阅读和目录返回正文统一一次黑白全刷，保留首帧灰阶。默认 VCOM 改为 −1500 mV。
+- S31 ordinary turns advance gray-edge drive without reducing gray levels or pulse counts. Ripple scans only the body, with independent local status/progress updates. Reader entry and TOC return use one black/white full refresh with source grays retained. Default VCOM is −1500 mV.
+
+- S31 普通阅读采用 37 相 GL16 差分，水波纹使用完整灰阶与八带逐拍启动；背景和插图使用独立灰阶派生表。阅读工具栏和设置改为局部差分，滑块在自身区域刷新，收起面板后统一文字墨度。保留有效的逐机 VCOM 标定。主页和系统设置列表的刷新保持原样。
+- S31 ordinary reading uses 37-phase GL16 differences, with full-gray ripple launching eight bands one per tick and separate background/illustration derivatives. Reader tools and settings update locally, sliders refresh their own rectangles, and dismissal normalizes text ink. Valid per-device VCOM calibration is retained. Main-page and system-list refresh profiles remain unchanged.
+
+- S31 构建补齐双核 Flash 缓存保护，在另一核报告就绪前暂停分支预测，缓存恢复后再开启，修复启动读取设置时的缓存异常和循环重启。
+- S31 builds guard the parked core's branch predictor before flash cache suspension and restore it after cache resumes, addressing cache panics and reboot loops while loading settings.
+
 ## 本地测试 / Local test — 2026-11-17
 
 - 设置「连接与时间」新增设备同步：两台设备进入同一页，一台选发射、一台选接收，扫描后自动选中对端并显示四位配对码；接收端确认后经 ESP-NOW 分片同步排版、阅读进度、书签与已存 WiFi，整段校验通过才写入并重启。

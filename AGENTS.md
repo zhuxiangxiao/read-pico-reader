@@ -8,6 +8,17 @@ Agent entry for this tree. Humans can read it too. Product overview, hardware, p
 
 Newcomers (human or agent): read [docs/ONBOARDING.md](docs/ONBOARDING.md). Taking over an in-flight task: read [docs/HANDOFF.md](docs/HANDOFF.md) first.
 
+## S31阅读GL16 / S31 reader GL16
+
+阅读器题头只用于核实的正文，目录/版权/序言等书前资料不套用。明确卷名独占页并在可见正文区居中，紧邻卷号/章号的副题合排；下一章新页，保留卷后引文和原文偏移。精排EPUB仍优先原书样式。两板页脚按当前正文位置找章名，只有章号时保留章号，不能剥成空文字。
+Reader headings apply only to verified body sections, not contents/copyright/preface material. Explicit reader-styled volumes center on their own page, paired subtitles compose with their numbers, and subsequent chapters start anew without dropping epigraphs or source offsets. Authored EPUB layouts retain priority. Both boards resolve footer names from the current text position and retain number-only labels.
+
+S31普通文字使用独立37相GL16，前移剥除擦白后留下空等的有效序列，保留脉冲顺序/数量和16灰。水波纹八带逐拍启动，纯文字及图文只扫描正文；背景29相、插图33相。状态栏/页脚和阅读工具栏/设置局刷，滑块区域定稿，收起面板37相归一。进入阅读、目录返回正文、阅读回主页正常路径各一次黑白全刷，不叠加盲清。默认VCOM为−1500mV，保留有效逐机标定；不写永久OTP/eFuse。主页切换、系统列表及PICO维持各自原有刷新。
+S31 ordinary text uses private37-phase GL16 with active sequences advanced past erase-stripped leading holds, retaining pulse order/counts and16 grays. Ripple launches eight compact bands and scans only the text/image body, with29-phase background and33-phase illustration derivatives. Status/footer and reader tools/settings update locally, sliders settle their rectangles, and dismissal normalizes in37 phases. Healthy reader entry, TOC return and exit to Home each use one black/white full refresh without blind preclears. Default VCOM is−1500mV with valid device calibration retained; never write permanent OTP/eFuses. Retain main switches, system lists and PICO refresh profiles.
+
+用户2026-11-18已授权将上述已验证本地修复同步到GitHub源码。本地S31版本沿用RC114；正式固件、官网与OTA发布另按发布流程处理。
+The user authorizes uploading these validated local fixes to GitHub source on2026-11-18. Local S31 builds remainRC114; formal firmware, website and OTA publication follow the separate release workflow.
+
 ## 双板正式发布 / Dual-board official publication
 
 用户2026-11-04明确要求推送Pico与S31在线刷机。本轮正式发布Pico rc105/S31 rc110：包括当前全部已验证本地功能，S31以8845为基准，Pico保留原灰阶字集与Moku波形。同步源码、GitHub Release、kiikoread.com刷机/TF下载及既有Pages OTA；归档原Pico rc104/S31 rc109并保留所有历史原字节。此授权取代此前对应仅本地、不上传/发布限制；不自动刷写设备、不修改供电/VCOM/分区。
@@ -96,6 +107,8 @@ User2026-11-01 explicitly authorizes online publication: release Pico rc104/S31 
 
 用户2026-11-01追加：Pico普通翻页的信息栏对齐水波纹/速读，正常正文和图文翻页只输出阅读内容区域，顶部状态/标题和底部章节进度不再跟随擦白；页脚停下800ms后局刷。此要求取代PR55/62在Pico的信息栏合并范围，正文派生波形、手动/周期/入书清理及S31保持。
 User2026-11-01 follow-up: align Pico ordinary metadata with ripple/Fast BW. Ordinary text/image turns present the reading-content region, excluding top status/title and bottom chapter/progress; update the footer after800ms idle. This supersedes PR55/62's Pico metadata scan extent, retaining body waveforms, manual/periodic/entry cleanup and S31 behavior.
+用户2026-11-18改为：Pico普通翻页整屏推白，状态栏与页脚一起擦，重推黑移到波形最后一段；图文页仍按其原范围。
+User2026-11-18 revision: Pico ordinary turns push white across the whole panel, metadata included, with the black re-drive last in the waveform; image pages retain their previous extent.
 
 用户2026-11-01追加：底部上滑回到非全屏并显示底部工具栏；顶部先显示时间、签名、电量，下一行恢复返回键、书名及收藏操作。进入书籍的非全屏也使用此布局；上方返回/书名/收藏与底部工具栏共同出现，进入全屏共同收起，所有工具栏入口先退出全屏。全屏关闭沉浸时仍只有状态栏，不显示书名。
 User2026-11-01 follow-up: bottom swipes return to standard mode with bottom tools, a time/signature/battery row, then Back/book title/Favorite. Standard book entry shares this layout. Back/title/Favorite and bottom tools appear together and hide together on fullscreen entry; every tools entry first leaves fullscreen. Nonimmersive fullscreen retains its status-only header.
