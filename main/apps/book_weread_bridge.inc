@@ -87,11 +87,16 @@ static void wr_cache_forward_toggle(app_ctx_t *ctx){
     // 开关反映“整本向后补齐是否启用”：默认启用；点一次暂停，再点一次立即恢复并清掉失败/退避/空间暂停。
     // The toggle mirrors whether whole-book fill is enabled: on by default, one tap pauses and the next resumes
     // eagerly after clearing automatic-prefetch failures/backoff/space pauses.
-    bool on=!weread_reader_cache_fill_enabled();
+    bool enabled=weread_reader_cache_fill_enabled();
+    bool stalled=enabled&&weread_reader_cache_forward_stalled();
+    // 启用但已因连续失败/空间暂停时，一次点击直接重新触发，不必先暂停再恢复。
+    // When enabled but stalled by failures/low space, one tap retriggers instead of requiring pause then resume.
+    bool on=!enabled||stalled;
     weread_reader_cache_forward_set(on);
     unsigned cached=0,total=0;
     weread_reader_cached_progress(&cached,&total);
-    const char *text=on?(total&&cached>=total?"本书已缓存完":"开始缓存后续章节"):"已暂停后台缓存";
+    const char *text=on?(total&&cached>=total?"本书已缓存完":
+        stalled?"重新开始缓存后续章节":"开始缓存后续章节"):"已暂停后台缓存";
     copy_text(s_reader_notice,sizeof(s_reader_notice),text);
     s_reader_notice_until=ctx->now_ms+2000;
     // 页脚下一次采样会看到缓存状态变化；这里只标记一次待刷新，避免依赖恰好快照。

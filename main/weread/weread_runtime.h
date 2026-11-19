@@ -118,3 +118,6 @@ bool weread_reader_cache_forward(void);
 /// 整本向后补齐当前是否启用（默认启用；暂停后为false）。工具栏开关应显示此状态。
 /// Whether whole-book forward fill is enabled (on by default, false after a pause). The toolbar toggle mirrors this.
 bool weread_reader_cache_fill_enabled(void);
+/// 自动补齐是否因连续失败或空间不足停住（用户开关仍启用）。供工具栏把一次点击变成重新触发。
+/// Whether automatic fill stalled on repeated failures or low space while the switch is still enabled.
+bool weread_reader_cache_forward_stalled(void);

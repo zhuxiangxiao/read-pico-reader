@@ -186,6 +186,9 @@ static bool in_worker(void) {
 }
 static esp_err_t connect_network(void) {
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+    // 每次建连尝试都从干净状态开始：前一次建连超时不能阻止后续 HTTP 超时的静默重试。
+    // Start every connect attempt clean: an earlier connect timeout must not block a later HTTP timeout replay.
+    s_connect_timed_out = false;
 #if defined(ESP_PLATFORM)
     read_pico_transfer_status_t status;
     for(unsigned i=0;i<150 && !cancelled(NULL);++i){
@@ -1394,6 +1397,11 @@ void weread_reader_cache_forward_set(bool on){
 }
 bool weread_reader_cache_forward(void){return s_reader.cache_forward;}
 bool weread_reader_cache_fill_enabled(void){return !s_reader.cache_forward_off;}
+bool weread_reader_cache_forward_stalled(void){
+    // 自动预取的连续失败/空间暂停会让开关仍亮却不再派发；工具栏据此把一次点击变成“立即重试”。
+    // Automatic-prefetch failure/space pauses leave the switch lit but idle; the toolbar uses this to make one tap retry.
+    return s_reader.prefetch_failures>=3||s_reader.storage_blocked;
+}
 bool weread_reader_caching(void){return weread_runtime_busy()&&s_work.job==WR_JOB_PREFETCH&&!strcmp(s_work.id,s_reader.id);}
 bool weread_reader_poll_cloud_jump(const char *uri,size_t *chapter_out,uint32_t *offset_out){
     if(!book_path_is_weread(uri)||!chapter_out||!offset_out||!atomic_load(&s_cloud_jump_ready)||

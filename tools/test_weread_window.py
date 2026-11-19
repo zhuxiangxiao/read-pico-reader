@@ -18,6 +18,6 @@ subprocess.run([os.environ.get('CC','/usr/bin/cc'),'-std=c11','-pthread','-D_DEF
     '-Imain','-Imain/book','-Imain/weread','-Itools/weread_stubs',*sources,'-lz','-lm','-o',str(out/'test')],cwd=root,check=True)
 env=dict(os.environ,ASAN_OPTIONS='abort_on_error=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
 for mode in ('binding','version-zero','window','space','fail','cancel','jump',
-             'stage','retry','manual','chapter-cache'):
+             'stage','retry','manual','adopt-stage','chapter-cache'):
     with tempfile.TemporaryDirectory(prefix=f'weread-window-{mode}-') as cache:
         subprocess.run([str(out/'test'),cache,str(out),mode],cwd=root,env=env,check=True,timeout=25)

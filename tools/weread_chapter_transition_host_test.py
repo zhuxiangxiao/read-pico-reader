@@ -25,8 +25,9 @@ typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t
 static struct {bool pending,started,committing,last_page;esp_err_t error;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
 static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,cached_flag,prefetch_busy,cloud_jump_ready,cloud_jump_committed;
 static bool stage_ready;static char stage_text[64];static EpdRect s_area;static int s_mode,renders;
+static int stage_kind;static uint64_t stage_bytes;
 typedef enum {WEREAD_STAGE_NONE=0,WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE,WEREAD_STAGE_RETRY} weread_stage_t;
-static bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){(void)bytes;if(!stage_ready)return false;*stage=WEREAD_STAGE_TOC;return true;}
+static bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){if(!stage_ready)return false;*stage=(weread_stage_t)stage_kind;if(bytes)*bytes=stage_bytes;return true;}
 static bool weread_reader_stage_text(char *out,size_t cap){if(!stage_ready)return false;snprintf(out,cap,"%s",stage_text);return true;}
 static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++renders;}
 static size_t cloud_jump_ch;static uint32_t cloud_jump_off,adopted_uid;
@@ -73,6 +74,11 @@ static void complete(int err){busy=false;done=true;ready.error=err;}
 int main(void){
  app_ctx_t ctx={.now_ms=1000,.fb=(uint8_t*)1};
  busy=true;assert(wr_chapter_queue(&ctx,3,0,false,NULL,SIZE_MAX));
+ // 未启动本页异步任务的阶段提示不得借用其他任务的文案。
+ // A stage notice must not be adopted while this page's asynchronous job has not started.
+ stage_ready=true;snprintf(stage_text,sizeof(stage_text),"下载章节正文…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!strcmp(s_reader_notice,"正在准备章节…"));
+ stage_ready=false;
  assert(s_wr_jump.pending&&!starts&&!loads&&s_chapter==2&&s_page==7);
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!starts);
  busy=false;assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&starts==1&&busy);
@@ -86,8 +92,23 @@ int main(void){
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!strcmp(s_reader_notice,"同步阅读进度…"));
  ctx.consumed=false;assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+2);
  assert(!strcmp(s_reader_notice,"下载章节正文…"));
+ // 同阶段 KB 文案按 3 秒合并；触摸/消费态在限速写入之前返回，不能吞掉下一次更新。
+ // Same-stage KB labels coalesce to 3 s; touch/consumed return before the limiter is armed so the next update survives.
+ stage_kind=WEREAD_STAGE_CHAPTER;snprintf(stage_text,sizeof(stage_text),"正在下载章节 32 KB…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+3);
+ assert(!strcmp(s_reader_notice,"正在下载章节 32 KB…"));
+ ctx.now_ms=5000;touch_t touch={.touched=true};ctx.touch=&touch;
+ snprintf(stage_text,sizeof(stage_text),"正在下载章节 384 KB…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+3);
+ touch.touched=false;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+4);
+ assert(!strcmp(s_reader_notice,"正在下载章节 384 KB…"));
+ snprintf(stage_text,sizeof(stage_text),"正在下载章节 416 KB…");
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+4);
+ ctx.touch=NULL;ctx.now_ms=9000;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&renders==renders_before+5);
  stage_ready=false;snprintf(stage_text,sizeof(stage_text),"解析章节…");
- assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+2);
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+5);
  complete(WEREAD_ERR_PURCHASE);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
  assert(!s_wr_jump.pending&&!loads&&!moves&&s_chapter==2&&s_page==7&&strstr(s_reader_notice,"手机"));
  char anchor[]="owned-anchor";assert(wr_chapter_queue(&ctx,3,0,false,anchor,SIZE_MAX));anchor[0]='X';

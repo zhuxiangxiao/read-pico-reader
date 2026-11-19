@@ -24,6 +24,7 @@ static atomic_bool gated,entered;
 static bool capture_stages;
 static unsigned stage_log[16],stage_log_count;
 static unsigned fail_mode,fail_uid,fail_attempts;
+static unsigned adopt_test_uid;
 static unsigned toc_requests;
 static bool fail_toc_request;
 static size_t last_job_idx;
@@ -100,6 +101,11 @@ static esp_err_t download(const char *url,const char *headers,FILE *out,size_t l
         assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_RETRY&&!bytes);
         assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"网络超时，正在重试…"));
         record_stage();
+        // 重试已重新进入字节流：KB 进度覆盖“正在重试”，大包不会全程停在重试文案。
+        // The replay is streaming again: KB progress replaces the retry label instead of staying frozen.
+        weread_client_report_download_progress(64u*1024u,false);
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_CHAPTER&&bytes==64u*1024u);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在下载章节 64 KB…"));
     }else if(capture_stages&&uid==11&&!fail_uid){
         weread_stage_t stage;uint64_t bytes;char label[64];
         assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_CHAPTER&&!bytes);
@@ -122,6 +128,19 @@ static esp_err_t download(const char *url,const char *headers,FILE *out,size_t l
     if((uint32_t)strtoul(v+13,NULL,10)!=server_version){
         const char *error="{\"errcode\":-2063}";info->status=499;info->bytes=strlen(error);
         assert(fwrite(error,1,info->bytes,out)==info->bytes);return ESP_OK;
+    }
+    if(adopt_test_uid==uid){
+        // 模拟阅读页在预取下载中接管：字节回调必须发布 CHAPTER 阶段与 KB 文案。
+        // Simulate the reader adopting an in-flight prefetch: the byte callback must publish CHAPTER + KB.
+        assert(weread_runtime_prefetch_active("window_book",uid));
+        weread_runtime_prefetch_adopt(uid);
+        weread_client_report_download_progress(200u*1024u,false);
+        weread_stage_t stage;uint64_t bytes;char label[64];
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_CHAPTER&&bytes==200u*1024u);
+        assert(weread_reader_stage_text(label,sizeof(label))&&!strcmp(label,"正在下载章节 200 KB…"));
+        weread_client_report_download_progress(0,true);
+        assert(weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_PARSE);
+        adopt_test_uid=0;
     }
     char path[1024];snprintf(path,sizeof(path),"%s/%u-v%u.zip",fixtures,uid,server_version);FILE *f=fopen(path,"rb");assert(f);
     info->status=200;strcpy(info->encrypt_key,"pDB9WzFl/4YFmRnIZe6L7tJOiLv+dZQ+ZqkP6U6I99g=");
@@ -239,14 +258,26 @@ int main(int argc,char **argv){
     }else if(!strcmp(mode,"space")){
         space=0;assert(step(0,now++)==WR_JOB_PREFETCH&&weread_reader_storage_blocked()&&downloads==1);
         for(unsigned i=0;i<12;++i){now+=16000;(void)step(0,now);}assert(downloads==1);
-        puts("PASS: insufficient space pauses automatic window without touching cached chapter");
+        // 自动预取已被空间暂停：开关仍启用但处于 stalled 态，一次“恢复”即重新派发（再次被空间拦下）。
+        // Automatic prefetch is space-stalled: still enabled but stalled, and one resume retriggers it (blocked again).
+        assert(weread_reader_cache_fill_enabled()&&weread_reader_cache_forward_stalled());
+        weread_reader_cache_forward_set(true);
+        assert(weread_reader_cache_fill_enabled()&&!weread_reader_cache_forward_stalled());
+        assert(step(0,now++)==WR_JOB_PREFETCH&&weread_reader_storage_blocked()&&downloads==1);
+        puts("PASS: insufficient space pauses automatic window without touching cached chapter and one resume retriggers a blocked fill");
     }else if(!strcmp(mode,"fail")){
         offline=true;for(unsigned i=0;i<3;++i){
             while(step(0,now++)!=WR_JOB_PREFETCH){assert(now<2500+(i+1)*20000);}
             assert(downloads==2+i);now+=16000;
         }
         for(unsigned i=0;i<12;++i){now+=16000;(void)step(0,now);}assert(downloads==4);
-        puts("PASS: only three actual download failures per unchanged window");
+        // 连续三次实际失败后自动补齐处于 stalled；一次恢复清空失败计数并重新派发。
+        // After three actual failures the automatic fill is stalled; one resume clears the counter and dispatches again.
+        assert(weread_reader_cache_fill_enabled()&&weread_reader_cache_forward_stalled());
+        weread_reader_cache_forward_set(true);
+        assert(!weread_reader_cache_forward_stalled());
+        assert(step(0,now++)==WR_JOB_PREFETCH&&downloads==5);
+        puts("PASS: only three actual download failures per unchanged window and one resume clears the failure latch");
     }else if(!strcmp(mode,"cancel")){
         for(unsigned i=0;i<4;++i){
             atomic_store(&gated,true);atomic_store(&entered,false);
@@ -378,6 +409,15 @@ int main(int argc,char **argv){
         assert(step(6,t+2400)==WR_JOB_INIT);
         assert(step(6,t+2800)==WR_JOB_PREFETCH&&last_job_error==ESP_OK&&last_job_idx==7&&downloads==before+4);
         puts("PASS: manual forward caching ignores the1s idle window, keeps the automatic pre-read, pauses on input, and explicit off suppresses the whole-book fill only");
+    }else if(!strcmp(mode,"adopt-stage")){
+        // 阅读页接管下一章预取时，下载进度以 CHAPTER 阶段 + KB 文案呈现；完成后回到 PARSE 并被任务结束清除。
+        // Adopting the next-chapter prefetch presents CHAPTER + KB from byte callbacks, then PARSE, cleared at job end.
+        adopt_test_uid=27;
+        assert(step(0,now++)==WR_JOB_PREFETCH&&downloads==2);
+        assert(adopt_test_uid==0);
+        weread_stage_t stage=WEREAD_STAGE_CHAPTER;uint64_t bytes=1;
+        assert(!weread_reader_stage(&stage,&bytes)&&stage==WEREAD_STAGE_NONE);
+        puts("PASS: adopting an in-flight prefetch publishes CHAPTER byte progress and clears the stage at job end");
     }else if(!strcmp(mode,"chapter-cache")){
         const char *uri="weread://window_book";
         unsigned cached=0,total=0;

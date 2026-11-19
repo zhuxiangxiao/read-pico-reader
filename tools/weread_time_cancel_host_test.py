@@ -136,6 +136,9 @@ int main(void){
  reset();atomic_store(&s_deadline,1800);assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==1800000&&syncs==1);
  reset();sync_error=ESP_ERR_TIMEOUT;assert(connect_network()==ESP_ERR_TIMEOUT);
  reset();assert(connect_network()==ESP_OK&&syncs==1&&wall==1800000000);assert(connect_network()==ESP_OK&&syncs==1);
+ // 成功建连清除超时标记：后续 HTTP 瞬时超时仍可静默重试。
+ // A successful connect clears the timeout marker so a later HTTP timeout can still replay.
+ reset();s_connect_timed_out=true;assert(connect_network()==ESP_OK&&!s_connect_timed_out);
  reset();atomic_store(&s_cancel,true);assert(connect_network()==ESP_ERR_INVALID_STATE&&!syncs);
  reset();connect_starting=true;wall=1800000000;assert(connect_network()==ESP_OK&&started&&s_owns_network&&s_network_active==100);
  mono+=600000;assert(connect_network()==ESP_OK&&s_network_active==700&&!syncs);

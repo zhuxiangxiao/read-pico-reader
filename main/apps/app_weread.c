@@ -320,8 +320,8 @@ static void render(app_ctx_t *ctx,uint8_t *fb) {
                 // family, so a constant family marker would drop every sibling book's raster.
                 raster_key=(metalio_cover_key_t){{
                     UINT64_C(0x5333315752726173) ^ raster_book,
-                    book->cover_key,
                     raster_book,
+                    book->cover_key,
                     ((uint64_t)s_cover_cache_epoch<<32)|((uint32_t)display_style()<<1)|(uint32_t)binary,
                     s_owner,
                     (uint64_t)(unsigned)epd_get_rotation()<<32|((unsigned)cover.width<<16)|(unsigned)cover.height,
