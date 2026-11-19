@@ -3,7 +3,7 @@
  * WeRead secure HTTPS client with sensitive header stripping and renewal replay.
  */
 // 网络和缓存按体积优化，保留双板原应用分区。/ Optimize network/cache code for size within the original app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_client.h"
@@ -31,16 +31,23 @@ static radio_ps_guard_t radio_ps_enter(void) {
 static void radio_ps_leave(radio_ps_guard_t *g) {
     if (g && g->restore) { (void)esp_wifi_set_ps(g->previous); g->restore = false; }
 }
+static void http_pool_close(void);
 static bool s_global_ps_restore;
 static wifi_ps_type_t s_global_ps_prev = WIFI_PS_MIN_MODEM;
 void weread_client_set_radio_awake(bool awake) {
     if (awake) {
-        if (!s_global_ps_restore && esp_wifi_get_ps(&s_global_ps_prev) == ESP_OK &&
-            s_global_ps_prev != WIFI_PS_NONE && esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK)
+        wifi_ps_type_t cur = WIFI_PS_MIN_MODEM;
+        if (esp_wifi_get_ps(&cur) == ESP_OK && cur != WIFI_PS_NONE &&
+            esp_wifi_set_ps(WIFI_PS_NONE) == ESP_OK && !s_global_ps_restore) {
+            s_global_ps_prev = cur;
             s_global_ps_restore = true;
-    } else if (s_global_ps_restore) {
-        (void)esp_wifi_set_ps(s_global_ps_prev);
-        s_global_ps_restore = false;
+        }
+    } else {
+        http_pool_close();
+        if (s_global_ps_restore) {
+            (void)esp_wifi_set_ps(s_global_ps_prev);
+            s_global_ps_restore = false;
+        }
     }
 }
 #else
@@ -442,19 +449,171 @@ static uint64_t client_now_ms(void) {
     return (uint64_t)now.tv_sec*1000+(uint64_t)now.tv_nsec/1000000;
 #endif
 }
+#if defined(ESP_PLATFORM)
+#define HTTP_POOL_IDLE_MS 25000u
+static struct {
+    esp_http_client_handle_t client;
+    char host[128];
+    char peer[48];
+    int port;
+    uint64_t last_used_ms;
+} s_pool;
+static void http_pool_close(void) {
+    http_lock();
+    esp_http_client_handle_t c = s_pool.client;
+    memset(&s_pool, 0, sizeof(s_pool));
+    http_unlock();
+    if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
+}
+static bool http_pool_peer(const char *host, int port, char peer[48]) {
+    bool ok = false;
+    esp_http_client_handle_t stale = NULL;
+    uint64_t now = client_now_ms();
+    http_lock();
+    if (s_pool.client) {
+        if (now - s_pool.last_used_ms >= HTTP_POOL_IDLE_MS ||
+            esp_http_client_get_state(s_pool.client) < HTTP_STATE_CONNECTED) {
+            stale = s_pool.client;
+            memset(&s_pool, 0, sizeof(s_pool));
+        } else if (s_pool.port == port && !strcasecmp(s_pool.host, host)) {
+            memcpy(peer, s_pool.peer, sizeof(s_pool.peer));
+            ok = true;
+        }
+    }
+    http_unlock();
+    if (stale) { esp_http_client_close(stale); esp_http_client_cleanup(stale); }
+    return ok;
+}
+#endif
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
 #include "weread_http_poll.inc"
 #endif
+#if defined(ESP_PLATFORM)
+static bool http_pool_eligible(const char *url) {
+    if (!weread_client_is_trusted_url(url)) return false;
+    const char *auth = strstr(url, "://");
+    const char *path = auth ? strchr(auth + 3, '/') : NULL;
+    if (!path) return true;
+    if (!strncmp(path, "/weblogin", 9) && (path[9] == 0 || path[9] == '?')) return false;
+    if (!strncmp(path, "/web/getlogininfo", 17) && (path[17] == 0 || path[17] == '?')) return false;
+    return true;
+}
+static esp_http_client_handle_t http_pool_take(const char *url, http_poll_t *poll, http_event_handle_cb cb, void *cb_ctx) {
+    if (!poll || !http_pool_eligible(url)) return NULL;
+    esp_http_client_handle_t client = NULL, stale = NULL;
+    uint64_t now = client_now_ms();
+    http_lock();
+    if (s_pool.client) {
+        if (now - s_pool.last_used_ms >= HTTP_POOL_IDLE_MS ||
+            esp_http_client_get_state(s_pool.client) < HTTP_STATE_CONNECTED) {
+            stale = s_pool.client;
+            memset(&s_pool, 0, sizeof(s_pool));
+        } else if (s_pool.port == poll->port && !strcasecmp(s_pool.host, poll->host)) {
+            client = s_pool.client;
+            memcpy(poll->peer, s_pool.peer, sizeof(poll->peer));
+            memset(&s_pool, 0, sizeof(s_pool));
+        }
+    }
+    http_unlock();
+    if (stale) { esp_http_client_close(stale); esp_http_client_cleanup(stale); }
+    if (!client) return NULL;
+    size_t cap = strlen(poll->path) + (poll->query ? strlen(poll->query) : 0) + 96;
+    char *pool_url = wr_alloc(cap);
+    if (!pool_url) { http_cleanup(client); return NULL; }
+    bool v6 = strchr(poll->peer, ':') != NULL;
+    int n = poll->query
+        ? snprintf(pool_url, cap, "https://%s%s%s:%d%s?%s", v6 ? "[" : "", poll->peer, v6 ? "]" : "", poll->port, poll->path, poll->query)
+        : snprintf(pool_url, cap, "https://%s%s%s:%d%s", v6 ? "[" : "", poll->peer, v6 ? "]" : "", poll->port, poll->path);
+    esp_err_t err = (n > 0 && (size_t)n < cap) ? esp_http_client_set_url(client, pool_url) : ESP_ERR_INVALID_SIZE;
+    free(pool_url);
+    if (err != ESP_OK) { http_cleanup(client); return NULL; }
+    static const char *const k_clear_hdrs[] = {
+        "Content-Type", "Content-Length", "Transfer-Encoding", "Accept",
+        "Cookie", "Authorization", "vid", "accessToken", "Origin",
+        "Referer", "User-Agent", "CLIENT_TYPE", "X-Is-Serverside", "fingerprint"
+    };
+    for (size_t i = 0; i < sizeof(k_clear_hdrs) / sizeof(*k_clear_hdrs); ++i)
+        (void)esp_http_client_delete_header(client, k_clear_hdrs[i]);
+    poll->connections = 0;
+    poll->header_restarts = 0;
+    poll->connected = true;
+    poll->error = ESP_OK;
+    poll->event_handler = cb;
+    poll->event_ctx = cb_ctx;
+    esp_http_client_set_event_handler(client, http_poll_event);
+    esp_http_client_set_user_data(client, poll);
+    return client;
+}
+static void http_pool_put(const char *url, esp_http_client_handle_t client, http_poll_t *poll, bool ok) {
+    if (!client) return;
+    size_t hlen = poll ? strlen(poll->host) : 0;
+    if (!ok || !poll || !hlen || hlen >= sizeof(s_pool.host) || !http_pool_eligible(url) ||
+        weread_client_cancelled() || esp_http_client_get_state(client) < HTTP_STATE_CONNECTED ||
+        !esp_http_client_is_persistent_connection(client) ||
+        !esp_http_client_is_complete_data_received(client)) {
+        http_cleanup(client);
+        return;
+    }
+    esp_http_client_set_event_handler(client, NULL);
+    esp_http_client_set_user_data(client, NULL);
+    http_lock();
+    if (s_active_http == client) s_active_http = NULL;
+    esp_http_client_handle_t evicted = s_pool.client;
+    memset(&s_pool, 0, sizeof(s_pool));
+    s_pool.client = client;
+    memcpy(s_pool.host, poll->host, hlen + 1);
+    memcpy(s_pool.peer, poll->peer, sizeof(s_pool.peer));
+    s_pool.port = poll->port;
+    s_pool.last_used_ms = client_now_ms();
+    http_unlock();
+    if (evicted && evicted != client) { esp_http_client_close(evicted); esp_http_client_cleanup(evicted); }
+}
+#endif
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-static void request_timing(const char *url,const uint64_t phase[7],esp_err_t result,int status,size_t bytes) {
+__attribute__((noinline)) static esp_err_t apply_headers(esp_http_client_handle_t client, const char *headers, bool strict_size) {
+    if (!headers) return ESP_OK;
+    const char *p = headers;
+    while (*p) {
+        const char *line_start = p;
+        while (*p && *p != '\n') p++;
+        const char *line_end = p;
+        if (*p == '\n') p++;
+
+        const char *k_start = line_start;
+        while (k_start < line_end && (*k_start == ' ' || *k_start == '\t')) k_start++;
+        const char *colon = k_start;
+        while (colon < line_end && *colon != ':') colon++;
+        if (colon < line_end) {
+            char k[128], v[1024];
+            const char *key_end = colon;
+            while (key_end > k_start && (*(key_end - 1) == ' ' || *(key_end - 1) == '\t')) key_end--;
+            size_t klen = (size_t)(key_end - k_start);
+
+            const char *val_start = colon + 1;
+            while (val_start < line_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
+            const char *val_end = line_end;
+            while (val_end > val_start && (*(val_end - 1) == '\r' || *(val_end - 1) == ' ' || *(val_end - 1) == '\t')) val_end--;
+            size_t vlen = (size_t)(val_end - val_start);
+
+            if (strict_size && (klen >= sizeof(k) || vlen >= sizeof(v))) return ESP_ERR_INVALID_SIZE;
+            if (klen >= sizeof(k)) klen = sizeof(k) - 1;
+            if (vlen >= sizeof(v)) vlen = sizeof(v) - 1;
+            memcpy(k, k_start, klen); k[klen] = '\0';
+            memcpy(v, val_start, vlen); v[vlen] = '\0';
+            esp_http_client_set_header(client, k, v);
+        }
+    }
+    return ESP_OK;
+}
+static void request_timing(const char *url,const uint64_t phase[7],esp_err_t result,int status,size_t bytes,bool reused) {
     static unsigned sequence,native,web,auth;
     const char *base=weread_client_get_base_url();
     unsigned route=strstr(url,"/weblogin")?3:!strncmp(url,base,strlen(base))?1:2;
     if(route==1)++native;else if(route==3)++auth;else ++web;
     // connect包含DNS/TCP/TLS；不要把SDK一次连接事件解释成三个独立指标。
     // Connect includes DNS/TCP/TLS; one SDK event cannot separate those stages.
-    ESP_LOGI("weread","HTTP timing n=%u route=%u native=%u web=%u auth=%u network=%u dns=%u connect=%u response=%u body=%u cleanup=%u total=%u bytes=%u status=%d result=%d",
-        ++sequence,route,native,web,auth,(unsigned)(phase[1]-phase[0]),phase[2]?(unsigned)(phase[2]-phase[1]):0,(unsigned)(phase[3]-(phase[2]?phase[2]:phase[1])),
+    ESP_LOGI("weread","HTTP timing n=%u route=%u native=%u web=%u auth=%u reused=%u network=%u dns=%u connect=%u response=%u body=%u cleanup=%u total=%u bytes=%u status=%d result=%d",
+        ++sequence,route,native,web,auth,(unsigned)reused,(unsigned)(phase[1]-phase[0]),phase[2]?(unsigned)(phase[2]-phase[1]):0,(unsigned)(phase[3]-(phase[2]?phase[2]:phase[1])),
         (unsigned)(phase[4]-phase[3]),(unsigned)(phase[5]-phase[4]),(unsigned)(phase[6]-phase[5]),
         (unsigned)(phase[6]-phase[0]),(unsigned)bytes,status,(int)result);
 }
@@ -492,84 +651,73 @@ static esp_err_t weread_client_dispatch_raw(
 #if !defined(ESP_PLATFORM)
     if (url_path && !strncmp(url_path,"/weblogin",9) && !strncmp(url,"http://127.0.0.1:",17)) login=true;
 #endif
-    esp_http_client_config_t config = {
-        .url = url,
-        .timeout_ms = request_timeout_ms(url),
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .disable_auto_redirect = true,
-        .buffer_size_tx = 2048,
-        .event_handler = login_header, .user_data = &login,
-    };
-    http_poll_config(poll,&config);
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        return ESP_FAIL;
-    }
-
-    if (strcasecmp(method, "POST") == 0) {
-        esp_http_client_set_method(client, HTTP_METHOD_POST);
-    } else if (strcasecmp(method, "PUT") == 0) {
-        esp_http_client_set_method(client, HTTP_METHOD_PUT);
-    } else if (strcasecmp(method, "DELETE") == 0) {
-        esp_http_client_set_method(client, HTTP_METHOD_DELETE);
-    } else {
-        esp_http_client_set_method(client, HTTP_METHOD_GET);
-    }
-
-    if (headers) {
-        const char *p = headers;
-        while (*p) {
-            const char *line_start = p;
-            while (*p && *p != '\n') p++;
-            const char *line_end = p;
-            if (*p == '\n') p++;
-
-            const char *k_start = line_start;
-            while (k_start < line_end && (*k_start == ' ' || *k_start == '\t')) k_start++;
-            const char *colon = k_start;
-            while (colon < line_end && *colon != ':') colon++;
-            if (colon < line_end) {
-                char k[128] = {0};
-                char v[512] = {0};
-                const char *key_end = colon;
-                while (key_end > k_start && (*(key_end - 1) == ' ' || *(key_end - 1) == '\t')) key_end--;
-                size_t klen = key_end - k_start;
-                if (klen >= sizeof(k)) klen = sizeof(k) - 1;
-                memcpy(k, k_start, klen);
-
-                const char *val_start = colon + 1;
-                while (val_start < line_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
-                const char *val_end = line_end;
-                while (val_end > val_start && (*(val_end - 1) == '\r' || *(val_end - 1) == ' ' || *(val_end - 1) == '\t')) val_end--;
-                size_t vlen = val_end - val_start;
-                if (vlen >= sizeof(v)) vlen = sizeof(v) - 1;
-                memcpy(v, val_start, vlen);
-
-                esp_http_client_set_header(client, k, v);
-            }
-        }
-    }
-
-    if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
-    // 按流读取含 chunked 的响应；禁止跨域自动重定向凭据。/ Read streamed/chunked bodies; never redirect credentials automatically.
     // 轮询传输仅由worker关闭，避免SDK内部重连与跨线程shutdown的fd复用竞态。
     // The polling worker owns close/reconnect; cancellation polls avoid cross-thread fd reuse races.
 #if defined(ESP_PLATFORM)
     radio_ps_guard_t ps_guard __attribute__((cleanup(radio_ps_leave))) = radio_ps_enter();
     (void)ps_guard;
 #endif
-    http_active(poll?NULL:client);
+    esp_http_client_handle_t client = NULL;
+    esp_err_t err = ESP_OK;
+    bool reused = false;
     size_t body_len = body ? strlen(body) : 0;
-    esp_err_t err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : http_poll_open(client, (int)body_len,poll);
-    phase[3]=client_now_ms();
-    size_t sent = 0;
-    while (err == ESP_OK && sent < body_len) {
-        int n = http_poll_write(client, body + sent, (int)(body_len - sent),poll);
-        if (n <= 0) { err = http_poll_error(poll,ESP_FAIL); break; }
-        sent += (size_t)n;
+    for (unsigned reuse_try = 0; reuse_try < 2; ++reuse_try) {
+#if defined(ESP_PLATFORM)
+        if (reuse_try == 0) {
+            client = http_pool_take(url, poll, login_header, &login);
+            reused = (client != NULL);
+        }
+#endif
+        if (!client) {
+            if (reuse_try > 0 && poll) {
+                http_poll_reset(poll);
+                weread_secure_zero(&s_login_cookies, sizeof(s_login_cookies));
+            }
+            esp_http_client_config_t config = {
+                .url = url,
+                .timeout_ms = request_timeout_ms(url),
+                .crt_bundle_attach = esp_crt_bundle_attach,
+                .disable_auto_redirect = true,
+                .keep_alive_enable = true,
+                .buffer_size = 2048,
+                .buffer_size_tx = 2048,
+                .event_handler = login_header, .user_data = &login,
+            };
+            http_poll_config(poll,&config);
+            client = esp_http_client_init(&config);
+            if (!client) {
+                return ESP_FAIL;
+            }
+        }
+        if (strcasecmp(method, "POST") == 0) {
+            esp_http_client_set_method(client, HTTP_METHOD_POST);
+        } else if (strcasecmp(method, "PUT") == 0) {
+            esp_http_client_set_method(client, HTTP_METHOD_PUT);
+        } else if (strcasecmp(method, "DELETE") == 0) {
+            esp_http_client_set_method(client, HTTP_METHOD_DELETE);
+        } else {
+            esp_http_client_set_method(client, HTTP_METHOD_GET);
+        }
+        (void)apply_headers(client, headers, false);
+        if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
+        http_active(poll?NULL:client);
+        err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : http_poll_open(client, (int)body_len,poll);
+        phase[3]=client_now_ms();
+        size_t sent = 0;
+        while (err == ESP_OK && sent < body_len) {
+            int n = http_poll_write(client, body + sent, (int)(body_len - sent),poll);
+            if (n <= 0) { err = http_poll_error(poll,ESP_FAIL); break; }
+            sent += (size_t)n;
+        }
+        if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+        phase[4]=client_now_ms();
+#if defined(ESP_PLATFORM)
+        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !weread_client_cancelled()) {
+            http_cleanup(client); client = NULL; reused = false; continue;
+        }
+#endif
+        break;
     }
-    if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
-    phase[4]=client_now_ms();
     if (out_status) *out_status = esp_http_client_get_status_code(client);
     const size_t limit = 2u * 1024u * 1024u;
     size_t used = 0, capacity = 4096;
@@ -611,8 +759,14 @@ static esp_err_t weread_client_dispatch_raw(
             (int)err,esp_http_client_get_status_code(client),(unsigned)used,tls,flags);
     }
 #endif
-    phase[5]=client_now_ms();http_cleanup(client);phase[6]=client_now_ms();
-    request_timing(url,phase,err, out_status?*out_status:0,used);
+    phase[5]=client_now_ms();
+#if defined(ESP_PLATFORM)
+    http_pool_put(url,client,poll,err==ESP_OK);
+#else
+    http_cleanup(client);
+#endif
+    phase[6]=client_now_ms();
+    request_timing(url,phase,err, out_status?*out_status:0,used,reused);
     return err;
 #else
     (void)phase;(void)background;return ESP_ERR_INVALID_STATE;
@@ -756,8 +910,13 @@ static esp_err_t weread_client_request_internal(
             } else {
                 // Renewal failed
                 if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED && renew_err == ESP_ERR_INVALID_STATE) {
-                    WR_GUARD;
-                    weread_auth_clear_session();
+                    {
+                        WR_GUARD;
+                        weread_auth_clear_session();
+                    }
+#if defined(ESP_PLATFORM)
+                    http_pool_close();
+#endif
                 }
                 if (out_resp) *out_resp = resp; else free(resp);
                 if (out_len) *out_len = resp_len;
@@ -766,8 +925,13 @@ static esp_err_t weread_client_request_internal(
         } else {
             // Already replayed once and still expired -> abort loop, clear session
             if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED) {
-                WR_GUARD;
-                weread_auth_clear_session();
+                {
+                    WR_GUARD;
+                    weread_auth_clear_session();
+                }
+#if defined(ESP_PLATFORM)
+                http_pool_close();
+#endif
             }
             if (out_resp) *out_resp = resp;
             else if (resp) free(resp);
@@ -919,37 +1083,50 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     http_poll_t *poll __attribute__((cleanup(wr_release)))=NULL;
     esp_err_t prepared=http_poll_prepare(url,s_polling,cancel,ctx,&poll);
     if(prepared!=ESP_OK)return prepared;
-    download_event_t event = {.info = info, .redirect = redirect};
-    esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
-        .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
-        .buffer_size = 2048, .buffer_size_tx = 2048,
-        .event_handler = download_event, .user_data = &event};
-    http_poll_config(poll,&cfg);
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_ERR_NO_MEM;
-    const char *p = headers;
-    while (*p) {
-        const char *end = strchr(p, '\n'); if (!end) end = p + strlen(p);
-        const char *colon = memchr(p, ':', (size_t)(end - p));
-        if (colon) {
-            char key[128], value[1024];
-            size_t k = (size_t)(colon - p);
-            const char *v = colon + 1; while (v < end && (*v == ' ' || *v == '\t')) ++v;
-            size_t n = (size_t)(end - v); if (n && v[n - 1] == '\r') --n;
-            if (k >= sizeof(key) || n >= sizeof(value)) { esp_http_client_cleanup(client); return ESP_ERR_INVALID_SIZE; }
-            memcpy(key, p, k); key[k] = 0; memcpy(value, v, n); value[n] = 0;
-            esp_http_client_set_header(client, key, value);
-        }
-        p = *end ? end + 1 : end;
-    }
-    if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
 #if defined(ESP_PLATFORM)
     radio_ps_guard_t ps_guard __attribute__((cleanup(radio_ps_leave))) = radio_ps_enter();
     (void)ps_guard;
 #endif
-    http_active(poll?NULL:client);
-    esp_err_t err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : http_poll_open(client,0,poll);
-    if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+    download_event_t event = {.info = info, .redirect = redirect};
+    esp_http_client_handle_t client = NULL;
+    esp_err_t err = ESP_OK;
+    bool reused = false; (void)reused;
+    for (unsigned reuse_try = 0; reuse_try < 2; ++reuse_try) {
+        if (reuse_try > 0) {
+            free(*redirect); *redirect = NULL;
+            memset(info, 0, sizeof(*info));
+            event.invalid = false;
+            http_poll_reset(poll);
+        }
+#if defined(ESP_PLATFORM)
+        if (reuse_try == 0) {
+            client = http_pool_take(url, poll, download_event, &event);
+            reused = (client != NULL);
+        }
+#endif
+        if (!client) {
+            esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
+                .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
+                .keep_alive_enable = true,
+                .buffer_size = 2048, .buffer_size_tx = 2048,
+                .event_handler = download_event, .user_data = &event};
+            http_poll_config(poll,&cfg);
+            client = esp_http_client_init(&cfg);
+            if (!client) return ESP_ERR_NO_MEM;
+        }
+        esp_http_client_set_method(client, HTTP_METHOD_GET);
+        if (apply_headers(client, headers, true) != ESP_OK) { http_cleanup(client); return ESP_ERR_INVALID_SIZE; }
+        if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
+        http_active(poll?NULL:client);
+        err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : http_poll_open(client,0,poll);
+        if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+#if defined(ESP_PLATFORM)
+        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !(cancel && cancel(ctx))) {
+            http_cleanup(client); client = NULL; reused = false; continue;
+        }
+#endif
+        break;
+    }
     info->status = esp_http_client_get_status_code(client);
     if (event.invalid) err = ESP_ERR_INVALID_RESPONSE;
     // 跳转体不属于最终文件；URL和凭据仍由外层逐跳校验。/ Redirect bodies are not file data; the outer loop still validates every URL and its credentials.
@@ -979,7 +1156,11 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
             (int)err,info->status,(unsigned)info->bytes,tls,flags);
     }
 #endif
+#if defined(ESP_PLATFORM)
+    http_pool_put(url, client, poll, err == ESP_OK && !(cancel && cancel(ctx)));
+#else
     http_cleanup(client);
+#endif
     return err;
 }
 #endif
@@ -1029,7 +1210,12 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             (info->status != 401 && code != -2013 && code != -2012)) return ESP_OK;
         if (s_background && code != WEREAD_AUTH_ERRCODE_TIMEOUT) return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
-            if (attempt && code == -2013 && !s_background) { WR_GUARD; weread_auth_clear_session(); }
+            if (attempt && code == -2013 && !s_background) {
+                { WR_GUARD; weread_auth_clear_session(); }
+#if defined(ESP_PLATFORM)
+                http_pool_close();
+#endif
+            }
             return ESP_FAIL;
         }
         err = weread_auth_renew_session(NULL);

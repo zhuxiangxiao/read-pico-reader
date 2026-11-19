@@ -13,6 +13,7 @@
 #include "weread_position.h"
 #include "weread_store.h"
 #include <assert.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,9 @@ static bool cancel(void *ctx) { (void)ctx; return stop; }
 static esp_err_t request(const char *url, const char *method, const char *headers, const char *body,
                         char **out, size_t *len, int *status, void *ctx) {
     (void)method; (void)headers; (void)body; (void)ctx; ++requests; *status = 200;
-    const char *r = strstr(url, "/book/chapterInfos") ? mode==8?
+    const char *r = strstr(url, "/book/chapterInfos") ? mode==9?
+        "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":3,\"clearAll\":1,\"bookVersion\":100,\"updated\":[{\"chapterUid\":4,\"chapterIdx\":1,\"title\":\"混淆章\"}]}]}":
+        mode==8?
         "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":2,\"clearAll\":1,\"bookVersion\":100,\"updated\":[{\"chapterUid\":3,\"chapterIdx\":1,\"title\":\"脚注章\"}]}]}":
         "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":100,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"第一章\"}]}]}" :
         "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"测试书\",\"format\":\"epub\",\"bookVersion\":100},{\"bookId\":\"txt_book_202\",\"title\":\"测试 TXT\",\"format\":\"txt\",\"bookVersion\":1}]}";
@@ -43,8 +46,9 @@ static esp_err_t download(const char *url, const char *headers, FILE *out, size_
         mode = 0; return ESP_OK;
     }
     bool txt = strstr(url, "bookType=txt") != NULL;
-    if (!txt) assert(strstr(url, "chapters=0,") || strstr(url, "chapters=2") || strstr(url,"chapters=3"));
+    if (!txt) assert(strstr(url, "chapters=0,") || strstr(url, "chapters=2") || strstr(url,"chapters=3") || strstr(url,"chapters=4"));
     const char *fixture = txt ? "tools/fixtures/weread/sample_txt_chapter1.tar" :
+        mode == 9 ? "build/weread-tests/obfuscated.zip" :
         mode == 8 ? "build/weread-tests/notes.zip" : mode == 7 ? "build/weread-tests/no-version.zip" :
         mode == 4 ? "tools/fixtures/weread/corrupted_crc.zip" :
         mode == 5 ? "tools/fixtures/weread/path_traversal_attack.zip" : "tools/fixtures/weread/sample_epub_chapter0_and_1.zip";
@@ -108,6 +112,65 @@ static void merged_notes(void) {
     }
     html_text_free(&parsed);book_weread_close();mode=0;
 }
+static void scan_fat_tree(const char *dir, bool in_wr, size_t *wr_css_count) {
+    DIR *d = opendir(dir);
+    assert(d);
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        for (const char *p = e->d_name; *p; ++p) assert(!strchr("*:<>|\"?\\", *p));
+        char child[1024];
+        snprintf(child, sizeof(child), "%s/%s", dir, e->d_name);
+        struct stat st;
+        assert(!stat(child, &st));
+        if (S_ISDIR(st.st_mode)) {
+            scan_fat_tree(child, in_wr || !strcmp(e->d_name, "_wr"), wr_css_count);
+        } else if (in_wr) {
+            size_t len = strlen(e->d_name);
+            if (len >= 4 && !strcmp(e->d_name + len - 4, ".css")) ++(*wr_css_count);
+        }
+    }
+    closedir(d);
+}
+static void obfuscated_names(void) {
+    mode = 9;
+    char *body = NULL; size_t len = 0; html_text_t parsed = {0};
+    assert(weread_chapter_load("test_book_101", 4, &body, &len) == ESP_OK);
+    assert(body && strstr(body, "混淆正文"));
+    free(body);
+    char dir[512];
+    assert(weread_chapter_directory("test_book_101", 4, dir, sizeof(dir)) == ESP_OK);
+    size_t wr_css_count = 0;
+    scan_fat_tree(dir, false, &wr_css_count);
+    assert(wr_css_count >= 1);
+    assert(weread_toc_sync("test_book_101") == ESP_OK && book_weread_open("weread://test_book_101") == ESP_OK);
+    assert(book_weread_load(0, NULL, NULL, &parsed) == ESP_OK);
+    assert(parsed.count >= 1 && parsed.note_count == 2 && parsed.image_count == 2);
+    assert(!strncmp(parsed.utf8 + parsed.blocks[0].offset, "混淆正文", strlen("混淆正文")) &&
+           parsed.blocks[0].align == 1);
+    const char *notes[] = {"混淆脚注", "编码脚注"};
+    for (size_t i = 0; i < 2; ++i) {
+        assert(parsed.notes[i].text_len >= strlen(notes[i]) &&
+               !memcmp(parsed.utf8 + parsed.notes[i].text_start, notes[i], strlen(notes[i])));
+    }
+    const char *tags[] = {"OBF1", "OBF2"};
+    for (size_t i = 0; i < 2; ++i) {
+        uint8_t *img = NULL; size_t ilen = 0; bool png = false;
+        assert(book_weread_image(0, parsed.images[i], &img, &ilen, &png) == ESP_OK);
+        assert(png && ilen == 8 + 4 && !memcmp(img + 8, tags[i], 4));
+        free(img);
+    }
+    assert(weread_resource_path(NULL, "Styles/:****::****.css", dir, sizeof(dir)) && !strcmp(dir, "Styles/:****::****.css"));
+    assert(weread_resource_path("Text/ch1.xhtml", "../Images/:****.png", dir, sizeof(dir)) && !strcmp(dir, "Images/:****.png"));
+    assert(weread_resource_path("Text/:****1.xhtml", ":****2.xhtml", dir, sizeof(dir)) && !strcmp(dir, "Text/:****2.xhtml"));
+    assert(!weread_resource_path(NULL, "https://qq.com/x", dir, sizeof(dir)));
+    assert(!weread_resource_path(NULL, "mailto:a@b", dir, sizeof(dir)));
+    assert(!weread_resource_path(NULL, "data:image/png;base64,AA", dir, sizeof(dir)));
+    assert(!weread_resource_path(NULL, "C:escape", dir, sizeof(dir)));
+    assert(!weread_resource_path(NULL, "../escape", dir, sizeof(dir)));
+    assert(!weread_resource_path(NULL, "/abs", dir, sizeof(dir)));
+    html_text_free(&parsed); book_weread_close(); mode = 0;
+}
 int main(void) {
     char root[] = "/tmp/kiiko-weread-chapter-XXXXXX"; assert(mkdtemp(root));
     assert(weread_auth_init(root) == ESP_OK);
@@ -167,6 +230,7 @@ int main(void) {
     mode = 0; assert(weread_chapter_load("txt_book_202", 1, &text, &len) == ESP_OK);
     assert(len && strstr(text, "序章")); free(text);
     merged_notes();
+    obfuscated_names();
     assert(weread_chapter_directory("../escape", 1, dir, sizeof(dir)) == ESP_ERR_INVALID_ARG);
     assert(weread_resource_path("Text/ch1.xhtml", "../Images/cover.jpg", dir, sizeof(dir)) && !strcmp(dir, "Images/cover.jpg"));
     assert(!weread_resource_path(NULL, "../escape", dir, sizeof(dir)));

@@ -5,7 +5,7 @@
  * English: Spool archives to TF, extract in 4 KiB chunks to a private directory and follow info.txt order.
  */
 #if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
-#pragma GCC optimize ("Os")
+#pragma GCC optimize ("Oz")
 #endif
 #include "weread_chapter.h"
 #include "weread_auth.h"
@@ -45,8 +45,108 @@ void weread_chapter_set_cancel(weread_cancel_fn fn, void *ctx) { s_cancel = fn; 
 static bool cancelled(void) { return s_cancel && s_cancel(s_cancel_ctx); }
 static uint64_t number(const cJSON *o, const char *key) { uint64_t n = 0; wr_uint(o, key, &n); return n; }
 
+static bool has_uri_scheme_or_drive(const char *s) {
+    if (!s) return false;
+    unsigned char c = (unsigned char)s[0];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) return false;
+    for (size_t i = 1; s[i]; ++i) {
+        c = (unsigned char)s[i];
+        if (c == ':') return true;
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'))
+            return false;
+    }
+    return false;
+}
+static bool valid_archive_name(const char *name) {
+    if (!name || !*name || name[0] == '/' || strchr(name, '\\') || has_uri_scheme_or_drive(name)) return false;
+    const char *p = name;
+    while (*p) {
+        const char *slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        if (!len || (len == 1 && p[0] == '.') || (len == 2 && p[0] == '.' && p[1] == '.')) return false;
+        if (!slash) break;
+        p = slash + 1;
+        if (!*p) return false;
+    }
+    return true;
+}
+static bool fat_safe_path(const char *p) {
+    if (!p || !*p) return false;
+    size_t total = strlen(p);
+    if (!total || total > 200 || p[0] == '/' || p[total - 1] == '/') return false;
+    const char *seg = p;
+    bool first = true;
+    while (*seg) {
+        const char *slash = strchr(seg, '/');
+        size_t len = slash ? (size_t)(slash - seg) : strlen(seg);
+        if (!len || len > 180) return false;
+        if (first && len == 3 && !strncasecmp(seg, "_wr", 3)) return false;
+        if (seg[0] == '.' || seg[0] == ' ' || seg[len - 1] == '.' || seg[len - 1] == ' ') return false;
+        for (size_t i = 0; i < len;) {
+            uint8_t c = (uint8_t)seg[i];
+            if (c < 0x20u || c == 0x7Fu || strchr("*:<>|\"?\\", (int)c)) return false;
+            if (c < 0x80u) { ++i; continue; }
+            uint8_t n = c < 0xC2u ? 0u : c < 0xE0u ? 2u : c < 0xF0u ? 3u : c < 0xF5u ? 4u : 0u;
+            if (!n || len - i < n) return false;
+            for (uint8_t k = 1; k < n; ++k) if (((uint8_t)seg[i + k] & 0xC0u) != 0x80u) return false;
+            i += n;
+        }
+        if (!slash) break;
+        seg = slash + 1;
+        first = false;
+    }
+    return true;
+}
+static uint64_t fnv64_salted(const char *s, uint64_t seed, uint8_t salt) {
+    uint64_t h = seed;
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p)
+        h = (h ^ (uint8_t)(*p ^ salt)) * UINT64_C(0x100000001b3);
+    return h;
+}
+const char *weread_chapter_storage_path(const char *normalized, char mapped[48]) {
+    if (!normalized || !*normalized || !mapped) return NULL;
+    if (fat_safe_path(normalized)) return normalized;
+    uint64_t h1 = fnv64_salted(normalized, UINT64_C(0xcbf29ce484222325), 0);
+    uint64_t h2 = fnv64_salted(normalized, UINT64_C(0x9e3779b97f4a7c15), 0x5au);
+    size_t n = strlen(normalized);
+    bool css = n >= 4 && !strcasecmp(normalized + n - 4, ".css");
+    snprintf(mapped, 48, "_wr/%016" PRIx64 "%016" PRIx64 "%s", h1, h2, css ? ".css" : "");
+    return mapped;
+}
+static int hex_nibble(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+bool weread_resource_path_decode(const char *normalized, char *out, size_t cap) {
+    if (!normalized || !out || !cap || !strchr(normalized, '%')) return false;
+    char tmp[512];
+    size_t used = 0;
+    bool changed = false;
+    for (size_t i = 0; normalized[i]; ++i) {
+        unsigned char c = (unsigned char)normalized[i];
+        if (c == '%') {
+            int hi = hex_nibble((unsigned char)normalized[i + 1]);
+            int lo = hi >= 0 ? hex_nibble((unsigned char)normalized[i + 2]) : -1;
+            if (hi < 0 || lo < 0) return false;
+            c = (unsigned char)((hi << 4) | lo);
+            if (!c || c == '/' || c == '\\') return false;
+            changed = true;
+            i += 2;
+        }
+        if (used + 1 >= sizeof(tmp)) return false;
+        tmp[used++] = (char)c;
+    }
+    tmp[used] = 0;
+    if (!changed || !valid_archive_name(tmp) || used >= cap) return false;
+    memcpy(out, tmp, used + 1);
+    return true;
+}
+
 bool weread_resource_path(const char *base, const char *relative, char *out, size_t cap) {
-    if (!out || !cap || !relative || !*relative || *relative == '/' || strchr(relative, ':') || strchr(relative, '\\')) return false;
+    if (!out || !cap || !relative || !*relative || *relative == '/' || has_uri_scheme_or_drive(relative) || strchr(relative, '\\')) return false;
     char raw[1024];
     const char *slash = base ? strrchr(base, '/') : NULL;
     size_t n = slash ? (size_t)(slash - base + 1) : 0;
@@ -149,33 +249,49 @@ esp_err_t weread_chapter_read_validated(const char *path,char **out,size_t *len)
     if(!path||!out||!len)return ESP_ERR_INVALID_ARG;
     return read_file(path,out,len);
 }
-typedef struct { char root[512], name[512],parent[1024]; FILE *file; esp_err_t error; char vbuf[4096]; } extract_t;
+typedef struct { char root[512], name[512], parent[1024], last_path[1024]; FILE *file; esp_err_t error; unsigned completed; char vbuf[4096]; } extract_t;
 static bool extract(void *ctx, const char *name, const uint8_t *bytes, size_t n, size_t offset, size_t total) {
     extract_t *x = ctx;
     if (cancelled()) return false;
     if (!offset) {
-        if (x->file) { x->error = ESP_ERR_INVALID_RESPONSE; return false; }
-        char path[1024];
-        if (!strcmp(name, "body.html") || !strcmp(name, "position.map") || strchr(name, ':') ||
-            join(x->root, name, path, sizeof(path)) != ESP_OK) return false;
+        if (x->file) { x->error = ESP_ERR_INVALID_RESPONSE; goto fail; }
+        char path[1024], mapped[48];
+        const char *disk = !strcmp(name, "body.html") || !strcmp(name, "position.map") ||
+            !strcmp(name, "archive.part") || !valid_archive_name(name)
+            ? NULL : weread_chapter_storage_path(name, mapped);
+        if (!disk || join(x->root, disk, path, sizeof(path)) != ESP_OK) {
+            x->error = ESP_ERR_INVALID_RESPONSE;
+#if defined(ESP_PLATFORM)
+            ESP_LOGW("weread", "extract reject name=%.64s", name);
+#endif
+            return false;
+        }
         char *slash = strrchr(path, '/'); *slash = 0;
         if(strcmp(x->parent,path)){
-            x->error=wr_mkdirs(path);if(x->error!=ESP_OK){x->parent[0]=0;return false;}
-            if(!wr_copy(x->parent,sizeof(x->parent),path))return false;
+            x->error=wr_mkdirs(path);if(x->error!=ESP_OK){x->parent[0]=0;goto fail;}
+            if(!wr_copy(x->parent,sizeof(x->parent),path)){x->error=ESP_ERR_INVALID_SIZE;goto fail;}
         }
         *slash='/';
         struct stat st;
-        if (!stat(path, &st)) { x->error = ESP_ERR_INVALID_RESPONSE; return false; }
-        x->file = fopen(path, "wb"); if (!x->file) { x->error = ESP_FAIL; return false; }
+        if (!stat(path, &st)) { x->error = ESP_ERR_INVALID_RESPONSE; goto fail; }
+        wr_copy(x->last_path, sizeof(x->last_path), path);
+        x->file = fopen(path, "wb"); if (!x->file) { x->error = ESP_FAIL; goto fail; }
         (void)setvbuf(x->file, x->vbuf, _IOFBF, sizeof(x->vbuf));
         wr_copy(x->name, sizeof(x->name), name);
     }
-    if (!x->file || strcmp(name, x->name) || fwrite(bytes, 1, n, x->file) != n) { x->error = ESP_FAIL; return false; }
+    if (!x->file || strcmp(name, x->name) || fwrite(bytes, 1, n, x->file) != n) { x->error = ESP_FAIL; goto fail; }
     if (offset + n == total) {
         bool ok = !fflush(x->file); if (fclose(x->file)) ok = false; x->file = NULL;
-        if (!ok) { x->error = ESP_FAIL; return false; }
+        if (!ok) { x->error = ESP_FAIL; goto fail; }
+        ++x->completed;
+        x->last_path[0] = 0;
     }
     return true;
+fail:
+#if defined(ESP_PLATFORM)
+    ESP_LOGW("weread", "extract err=%d name=%.64s", (int)x->error, name);
+#endif
+    return false;
 }
 static bool append(FILE *f, const void *data, size_t len, size_t *total) {
     if (len > CHAPTER_LIMIT - *total || fwrite(data, 1, len, f) != len) return false;
@@ -191,9 +307,12 @@ static bool append_source(FILE *f, const char *data, size_t len, size_t *total, 
     p->units += weread_utf16_length(data, len); return true;
 }
 static bool merged_file(const cJSON *files, const char *path) {
-    cJSON *file; char normalized[512];
-    cJSON_ArrayForEach(file,files)
-        if(cJSON_IsString(file)&&weread_resource_path(NULL,file->valuestring,normalized,sizeof(normalized))&&!strcmp(normalized,path))return true;
+    cJSON *file; char normalized[512], decoded[512];
+    cJSON_ArrayForEach(file,files) {
+        if(!cJSON_IsString(file)||!weread_resource_path(NULL,file->valuestring,normalized,sizeof(normalized)))continue;
+        if(!strcmp(normalized,path))return true;
+        if(strchr(normalized,'%')&&weread_resource_path_decode(normalized,decoded,sizeof(decoded))&&!strcmp(decoded,path))return true;
+    }
     return false;
 }
 static void note_id(char out[24], const char *source, const char *fragment) {
@@ -239,10 +358,16 @@ static bool append_html(FILE *f, const char *data, size_t len, const char *sourc
         }
         bool relative=raw[0]!='#'&&weread_resource_path(source,raw,normalized,sizeof(normalized));
         const char *fragment=k==4?strchr(raw,'#'):NULL;
-        if(fragment&&fragment[1]&&((raw[0]=='#'&&wr_copy(normalized,sizeof(normalized),source))||
-            (relative&&merged_file(files,normalized)))) {
-            note_id(alias,normalized,fragment+1);normalized[0]='#';strcpy(normalized+1,alias);
-            fragment=NULL;relative=true;
+        if(fragment&&fragment[1]) {
+            char decoded[512];
+            const char *target=NULL;
+            if(raw[0]=='#'&&wr_copy(normalized,sizeof(normalized),source))target=normalized;
+            else if(relative&&merged_file(files,normalized))target=normalized;
+            else if(relative&&strchr(normalized,'%')&&weread_resource_path_decode(normalized,decoded,sizeof(decoded))&&merged_file(files,decoded))target=decoded;
+            if(target) {
+                note_id(alias,target,fragment+1);normalized[0]='#';strcpy(normalized+1,alias);
+                fragment=NULL;relative=true;
+            }
         }
         if (relative) {
             if (!append_source(f, data + start, value - start, total, map) ||
@@ -402,14 +527,32 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
     size_t total = 0;
     if (err == ESP_OK) cJSON_ArrayForEach(entry, files) {
         if (!cJSON_IsString(entry) || cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
-        char normalized[512];
-        if (!weread_resource_path(NULL, entry->valuestring, normalized, sizeof(normalized)) ||
-            join(root, normalized, path, sizeof(path)) != ESP_OK || !strcmp(normalized, "body.html")) {
+        char normalized[512], mapped[48];
+        const char *disk = weread_resource_path(NULL, entry->valuestring, normalized, sizeof(normalized))
+            ? weread_chapter_storage_path(normalized, mapped) : NULL;
+        if (!disk || !strcmp(normalized, "body.html") || !strcmp(normalized, "position.map") ||
+            join(root, disk, path, sizeof(path)) != ESP_OK) {
             ESP_LOGW("weread", "assemble bad path=%s", entry->valuestring);
             err = ESP_ERR_INVALID_RESPONSE; break;
         }
         char *data = NULL; size_t len = 0;
-        err = read_file(path, &data, &len); if (err != ESP_OK) break;
+        err = read_file(path, &data, &len);
+        if (err == ESP_ERR_NOT_FOUND && strchr(normalized, '%')) {
+            char decoded[512];
+            const char *dec_disk = weread_resource_path_decode(normalized, decoded, sizeof(decoded)) &&
+                strcmp(decoded, "body.html") && strcmp(decoded, "position.map")
+                ? weread_chapter_storage_path(decoded, mapped) : NULL;
+            if (dec_disk && join(root, dec_disk, path, sizeof(path)) == ESP_OK) {
+                err = read_file(path, &data, &len);
+                if (err == ESP_OK) wr_copy(normalized, sizeof(normalized), decoded);
+            }
+        }
+        if (err != ESP_OK) {
+#if defined(ESP_PLATFORM)
+            ESP_LOGW("weread", "assemble read err=%d file=%.64s", (int)err, normalized);
+#endif
+            break;
+        }
         if (!strcmp(format, "txt")) {
             char env_vid[WEREAD_VID_MAX_LEN] = "";
             {
@@ -548,26 +691,39 @@ esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload)
         ESP_LOGI("weread","chapter result=%d http=%d bytes=%u",(int)err,w->response.status,(unsigned)w->response.bytes);
         memset(&w->x,0,sizeof(w->x)); wr_copy(w->x.root, sizeof(w->x.root), w->root);
         if (err == ESP_OK && !strcmp(w->b.format, "epub")) {
-            size_t n = 0;
             char sec_vid[WEREAD_VID_MAX_LEN] = "", sec_tok[WEREAD_TOKEN_MAX_LEN] = "";
-            bool has_session = false;
             {
                 WR_GUARD;
                 const weread_auth_session_t *s = weread_auth_get_current_session();
                 if (s) {
-                    has_session = true;
                     wr_copy(sec_vid, sizeof(sec_vid), s->vid);
                     wr_copy(sec_tok, sizeof(sec_tok), s->access_token);
                 }
             }
-            const char *secrets[] = {has_session ? sec_vid : "", has_session ? sec_tok : ""};
-            if (!book_weread_decrypt_encrypt_key_candidates(w->response.encrypt_key, secrets, 2, w->password, sizeof(w->password), &n)) err = ESP_ERR_INVALID_RESPONSE;
-            else err = book_weread_unpack_zip_file(archive, w->password, n, extract, &w->x);
+            const char *secrets[] = {sec_vid, sec_tok};
+            err = ESP_ERR_INVALID_RESPONSE;
+            for (size_t k = 0; k < 2; ++k) {
+                size_t n = 0;
+                if (!secrets[k][0] ||
+                    !book_weread_decrypt_encrypt_key(w->response.encrypt_key, secrets[k], w->password, sizeof(w->password), &n)) {
+                    continue;
+                }
+                memset(&w->x, 0, sizeof(w->x));
+                wr_copy(w->x.root, sizeof(w->x.root), w->root);
+                err = book_weread_unpack_zip_file(archive, w->password, n, extract, &w->x);
+                if (w->x.file) { fclose(w->x.file); w->x.file = NULL; }
+                if (err == ESP_OK) break;
+                if (err == ESP_ERR_INVALID_STATE && !cancelled() && w->x.error == ESP_OK && !w->x.completed && k + 1 < 2) {
+                    if (w->x.last_path[0]) { unlink(w->x.last_path); w->x.last_path[0] = 0; }
+                    continue;
+                }
+                break;
+            }
             weread_secure_zero(sec_vid, sizeof(sec_vid));
             weread_secure_zero(sec_tok, sizeof(sec_tok));
             weread_secure_zero(w->password, sizeof(w->password));
         } else if (err == ESP_OK) err = book_weread_unpack_tar_file(archive, extract, &w->x);
-        if (w->x.file) fclose(w->x.file);
+        if (w->x.file) { fclose(w->x.file); w->x.file = NULL; }
         if (fclose(archive) && err == ESP_OK) err = ESP_FAIL;
         unlink(w->path);
         if (err != ESP_OK && w->x.error != ESP_OK) err = w->x.error;

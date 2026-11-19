@@ -50,7 +50,8 @@ static atomic_bool s_busy, s_done, s_cancel, s_alive;
 static atomic_uint_fast64_t s_deadline, s_live_pos, s_fg_input_ms;
 static atomic_bool s_live_valid, s_cloud_jump_ready;
 static atomic_uint_fast32_t s_sync_downloading_uid, s_prefetch_downloading_uid, s_adopting_prefetch_uid, s_cached_count, s_total_count;
-static bool s_configured, s_owns_network;
+static bool s_configured;
+static atomic_bool s_owns_network;
 static unsigned s_cache_epoch;
 static uint64_t s_idle_at,s_network_active;
 static weread_result_t s_result;
@@ -743,7 +744,7 @@ static void perform_job(void) {
                 weread_book_t book;char url[512];weread_cover_retry_t retry={.original=!strcmp(s_work.value,"original")};
                 err=weread_shelf_find(s_work.id,&book)?weread_cover_retry_url(book.cover,&retry,0,url,sizeof(url)):ESP_ERR_NOT_FOUND;
                 if(err==ESP_OK)err=cover_job(url);
-            }else if(!strcmp(s_work.value,"warm")){
+            }else if(!strcmp(s_work.value,"warm")||!strcmp(s_work.value,"warm-disk")){
                 char ready[512];struct stat st;
                 if(weread_cover_cache_path(s_work.id,"gray",ready,sizeof(ready))==ESP_OK&&!stat(ready,&st)&&S_ISREG(st.st_mode)&&st.st_size==WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT)break;
                 err=cover_job(NULL);
@@ -1026,11 +1027,14 @@ unsigned weread_runtime_cache_epoch(void){return s_cache_epoch;}
 bool weread_runtime_idle(uint64_t now){
     if(weread_runtime_busy()||now<s_idle_at)return false;
     if(s_reader.id[0]&&s_reader.save_failed&&(weread_reader_save(now)!=ESP_OK))return false;
-    if(s_owns_network&&s_network_active&&now>=s_network_active&&now-s_network_active>=60000)
+    if(s_owns_network&&s_network_active&&now>=s_network_active&&now-s_network_active>=600000)
         return weread_runtime_start(WR_JOB_DISCONNECT,NULL,NULL);
     if(s_reader.active)return false;
     s_idle_at=now+1000;
     return weread_runtime_start(WR_JOB_REPORT,NULL,NULL);
+}
+bool weread_runtime_network_active(void){
+    return weread_runtime_busy()||atomic_load(&s_owns_network);
 }
 bool weread_reader_cached(const char *uri,size_t chapter){
     if(!book_path_is_weread(uri))return false;

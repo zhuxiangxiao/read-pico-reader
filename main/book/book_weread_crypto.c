@@ -22,6 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include "zlib.h"
+#if defined(ESP_PLATFORM)
+#include "esp_log.h"
+#endif
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_TEST_MEMORY)
 #include "esp_heap_caps.h"
@@ -537,6 +540,7 @@ esp_err_t book_weread_unpack_zip(const uint8_t *payload, size_t len,
         const uint8_t *src = payload + data_off;
         size_t src_len = comp_size;
         uint8_t *dec_comp = NULL;
+        bool hdr_mismatch = false;
 
         if (flags & 0x1u) {
             if (!password || !password_len || src_len < 12u) return ESP_ERR_INVALID_STATE;
@@ -549,7 +553,8 @@ esp_err_t book_weread_unpack_zip(const uint8_t *payload, size_t len,
                 hdr[i] = plain_b;
             }
             uint8_t check = (flags & 0x8u) ? (uint8_t)(mod_time >> 8) : (uint8_t)(expected_crc >> 24);
-            if (hdr[11] != check) return ESP_ERR_INVALID_STATE;
+            // Defer rejecting a mismatched check byte until deflate + full 32-bit CRC-32 decide validity.
+            hdr_mismatch = (hdr[11] != check);
 
             src_len -= 12u;
             if (src_len > 0) {
@@ -568,7 +573,7 @@ esp_err_t book_weread_unpack_zip(const uint8_t *payload, size_t len,
         esp_err_t err = ESP_OK;
         if (uncomp_size == 0) {
             uint8_t empty = 0;
-            if (expected_crc != 0) err = ESP_ERR_INVALID_CRC;
+            if (expected_crc != 0) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_CRC;
             else if (!on_entry(ctx, norm_name, &empty, 0)) err = ESP_ERR_INVALID_STATE;
             free(dec_comp);
             if (err != ESP_OK) return err;
@@ -578,7 +583,7 @@ esp_err_t book_weread_unpack_zip(const uint8_t *payload, size_t len,
         if (method == 0) {
             if (src_len != uncomp_size) {
                 free(dec_comp);
-                return ESP_ERR_INVALID_RESPONSE;
+                return hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE;
             }
             if (dec_comp) {
                 out = dec_comp;
@@ -599,14 +604,14 @@ esp_err_t book_weread_unpack_zip(const uint8_t *payload, size_t len,
             dec_comp = NULL;
             if (err != ESP_OK) {
                 free(out);
-                return err;
+                return (hdr_mismatch && err != ESP_ERR_NO_MEM) ? ESP_ERR_INVALID_STATE : err;
             }
         }
 
         uint32_t actual_crc = (uint32_t)crc32(0L, out, (uInt)uncomp_size);
         if (actual_crc != expected_crc) {
             free(out);
-            return ESP_ERR_INVALID_CRC;
+            return hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_CRC;
         }
         bool keep_going = on_entry(ctx, norm_name, out, uncomp_size);
         free(out);
@@ -728,14 +733,28 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
     uint8_t *in = scratch, *out = scratch + 4096;
     size_t pos = cd, cd_end = cd + cd_size, expanded = 0;
     esp_err_t err = ESP_OK;
+#if defined(ESP_PLATFORM)
+    uint8_t dec_in11 = 0, dec_check = 0;
+    uint16_t fail_flags = 0, fail_method = 0;
+    unsigned fail_entry = 0;
+    bool fail_mm = false;
+    char fail_name[96] = "";
+#endif
     for (unsigned entry = 0; entry < count && err == ESP_OK; ++entry) {
         uint8_t header[46], local[30];
+#if defined(ESP_PLATFORM)
+        fail_entry = entry; fail_flags = fail_method = 0; fail_mm = false;
+        dec_in11 = dec_check = 0; fail_name[0] = 0;
+#endif
         if (pos > cd_end || cd_end - pos < sizeof(header) || !archive_read(f, pos, header, sizeof(header)) ||
             le32(header) != UINT32_C(0x02014b50)) { err = ESP_ERR_INVALID_RESPONSE; break; }
         uint16_t flags = le16(header + 8), method = le16(header + 10), name_len = le16(header + 28);
         uint32_t crc = le32(header + 16), compressed = le32(header + 20), plain = le32(header + 24);
         size_t local_pos = le32(header + 42);
         size_t record = 46u + name_len + le16(header + 30) + le16(header + 32);
+#if defined(ESP_PLATFORM)
+        fail_flags = flags; fail_method = method;
+#endif
         char raw[512], name[512];
         if (record > cd_end - pos || !name_len || name_len >= sizeof(raw) ||
             !archive_read(f, pos + 46, raw, name_len)) { err = ESP_ERR_INVALID_RESPONSE; break; }
@@ -745,6 +764,9 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
         if ((kind && kind != 0100000u) || !normalize_archive_path(raw, name_len, name, sizeof(name))) {
             err = ESP_ERR_INVALID_RESPONSE; break;
         }
+#if defined(ESP_PLATFORM)
+        snprintf(fail_name, sizeof(fail_name), "%.64s", name);
+#endif
         if ((flags & 0x2040u) || (method != 0 && method != 8)) { err = ESP_ERR_NOT_SUPPORTED; break; }
         if (compressed > WR_ARCHIVE_ENTRY_MAX || plain > WR_ARCHIVE_ENTRY_MAX ||
             plain > 64u * 1024u * 1024u - expanded) { err = ESP_ERR_INVALID_SIZE; break; }
@@ -757,6 +779,7 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
             !archive_read(f, local_pos + 30, in, name_len) || memcmp(in, raw, name_len)) {
             err = ESP_ERR_INVALID_RESPONSE; break;
         }
+        bool hdr_mismatch = false;
         pk_keys_t pk;
         if (flags & 1u) {
             if (!password || !password_len || compressed < 12 || !archive_read(f, data, in, 12)) {
@@ -765,7 +788,11 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
             pk_init(&pk, password, password_len);
             for (size_t i = 0; i < 12; ++i) { uint8_t b = in[i] ^ pk_decrypt_byte(&pk); pk_update(&pk, b); in[i] = b; }
             uint8_t check = flags & 8u ? (uint8_t)(le16(header + 12) >> 8) : (uint8_t)(crc >> 24);
-            if (in[11] != check) { err = ESP_ERR_INVALID_STATE; break; }
+            // Defer rejecting a mismatched check byte until deflate + full 32-bit CRC-32 decide validity.
+            hdr_mismatch = (in[11] != check);
+#if defined(ESP_PLATFORM)
+            dec_in11 = in[11]; dec_check = check; fail_mm = hdr_mismatch;
+#endif
             data += 12; compressed -= 12;
         }
         z_stream zs = {0};
@@ -782,7 +809,7 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
                 uint8_t b = in[i] ^ pk_decrypt_byte(&pk); pk_update(&pk, b); in[i] = b;
             }
             if (!method) {
-                if (n > plain - done) { err = ESP_ERR_INVALID_RESPONSE; break; }
+                if (n > plain - done) { err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE; break; }
                 actual_crc = (uint32_t)crc32(actual_crc, in, (uInt)n);
                 if (!sink(ctx, name, in, n, done, plain)) { err = ESP_ERR_INVALID_STATE; break; }
                 done += n;
@@ -798,22 +825,29 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
                     if((rc==Z_BUF_ERROR||rc==Z_OK)&&!produced&&zs.total_in==before&&!zs.avail_in)break;
                     if (produced > plain - done || (rc != Z_OK && rc != Z_STREAM_END) ||
                         (!produced && zs.total_in == before && rc != Z_STREAM_END)) {
-                        err = ESP_ERR_INVALID_RESPONSE; break;
+                        err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE; break;
                     }
                     actual_crc = (uint32_t)crc32(actual_crc, out, (uInt)produced);
                     if (produced && !sink(ctx, name, out, produced, done, plain)) { err = ESP_ERR_INVALID_STATE; break; }
                     done += produced;
                     if (rc == Z_STREAM_END) { ended = true; break; }
                 } while (zs.avail_in || !zs.avail_out);
-                if (ended && (remaining || zs.avail_in)) err = ESP_ERR_INVALID_RESPONSE;
+                if (ended && (remaining || zs.avail_in)) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE;
                 if (ended) break;
             }
         }
         if (method == 8) inflateEnd(&zs);
-        if (err == ESP_OK && (done != plain || (method == 8 && !ended))) err = ESP_ERR_INVALID_RESPONSE;
-        if (err == ESP_OK && actual_crc != crc) err = ESP_ERR_INVALID_CRC;
+        if (err == ESP_OK && (done != plain || (method == 8 && !ended))) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE;
+        if (err == ESP_OK && actual_crc != crc) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_CRC;
         if (err == ESP_OK && !plain && !sink(ctx, name, out, 0, 0, 0)) err = ESP_ERR_INVALID_STATE;
     }
+#if defined(ESP_PLATFORM)
+    if (err != ESP_OK) {
+        ESP_LOGW("weread", "zip fail err=%d entry=%u/%u flags=0x%x m=%u mm=%u b11=%02x/%02x name=%.64s",
+            (int)err, fail_entry, (unsigned)count, (unsigned)fail_flags, (unsigned)fail_method,
+            (unsigned)fail_mm, (unsigned)dec_in11, (unsigned)dec_check, fail_name);
+    }
+#endif
     free(scratch);
     return err;
 }

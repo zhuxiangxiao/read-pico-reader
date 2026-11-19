@@ -31,3 +31,7 @@ esp_err_t weread_chapter_snapshot(const char *book_id,uint32_t uid,char *root,si
 esp_err_t weread_chapter_resource_directory(const char *book_id, char *out, size_t cap);
 /// 相对资源路径规范化，禁止越出归档根目录或联网。/ Resolve relative resources without leaving the archive root or networking.
 bool weread_resource_path(const char *base, const char *relative, char *out, size_t cap);
+/// 对已规范化的相对路径做百分号解码（不允许路径逃逸/协议头/反斜杠）。/ Percent-decode an already-normalized path without traversal, schemes, or backslashes.
+bool weread_resource_path_decode(const char *normalized, char *out, size_t cap);
+/// 把不兼容 FAT32 的归档相对路径映射为确定性的槽位安全路径（保留 .css 后缀）。/ Map FAT32-unsafe archive paths to deterministic storage-safe names while retaining .css.
+const char *weread_chapter_storage_path(const char *normalized, char mapped[48]);

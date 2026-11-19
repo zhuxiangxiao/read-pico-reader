@@ -3,11 +3,13 @@
 #include "book/book_weread_cover.h"
 #include "book/book_xteink_sync.h"
 #include "online_font.h"
+#include "weread/weread_runtime.h"
 
 static void poll_wifi_idle(void) {
     const book_weread_cover_status_t covers = book_weread_cover_status();
     online_font_status_t font;
     online_font_status(&font);
     read_pico_transfer_idle_poll(pico_online_busy() || xteink_sync_busy() || font.busy ||
+                                 weread_runtime_network_active() ||
                                  covers.running || covers.saving || (covers.active && covers.multiple));
 }

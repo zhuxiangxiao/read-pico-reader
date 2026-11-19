@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <zlib.h>
 #if defined(ESP_PLATFORM)
+#include "esp_log.h"
 #include "nvs.h"
 #include "read_pico_sd.h"
 _Static_assert(WEREAD_MEDIA_ID_BYTES==READ_PICO_SD_MEDIA_ID_BYTES,"media identity ABI");
@@ -387,7 +388,10 @@ static esp_err_t request_mode(const char *url, const char *body, cJSON **out, in
     char *text = NULL; size_t len = 0; *out = NULL;
     if(identity){WR_GUARD;if(!identity_matches(identity)){*status=0;return ESP_ERR_INVALID_STATE;}}
     const char *headers=body?"Content-Type: application/json\r\n":NULL;
-    esp_err_t err=identity?weread_client_request_bound_renew(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client):
+    bool skip_renew=(strstr(url,"/book/getProgress")!=NULL&&!strstr(url,"/web/book/getProgress"))||
+        (strstr(url,"/book/read")!=NULL&&!strstr(url,"/web/book/read"));
+    esp_err_t err=identity?(skip_renew?weread_client_request_bound(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client):
+        weread_client_request_bound_renew(url,body?"POST":"GET",headers,body,&text,&len,status,&identity->client)):
         weread_client_request(url,body?"POST":"GET",headers,body,&text,&len,status);
     if(identity){WR_GUARD;if(!identity_matches(identity)){free(text);*status=0;return ESP_ERR_INVALID_STATE;}}
     if (text && len && len <= 65536) { WR_GUARD; *out = wr_parse_json(text,len+1); }
@@ -408,13 +412,14 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
     esp_err_t err = request_mode(url,body,&r,&status,identity);
     if(err!=ESP_OK && (!status || err==ESP_ERR_NO_MEM)){cJSON_Delete(r);return err;}
     const cJSON *book = NULL;uint32_t fresh_version=0,last_index=0;
-    bool unread_syncbook = false;
+    bool unread_syncbook = false, has_detail = false;
     if(err==ESP_OK){
         const cJSON *detail=NULL,*entry;
         cJSON_ArrayForEach(entry,cJSON_GetObjectItemCaseSensitive(r,"books")){
             const char *saved_id=wr_string(entry,"bookId");
             if(saved_id&&!strcmp(saved_id,id)){if(detail){cJSON_Delete(r);return ESP_ERR_INVALID_RESPONSE;}detail=entry;}
         }
+        has_detail = (detail != NULL);
         if(detail&&!field(detail,"bookVersion",&fresh_version,false)){cJSON_Delete(r);return ESP_ERR_INVALID_RESPONSE;}
         if(detail&&!field(detail,"lastChapterIdx",&last_index,false))last_index=0;
         const cJSON *positions=cJSON_GetObjectItemCaseSensitive(r,"bookProgress"),*p;
@@ -431,15 +436,23 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
             // Native syncbook may report unread books with chapterUid=0 or an empty bookProgress entry; avoid falling back to getProgress/web.
             if(has_all){
                 if(!decode(book,cloud,true)){memset(cloud,0,sizeof(*cloud));book=NULL;}
-            }else if(allow_unread&&detail&&cJSON_IsArray(positions)&&cJSON_HasObjectItem(book,"chapterUid")&&
+            }else if(allow_unread&&detail&&(!positions||cJSON_IsArray(positions))&&
+                     !cJSON_HasObjectItem(book,"chapterIdx")&&!cJSON_HasObjectItem(book,"chapterOffset")&&
                      decode(book,cloud,true)&&!cloud->chapter_uid){
                 unread_syncbook=true;
             }else{
                 memset(cloud,0,sizeof(*cloud));book=NULL;
             }
-        }else if(allow_unread&&detail&&cJSON_IsArray(positions)){
+        }
+#if defined(ESP_PLATFORM)
+        else if(allow_unread&&detail&&(!positions||cJSON_IsArray(positions))){
             unread_syncbook=true;
         }
+#else
+        else if(allow_unread&&detail&&cJSON_IsArray(positions)){
+            unread_syncbook=true;
+        }
+#endif
     }
     if (!book && !unread_syncbook) {
         cJSON_Delete(r); r = NULL;
@@ -455,7 +468,8 @@ static esp_err_t fetch_progress(const char *id,weread_progress_t *cloud,uint32_t
         const char *server_id=wr_string(r,"bookId"),*nested_id=wr_string(book,"bookId");
         bool wrong_id=(cJSON_HasObjectItem(r,"bookId")&&(!server_id||strcmp(server_id,id)))||
             (cJSON_HasObjectItem(book,"bookId")&&(!nested_id||strcmp(nested_id,id)));
-        if(!allow_unread || (identity && !cJSON_IsObject(explicit_book))){
+        bool empty_unread = allow_unread && has_detail && cJSON_IsObject(r) && !r->child;
+        if(!empty_unread && (!allow_unread || (identity && !cJSON_IsObject(explicit_book)))){
             const char *required[]={"chapterUid","chapterIdx","chapterOffset","progress"};
             for(size_t i=0;i<sizeof(required)/sizeof(*required);++i)if(!cJSON_HasObjectItem(book,required[i]))wrong_id=true;
         }
@@ -640,6 +654,11 @@ static esp_err_t send_progress(const char *id,const weread_progress_t *p, progre
         err = request_mode(url,signed_body,&r,&status,identity);
     }
     if (err == ESP_OK && number(r, "succ") != 1 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "succ"))) err = ESP_ERR_INVALID_RESPONSE;
+#if defined(ESP_PLATFORM)
+    if (err != ESP_OK) ESP_LOGW("weread", "report fail id=%s uid=%u idx=%u off=%u p=%u st=%d err=%d",
+        id, (unsigned)p->chapter_uid, (unsigned)p->chapter_index,
+        (unsigned)p->chapter_offset, (unsigned)p->progress, status, (int)err);
+#endif
     cJSON_Delete(r);
     return err;
 }

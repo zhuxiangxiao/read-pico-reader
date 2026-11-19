@@ -280,6 +280,10 @@ int main(int argc, char **argv) {
     assert(weread_runtime_idle(7000));result=completion();
     assert(result.job==WR_JOB_REPORT&&result.error==ESP_OK);weread_runtime_result_free(&result);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&!local.dirty&&local.chapter_offset==expected_raw&&local.progress==85);
+    uint64_t active_base=milliseconds();
+    if(weread_runtime_idle(active_base+65000)){result=completion();assert(result.job==WR_JOB_REPORT);weread_runtime_result_free(&result);}
+    assert(weread_runtime_idle(active_base+605000));result=completion();
+    assert(result.job==WR_JOB_DISCONNECT&&result.error==ESP_OK);weread_runtime_result_free(&result);
     puts("PASS: local persistence, cached chapter preparation and text input remain below100ms during delayed HTTP; ACK preserves newer revisions; closed-book idle drains the durable outbox");
     // shutdown中断阻塞响应；取消后可重新创建任务。/ Shutdown interrupts blocked responses and permits worker restart.
     control("{\"latency\":1.5}");

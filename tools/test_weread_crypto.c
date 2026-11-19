@@ -291,6 +291,45 @@ typedef struct {
     const char *abort_name;
 } test_zip_collector_t;
 
+typedef struct {
+    test_zip_collector_t *col;
+    uint8_t *cur;
+    size_t cur_cap;
+    size_t cur_len;
+    char cur_name[64];
+} test_zip_chunk_t;
+
+static bool test_zip_chunk_callback(void *ctx, const char *name, const uint8_t *bytes, size_t n, size_t offset, size_t total) {
+    test_zip_chunk_t *st = (test_zip_chunk_t *)ctx;
+    test_zip_collector_t *c = st->col;
+    if (c->abort_on_match && c->abort_name && strcmp(name, c->abort_name) == 0) return false;
+    if (offset == 0) {
+        free(st->cur);
+        st->cur = total ? malloc(total) : NULL;
+        st->cur_cap = total;
+        st->cur_len = 0;
+        snprintf(st->cur_name, sizeof(st->cur_name), "%s", name);
+    }
+    assert(offset == st->cur_len && offset + n <= st->cur_cap);
+    if (n) {
+        memcpy(st->cur + offset, bytes, n);
+        st->cur_len += n;
+    }
+    if (offset + n == total) {
+        if (c->count < 8) {
+            snprintf(c->names[c->count], sizeof(c->names[c->count]), "%s", st->cur_name);
+            c->data[c->count] = st->cur;
+            c->sizes[c->count] = total;
+            c->count++;
+            st->cur = NULL;
+        } else {
+            free(st->cur);
+            st->cur = NULL;
+        }
+    }
+    return true;
+}
+
 static bool test_zip_callback(void *ctx, const char *name, const uint8_t *data, size_t size) {
     test_zip_collector_t *c = (test_zip_collector_t *)ctx;
     if (c->abort_on_match && c->abort_name && strcmp(name, c->abort_name) == 0) {
@@ -542,6 +581,55 @@ static void test_zipcrypto_unpacking(void) {
                                  test_zip_callback, &col);
     assert(err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_CRC);
     test_zip_collector_free(&col);
+
+    // 2b. ZipCrypto check-byte mismatch (e.g. data-descriptor flag 0x08 with CRC MSB instead of mod_time MSB)
+    // must still succeed when deflate + full 32-bit CRC-32 match, while wrong password still fails.
+    {
+        assert(((uint32_t)crc32(0L, (const Bytef *)plain_html, (uInt)strlen(plain_html)) >> 24) != 0);
+        uint8_t *dd_zip = malloc(zip_len);
+        assert(dd_zip != NULL);
+        memcpy(dd_zip, enc_zip, zip_len);
+        size_t eocd = zip_len - 22u;
+        uint16_t cnt = (uint16_t)dd_zip[eocd + 10] | ((uint16_t)dd_zip[eocd + 11] << 8);
+        size_t cd_off = (uint32_t)dd_zip[eocd + 16] | ((uint32_t)dd_zip[eocd + 17] << 8) |
+                        ((uint32_t)dd_zip[eocd + 18] << 16) | ((uint32_t)dd_zip[eocd + 19] << 24);
+        size_t p_cd = cd_off;
+        for (uint16_t idx = 0; idx < cnt; ++idx) {
+            dd_zip[p_cd + 8] |= 0x08;
+            size_t l_off = (uint32_t)dd_zip[p_cd + 42] | ((uint32_t)dd_zip[p_cd + 43] << 8) |
+                           ((uint32_t)dd_zip[p_cd + 44] << 16) | ((uint32_t)dd_zip[p_cd + 45] << 24);
+            dd_zip[l_off + 6] |= 0x08;
+            uint16_t nlen = (uint16_t)dd_zip[p_cd + 28] | ((uint16_t)dd_zip[p_cd + 29] << 8);
+            uint16_t elen = (uint16_t)dd_zip[p_cd + 30] | ((uint16_t)dd_zip[p_cd + 31] << 8);
+            uint16_t clen = (uint16_t)dd_zip[p_cd + 32] | ((uint16_t)dd_zip[p_cd + 33] << 8);
+            p_cd += 46u + nlen + elen + clen;
+        }
+        err = book_weread_unpack_zip(dd_zip, zip_len, (const uint8_t *)pwd, pwd_len, test_zip_callback, &col);
+        assert(err == ESP_OK && col.count == 2);
+        assert(col.sizes[1] == strlen(plain_html) && memcmp(col.data[1], plain_html, col.sizes[1]) == 0);
+        test_zip_collector_free(&col);
+
+        FILE *zf = tmpfile();
+        assert(zf && fwrite(dd_zip, 1, zip_len, zf) == zip_len && fflush(zf) == 0);
+        rewind(zf);
+        test_zip_chunk_t chunk_ctx = { .col = &col };
+        err = book_weread_unpack_zip_file(zf, (const uint8_t *)pwd, pwd_len, test_zip_chunk_callback, &chunk_ctx);
+        free(chunk_ctx.cur);
+        assert(err == ESP_OK && col.count == 2);
+        assert(col.sizes[0] == strlen(plain_info) && memcmp(col.data[0], plain_info, col.sizes[0]) == 0);
+        assert(col.sizes[1] == strlen(plain_html) && memcmp(col.data[1], plain_html, col.sizes[1]) == 0);
+        test_zip_collector_free(&col);
+
+        rewind(zf);
+        memset(&chunk_ctx, 0, sizeof(chunk_ctx));
+        chunk_ctx.col = &col;
+        err = book_weread_unpack_zip_file(zf, (const uint8_t *)"wrong_pwd", 9, test_zip_chunk_callback, &chunk_ctx);
+        free(chunk_ctx.cur);
+        assert(err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_CRC);
+        test_zip_collector_free(&col);
+        fclose(zf);
+        free(dd_zip);
+    }
 
     // 3. Unpack unencrypted ZIP (password = NULL)
     size_t plain_zip_len = 0;

@@ -30,6 +30,7 @@ bool test_reader_open;
 void online_font_status(online_font_status_t *s){*s=(online_font_status_t){0};}
 book_weread_cover_status_t book_weread_cover_status(void){return (book_weread_cover_status_t){0};}
 bool xteink_sync_busy(void){return false;}
+bool weread_runtime_network_active(void){return false;}
 void read_pico_transfer_idle_poll(bool in_use){(void)in_use;}
 
 const app_desc_t app_book = {.title="book"};

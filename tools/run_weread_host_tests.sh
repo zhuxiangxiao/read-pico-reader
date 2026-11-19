@@ -100,6 +100,15 @@ with open('build/weread-tests/notes.zip','wb') as output:
         'Text/three.xhtml':'<html><body><p>丁<a href="#abcdefghijklmnopqrstuvw">[4]</a></p><p id="abcdefghijklmnopqrstuvw">第三注</p></body></html>'.encode(),
         'Styles/notes.css':b'#note {text-align:right} #abcdefghijklmnopqrstuvw {text-align:center}',
     },b'test_password_123'))
+with open('build/weread-tests/obfuscated.zip','wb') as output:
+    output.write(fixture['_make_zipcrypto_zip']({
+        'info.txt':json.dumps({'bookId':'test_book_101','chapters':[{'chapterUid':4,'files':['Text/:****::****1.xhtml','Text/:****::****2.xhtml']}]}).encode(),
+        'Styles/:****::********::*::********::*::::*::*:*::::::**:*.css':b'p.obf { text-align: center }',
+        'Text/:****::****1.xhtml':'<html><body><p class="obf">混淆正文<a href=":****::****2.xhtml#n1">[1]</a><a href="%3A%2A%2A%2A%2A%3A%3A%2A%2A%2A%2A2.xhtml#n2">[2]</a></p><img src="../Images/:****::****.png"/><img src="../Images/%3A%2A%2A%2A%2A2.png"/></body></html>'.encode(),
+        'Text/:****::****2.xhtml':'<html><body><p id="n1">混淆脚注</p><p id="n2">编码脚注</p></body></html>'.encode(),
+        'Images/:****::****.png':b'\x89PNG\r\n\x1a\nOBF1',
+        'Images/:****2.png':b'\x89PNG\r\n\x1a\nOBF2',
+    },b'test_password_123'))
 PY
 echo "Compiling and running production WeRead streamed chapter tests..."
 "${CC}" "${flags[@]}" \

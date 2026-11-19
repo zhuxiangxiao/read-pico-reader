@@ -44,6 +44,7 @@ void weread_runtime_cancel_join(void);
 void weread_runtime_cancel(void);
 /// 微信书架空闲期扫描并补报；不改变其他页面网络生命周期。/ Drain durable reports during WeRead shelf idle.
 bool weread_runtime_idle(uint64_t now_ms);
+bool weread_runtime_network_active(void);
 /// 已载入的同章纯文字页可继续绘制，进度任务用自己的位置快照完成；IO/生命周期边界仍取消并等待。
 /// Loaded same-chapter text may render while a note uses its owned position snapshot; IO/lifecycle boundaries still join.
 void weread_reader_input(bool cached_text_only);

@@ -423,9 +423,9 @@ target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_UI_LOCALIZATION=1)
 # Size-optimize cold parsing/settings/setup within original slots; on S31 keep hot UI/cover/WeRead paths at -O2.
 set(weread_cold_size_sources
     book_index_cache.c book_title.c book_toc.c book_weread_cover.c
-    book_xteink_sync.c book_history_backup.c weread_auth.c
-    settings.c app_device_settings.c app_files.c app_transfer.c
-    app_cloud_sync.c ui_keyboard.c ota_online.c ota_release.c app_onboarding.c
+    book_xteink_sync.c book_history_backup.c book_lock_collage.c book_lock_bookmark.c weread_auth.c
+    settings.c app_device_settings.c app_files.c app_transfer.c app_image.c vcom_setup.c
+    app_cloud_sync.c ui_keyboard.c ota_online.c ota_release.c app_onboarding.c ui_wallpaper.c
     boot_state.c app_registry.c app_boot_recovery.c ota_update.c
     app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c
     ui_ime.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c)
@@ -439,7 +439,7 @@ foreach(weread_source IN LISTS kiiko_selected_sources)
     if(weread_source_name IN_LIST weread_size_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
         # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
-        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|ota_update|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input)\\.c$")
+        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery)\\.c$")
             set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
         endif()
     endif()

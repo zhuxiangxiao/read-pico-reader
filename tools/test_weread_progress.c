@@ -38,7 +38,12 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         assert(!cJSON_HasObjectItem(request, "dirty") && !cJSON_HasObjectItem(request, "lastReportMs") && !cJSON_HasObjectItem(request,"positionPending"));
         assert(cJSON_GetObjectItem(request, "readingTime")->valueint < 100);
         cJSON_Delete(request);
-        response = mode == 2 ? "{}" : mode == 3 ? "{\"errcode\":-2012}" : "{\"succ\":1}";
+        if (mode == 4) {
+            *status = 401;
+            response = "{\"errCode\":-2012}";
+        } else {
+            response = mode == 2 ? "{}" : mode == 3 ? "{\"errcode\":-2012}" : "{\"succ\":1}";
+        }
     } else if (strstr(url, "/shelf/syncbook")) {
         assert(!strcmp(method,"POST")&&strstr(body,"test_book_101"));
         response=native_response?native_response:"{}";
@@ -148,6 +153,8 @@ int main(void) {
         assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_OK);
         assert(requests == before + 2 && !unread_cloud.chapter_uid && fresh_ver == 100);
         progress_response = "{}";
+        assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_OK && !unread_cloud.chapter_uid && fresh_ver == 100);
+        native_response = "{}";
         assert(weread_progress_fetch_version("test_book_101", &unread_cloud, &fresh_ver, &last_ch) == ESP_ERR_INVALID_RESPONSE);
         progress_response = NULL;
     }
@@ -157,6 +164,16 @@ int main(void) {
     cJSON_DeleteItemFromObject(legacy,"positionPending");assert(wr_write_json(path,legacy)==ESP_OK);cJSON_Delete(legacy);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.position_pending);
     assert(weread_progress_report("test_book_101",true,90002)==ESP_OK);
+    {
+        assert(weread_progress_note("test_book_101",1,1,150,35,2,1,"outbox-skip-renew",950)==ESP_OK);
+        native_response="{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":60,\"progress\":25}]}";
+        int renew_before=renewals, web_before=web_reads;
+        mode=4;
+        weread_progress_t reported={0};
+        assert(weread_progress_outbox_report("test_book_101",90100,960,&reported)==ESP_OK);
+        assert(renewals==renew_before && web_reads==web_before+1 && !reported.dirty && !reported.position_pending);
+        mode=0; native_response=NULL;
+    }
     strcpy(session.vid, "999"); assert(weread_auth_save_session(&session) == ESP_OK && weread_auth_load_session(&session) == ESP_OK);
     assert(weread_progress_load("test_book_101", &local) != ESP_OK);
     weread_auth_clear_session();

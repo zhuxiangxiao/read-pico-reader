@@ -124,7 +124,12 @@ static esp_err_t http_poll_prepare(const char *url,bool enabled,weread_cancel_fn
     int budget=s_timeout_budget?s_timeout_budget(s_timeout_ctx):0;
     if(budget>0)p->hard_deadline=client_now_ms()+(uint64_t)budget;
     http_poll_progress(p);
-    esp_err_t err=http_poll_guard(p);if(err==ESP_OK)err=http_poll_resolve(p);
+    esp_err_t err=http_poll_guard(p);
+#if defined(ESP_PLATFORM)
+    if(err==ESP_OK&&!http_pool_peer(p->host,p->port,p->peer))err=http_poll_resolve(p);
+#else
+    if(err==ESP_OK)err=http_poll_resolve(p);
+#endif
     if(err!=ESP_OK){free(p);return err;}
     http_poll_progress(p);*out=p;return ESP_OK;
 }
@@ -140,10 +145,19 @@ static esp_err_t http_poll_event(esp_http_client_event_t *event) {
 }
 static void http_poll_config(http_poll_t *p,esp_http_client_config_t *cfg) {
     if(!p)return;
+#if defined(ESP_PLATFORM)
+    static bool s_http_log_quiet;
+    if(!s_http_log_quiet){esp_log_level_set("HTTP_CLIENT",ESP_LOG_ERROR);s_http_log_quiet=true;}
+#endif
     cfg->url=NULL;cfg->host=p->peer;cfg->port=p->port;cfg->path=p->path;cfg->query=p->query;
     cfg->common_name=p->host;cfg->transport_type=HTTP_TRANSPORT_OVER_SSL;cfg->is_async=true;cfg->timeout_ms=50;
     p->event_handler=cfg->event_handler;p->event_ctx=cfg->user_data;
     cfg->event_handler=http_poll_event;cfg->user_data=p;
+}
+static void http_poll_reset(http_poll_t *p) {
+    if(!p)return;
+    p->connected=false;p->connections=0;p->header_restarts=0;p->error=ESP_OK;
+    http_poll_progress(p);
 }
 static const char *http_poll_host(http_poll_t *p) { return p?p->authority:NULL; }
 static esp_err_t http_poll_error(http_poll_t *p,esp_err_t fallback) { return p&&p->error?p->error:fallback; }
@@ -215,6 +229,7 @@ static int http_poll_read(esp_http_client_handle_t client,char *data,int bytes,h
 typedef void http_poll_t;
 #define http_poll_prepare(url,enabled,cancel,ctx,out) ((void)(url),(void)(enabled),(void)(cancel),(void)(ctx),*(out)=NULL,ESP_OK)
 #define http_poll_config(p,cfg) ((void)(p),(void)(cfg))
+#define http_poll_reset(p) ((void)(p))
 #define http_poll_open(client,length,p) esp_http_client_open(client,length)
 #define http_poll_write(client,data,bytes,p) esp_http_client_write(client,data,bytes)
 #define http_poll_headers(client,p) esp_http_client_fetch_headers(client)

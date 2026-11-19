@@ -557,18 +557,29 @@ esp_err_t book_weread_map_candidate(size_t i,bool to_cloud,uint32_t input,uint32
 esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *len, bool *png) { WR_GUARD;
     if (!data || !len || !png || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
     *data = NULL; *len = 0;
-    struct { char name[512], root[512], path[1024]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    struct { char name[512], decoded[512], root[512], path[1024]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
     if (!paths) return ESP_ERR_NO_MEM;
     if (!weread_resource_path(NULL, src, paths->name, sizeof(paths->name))) return ESP_ERR_INVALID_ARG;
+    char mapped[48], mapped_dec[48];
+    const char *disk = weread_chapter_storage_path(paths->name, mapped);
+    if (!disk) return ESP_ERR_INVALID_ARG;
+    const char *disk_dec = strchr(paths->name, '%') &&
+        weread_resource_path_decode(paths->name, paths->decoded, sizeof(paths->decoded))
+        ? weread_chapter_storage_path(paths->decoded, mapped_dec) : NULL;
     for (unsigned pass = 0; pass < 2; ++pass) {
         loaded_chapter_t *bound=binding_owned(s_candidate)&&s_candidate->index==i?s_candidate:
             binding_owned(s_loaded)&&s_loaded->index==i?s_loaded:NULL;
         esp_err_t err=bound?(wr_copy(paths->root,sizeof(paths->root),pass?bound->resources:bound->root)&&paths->root[0]?ESP_OK:ESP_ERR_NOT_FOUND):
             pass?weread_chapter_resource_directory(s_id,paths->root,sizeof(paths->root)):weread_chapter_directory(s_id,book_weread_uid(i),paths->root,sizeof(paths->root));
         if (err != ESP_OK) continue;
-        int n = snprintf(paths->path, sizeof(paths->path), "%s/%s", paths->root, paths->name);
-        if (n < 0 || (size_t)n >= sizeof(paths->path)) continue;
-        FILE *f = fopen(paths->path, "rb"); if (!f) continue;
+        const char *candidates[2] = {disk, disk_dec};
+        FILE *f = NULL;
+        for (size_t c = 0; c < 2 && !f; ++c) {
+            if (!candidates[c]) continue;
+            int n = snprintf(paths->path, sizeof(paths->path), "%s/%s", paths->root, candidates[c]);
+            if (n >= 0 && (size_t)n < sizeof(paths->path)) f = fopen(paths->path, "rb");
+        }
+        if (!f) continue;
         struct stat st;
         if (fstat(fileno(f), &st) || st.st_size <= 0 || st.st_size > 8 * 1024 * 1024) { fclose(f); return ESP_ERR_INVALID_SIZE; }
         size_t size = (size_t)st.st_size; uint8_t *buf = wr_alloc(size);
