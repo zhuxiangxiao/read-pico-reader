@@ -754,6 +754,10 @@ static esp_err_t weread_client_dispatch_raw(
     }
     if (err == ESP_OK) {
         buffer[used] = 0;
+        if (out_resp && capacity > used + 4096u) {
+            char *shrunk = wr_realloc(buffer, used + 1);
+            if (shrunk) buffer = shrunk;
+        }
         if (out_resp) *out_resp = buffer; else free(buffer);
         if (out_len) *out_len = used;
     } else {

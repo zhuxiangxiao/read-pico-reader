@@ -7,6 +7,7 @@
 #pragma once
 #include "weread_types.h"
 #include "cJSON.h"
+#include <stdio.h>
 
 #define WEREAD_BOOK_ID_CAP 64
 #define WEREAD_JSON_LIMIT (2u * 1024u * 1024u)
@@ -40,6 +41,8 @@ esp_err_t wr_read_json(const char *path, cJSON **out);
 /// 仅读取指定主文件，让按账号恢复的调用方自行判定副本归属。/ Read only the named primary so account-aware recovery can validate backup ownership.
 esp_err_t wr_read_json_primary(const char *path, cJSON **out);
 esp_err_t wr_write_json(const char *path, const cJSON *json);
+typedef esp_err_t (*wr_stream_writer_fn)(FILE *f, void *ctx);
+esp_err_t wr_write_stream(const char *path, wr_stream_writer_fn writer, void *ctx);
 esp_err_t wr_write_bytes(const char *path, const void *data, size_t len);
 esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out);
 bool wr_owner_matches(const cJSON *json);

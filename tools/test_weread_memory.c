@@ -46,12 +46,18 @@ static esp_err_t transport(const char *url,const char *method,const char *header
         for(unsigned i=0;i<800;++i){char id[32];snprintf(id,sizeof(id),"memory_%u",i);cJSON_AddItemToArray(ids,cJSON_CreateString(id));}
         cJSON_AddNumberToObject(r,"synckey",17);
     }else if(strstr(url,"/book/chapterInfos")){
-        cJSON *data=cJSON_AddArrayToObject(r,"data"),*entry=cJSON_CreateObject();cJSON_AddItemToArray(data,entry);
-        cJSON_AddStringToObject(entry,"bookId","memory_0");cJSON_AddNumberToObject(entry,"synckey",12);
-        cJSON_AddNumberToObject(entry,"clearAll",1);cJSON_AddNumberToObject(entry,"bookVersion",1);
-        cJSON *updated=cJSON_AddArrayToObject(entry,"updated");for(unsigned i=1;i<=3000;++i){cJSON *c=cJSON_CreateObject();
-            cJSON_AddNumberToObject(c,"chapterUid",i);cJSON_AddNumberToObject(c,"chapterIdx",i);
-            cJSON_AddStringToObject(c,"title","Chapter memory stress");cJSON_AddItemToArray(updated,c);}
+        cJSON_Delete(r);
+        size_t cap=1280u*1024u,used=0;
+        char *buf=heap_caps_malloc(cap,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);assert(buf);
+        used+=(size_t)snprintf(buf+used,cap-used,"{\"data\":[{\"bookId\":\"memory_0\",\"synckey\":12,\"clearAll\":1,\"bookVersion\":1,\"updated\":[");
+        for(unsigned i=1;i<=3000;++i){
+            used+=(size_t)snprintf(buf+used,cap-used,
+                "%s{\"chapterUid\":%u,\"chapterIdx\":%u,\"title\":\"Chapter \\\"quote\\\" \\\\ slash \\n #%u\",\"level\":1,\"wordCount\":1200,\"updateTime\":1700000000,\"price\":0,\"paid\":1,\"readAhead\":0,\"isMPChapter\":0,\"tar\":\"unused-tar-payload-0123456789\",\"anchors\":[{\"anchor\":\"a1\",\"title\":\"sub\"}],\"files\":[\"Text/ch%u.xhtml\"]}",
+                i==1?"":",",i,i,i,i);
+            assert(used<cap-64);
+        }
+        used+=(size_t)snprintf(buf+used,cap-used,"]}]}");
+        *out=buf;*len=used;*status=200;return ESP_OK;
     }else assert(false);
     *out=cJSON_PrintUnformatted(r);assert(*out);*len=strlen(*out);*status=200;cJSON_Delete(r);return ESP_OK;
 }
@@ -80,7 +86,9 @@ int main(void){
     assert(items[0].cover_key==weread_cover_key(first.book_id,first.cover));heap_caps_free(items);
     assert(weread_shelf_sync(false)==ESP_OK&&weread_shelf_load()==ESP_OK);
     assert(weread_toc_sync("memory_0")==ESP_OK);weread_toc_t toc={0};
-    assert(weread_toc_load("memory_0",&toc)==ESP_OK&&toc.count==3000);weread_toc_free(&toc);
+    assert(weread_toc_load("memory_0",&toc)==ESP_OK&&toc.count==3000);
+    assert(!strcmp(toc.chapters[0].title,"Chapter \"quote\" \\ slash \n #1")&&!strcmp(toc.chapters[2999].title,"Chapter \"quote\" \\ slash \n #3000"));
+    weread_toc_free(&toc);
     size_t baseline=weread_test_memory_used(MALLOC_CAP_SPIRAM);weread_test_memory_fail_after(2);
     assert(weread_shelf_load()==ESP_ERR_NO_MEM&&weread_shelf_count()==800&&weread_shelf_synckey()==17);
     assert(weread_test_memory_used(MALLOC_CAP_SPIRAM)==baseline);weread_test_memory_fail_after(-1);

@@ -211,8 +211,19 @@ esp_err_t wr_read_json(const char *path, cJSON **out) {
     return recovery == ESP_OK ? ESP_OK : err;
 }
 
-esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
-    if (!path) return ESP_ERR_INVALID_ARG;
+typedef struct {
+    const void *data;
+    size_t len;
+} wr_bytes_writer_ctx_t;
+
+static esp_err_t wr_bytes_writer(FILE *f, void *ctx) {
+    const wr_bytes_writer_ctx_t *arg = ctx;
+    if (!arg->len) return ESP_OK;
+    return fwrite(arg->data, 1, arg->len, f) == arg->len ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t wr_write_stream(const char *path, wr_stream_writer_fn writer, void *ctx) {
+    if (!path || !writer) return ESP_ERR_INVALID_ARG;
     size_t path_len = strlen(path);
     if (path_len >= 768 || path_len + sizeof(".previous") > 800) return ESP_ERR_INVALID_SIZE;
 #if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
@@ -240,7 +251,8 @@ esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
     FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
     if (!f && fd >= 0) close(fd);
     if (!f) {ESP_LOGW("weread","cache open failed errno=%d",errno);return ESP_FAIL;}
-    bool ok = fwrite(data, 1, len, f) == len && !fflush(f);
+    esp_err_t write_err = writer(f, ctx);
+    bool ok = write_err == ESP_OK && !ferror(f) && !fflush(f);
     if (ok && fsync(fileno(f))) ok = false;
     if (fclose(f)) ok = false;
     if (ok && !rename(tmp, path)) return ESP_OK;
@@ -254,7 +266,13 @@ esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
     }
     ESP_LOGW("weread","cache commit failed errno=%d",errno);
     unlink(tmp);
-    return ESP_FAIL;
+    return write_err != ESP_OK ? write_err : ESP_FAIL;
+}
+
+esp_err_t wr_write_bytes(const char *path, const void *data, size_t len) {
+    if (len && !data) return ESP_ERR_INVALID_ARG;
+    wr_bytes_writer_ctx_t ctx = { .data = data, .len = len };
+    return wr_write_stream(path, wr_bytes_writer, &ctx);
 }
 
 esp_err_t wr_write_json(const char *path, const cJSON *json) {

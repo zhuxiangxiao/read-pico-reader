@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #if defined(ESP_PLATFORM)
+#include "kiiko_board_config.h"
 #include "book_cover.h"
 #include "read_pico_transfer.h"
 #include "read_pico_sd.h"
@@ -353,6 +354,15 @@ static esp_err_t cloud_sync_job(void) { WR_MEMORY_SCOPE;
     ESP_LOGI("weread", "cloud jump ready uid=%u idx=%u off=%u", (unsigned)uid, (unsigned)cloud.chapter_index, (unsigned)cloud.chapter_offset);
     return ESP_OK;
 }
+static void trim_cover_cache_for_open(void) {
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_RAM_COVER_CACHE) && KIIKO_BOARD_RAM_COVER_CACHE
+#if !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
+    metalio_cover_cache_trim(0);
+#else
+    metalio_cover_cache_trim(512u * 1024u);
+#endif
+#endif
+}
 static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
     uint64_t phase[5]={now_ms(),0,0,0,0};
     weread_toc_t toc = {0};
@@ -374,38 +384,45 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
             strcpy(s_choice.id,s_work.id);s_choice.valid=false;s_choice.fresh_version=s_choice.last_chapter=0;
             s_choice.pending_cloud_sync = false;
             weread_progress_t local = {0};
-            if (weread_progress_load(s_work.id, &local) == ESP_OK && local.chapter_uid &&
-                weread_toc_load(s_work.id, &toc) == ESP_OK && toc.count) {
-                size_t idx = SIZE_MAX;
-                for (size_t i = 0; i < toc.count; ++i) {
-                    if (toc.chapters[i].uid == local.chapter_uid) { idx = i; break; }
+            if (weread_progress_load(s_work.id, &local) == ESP_OK && local.chapter_uid) {
+                esp_err_t local_toc_err = weread_toc_load(s_work.id, &toc);
+                if (local_toc_err == ESP_ERR_NO_MEM) {
+                    trim_cover_cache_for_open();
+                    local_toc_err = weread_toc_load(s_work.id, &toc);
                 }
-                bool version_ok = !toc.book_version || !local.book_version || toc.book_version == local.book_version;
-                bool index_ok = idx != SIZE_MAX && (!local.chapter_index || local.chapter_index == toc.chapters[idx].index);
-                if (version_ok && index_ok && weread_chapter_cached(s_work.id, local.chapter_uid)) {
-                    if (!local.chapter_index) local.chapter_index = toc.chapters[idx].index;
-                    if (!local.book_version) local.book_version = toc.book_version;
-                    book_weread_adopt_prepared_local(s_work.id, &toc);
-                    weread_toc_free(&toc);
-                    stage_phase(WEREAD_STAGE_PARSE, 0);
-                    esp_err_t verr = book_weread_validate_prepared(s_work.id, local.chapter_uid, local.chapter_index,
-                        local.chapter_offset, &local.book_version);
-                    if (verr == ESP_OK) {
-                        s_result.local = local;
-                        s_choice.progress = local; s_choice.valid = true; s_choice.pending_cloud_sync = true;
-                        s_result.open_ready = true;
-                        phase[4] = now_ms();
-                        ESP_LOGI("weread", "open local-fast total=%u uid=%u off=%u",
-                            (unsigned)(phase[4] - phase[0]), (unsigned)local.chapter_uid, (unsigned)local.chapter_offset);
-                        return ESP_OK;
+                if (local_toc_err == ESP_OK && toc.count) {
+                    size_t idx = SIZE_MAX;
+                    for (size_t i = 0; i < toc.count; ++i) {
+                        if (toc.chapters[i].uid == local.chapter_uid) { idx = i; break; }
                     }
-                    book_weread_clear_prepared();
+                    bool version_ok = !toc.book_version || !local.book_version || toc.book_version == local.book_version;
+                    bool index_ok = idx != SIZE_MAX && (!local.chapter_index || local.chapter_index == toc.chapters[idx].index);
+                    if (version_ok && index_ok && weread_chapter_cached(s_work.id, local.chapter_uid)) {
+                        if (!local.chapter_index) local.chapter_index = toc.chapters[idx].index;
+                        if (!local.book_version) local.book_version = toc.book_version;
+                        book_weread_adopt_prepared_local(s_work.id, &toc);
+                        weread_toc_free(&toc);
+                        stage_phase(WEREAD_STAGE_PARSE, 0);
+                        esp_err_t verr = book_weread_validate_prepared(s_work.id, local.chapter_uid, local.chapter_index,
+                            local.chapter_offset, &local.book_version);
+                        if (verr == ESP_OK) {
+                            s_result.local = local;
+                            s_choice.progress = local; s_choice.valid = true; s_choice.pending_cloud_sync = true;
+                            s_result.open_ready = true;
+                            phase[4] = now_ms();
+                            ESP_LOGI("weread", "open local-fast total=%u uid=%u off=%u",
+                                (unsigned)(phase[4] - phase[0]), (unsigned)local.chapter_uid, (unsigned)local.chapter_offset);
+                            return ESP_OK;
+                        }
+                        book_weread_clear_prepared();
+                    }
                 }
             }
             weread_toc_free(&toc);
             have_local = weread_progress_load(s_work.id, &s_result.local) == ESP_OK && s_result.local.chapter_uid != 0;
         }
     }
+    trim_cover_cache_for_open();
     if (!choose) {
         weread_progress_t cloud_prog = {0};
         stage_phase(WEREAD_STAGE_PROGRESS, 0);
@@ -856,6 +873,7 @@ static esp_err_t job_run(void) {
         case WR_JOB_TOC:
             // 目录准备可能重新联网同步目录；解析与校验仍由目录服务内部完成。
             // TOC preparation may re-sync the TOC; parsing/validation stay inside the TOC service.
+            trim_cover_cache_for_open();
             stage_phase(WEREAD_STAGE_TOC, 0);
             err=book_weread_prepare_open(s_work.id);
             break;

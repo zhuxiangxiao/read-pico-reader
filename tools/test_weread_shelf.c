@@ -85,11 +85,17 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         cJSON *req = cJSON_Parse(body);
         assert(!strcmp(cJSON_GetArrayItem(cJSON_GetObjectItem(req, "bookIds"), 0)->valuestring, "A"));
         double key = cJSON_GetArrayItem(cJSON_GetObjectItem(req, "synckeys"), 0)->valuedouble;
-        assert(key == (toc_mode == 0 ? 0 : toc_mode == 1 ? 10 : 11));
+        double expected_key = toc_mode == 0 ? 0 : toc_mode == 1 ? 10 : toc_mode <= 3 ? 11 : toc_mode == 4 ? 12 : toc_mode == 5 ? 13 : 14;
+        assert(key == expected_key);
         cJSON_Delete(req);
         if (toc_mode == 0) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":10,\"clearAll\":1,\"bookVersion\":12,\"updated\":[{\"chapterUid\":90,\"chapterIdx\":2,\"title\":\"第二章\",\"updateTime\":9},{\"chapterUid\":80,\"chapterIdx\":1,\"title\":\"第一章\"}],\"removed\":[]}]}");
         else if (toc_mode == 1) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":11,\"clearAll\":0,\"updated\":[{\"chapterUid\":70,\"chapterIdx\":3,\"title\":\"第三章\"}],\"removed\":[80]}]}");
         else if (toc_mode == 2) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":12,\"clearAll\":1,\"bookVersion\":13,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"新版本\"}],\"removed\":[]}]}");
+        else if (toc_mode == 4) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":13,\"clearAll\":1,\"bookVersion\":13,\"updated\":[{\"chapterUid\":2,\"chapterIdx\":1,\"title\":\"\\\"quoted\\\" \\\\ slash \\n\\t\\u0001\",\"anchors\":[{\"title\":\"x\"}],\"tar\":\"deadbeef\",\"paid\":1,\"files\":[\"a.xhtml\"]}],\"removed\":[]}]}");
+        else if (toc_mode == 5) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":14,\"clearAll\":1,\"bookVersion\":13,\"updated\":[{\"chapterUid\":50,\"chapterIdx\":1,\"title\":\"old\"},{\"chapterUid\":50,\"chapterIdx\":2,\"title\":\"new\"}],\"removed\":[]}]}");
+        else if (toc_mode == 6) *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":99,\"clearAll\":1,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"bad\"}]}],\"errcode\":-1}");
+        else if (toc_mode == 7) *out = reply("{\"data\":[]}garbage");
+        else if (toc_mode == 8) *out = reply("{\"data\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}");
         else *out = reply("{\"data\":[{\"bookId\":\"A\",\"synckey\":12,\"clearAll\":1,\"updated\":[{\"chapterUid\":0,\"chapterIdx\":1,\"title\":\"损坏\"}]}]}");
     } else { assert(false); }
     *len = strlen(*out); return ESP_OK;
@@ -179,6 +185,24 @@ int main(void) {
     assert(toc.synckey == 11 && toc.count == 2); weread_toc_free(&toc);
     toc_mode = 2; assert(weread_toc_sync("A") == ESP_OK); assert(weread_toc_load("A", &toc) == ESP_OK);
     assert(toc.count == 1 && toc.chapters[0].uid == 1 && toc.book_version == 13); weread_toc_free(&toc);
+    toc_mode = 4; assert(weread_toc_sync("A") == ESP_OK); assert(weread_toc_load("A", &toc) == ESP_OK);
+    assert(toc.count == 1 && toc.chapters[0].uid == 2 && !strcmp(toc.chapters[0].title, "\"quoted\" \\ slash \n\t\x01"));
+    weread_toc_free(&toc);
+    {
+        char toc_path[512], raw_disk[2048];
+        assert(wr_cache_path("A", "chapters.json", toc_path, sizeof(toc_path)) == ESP_OK);
+        FILE *tf = fopen(toc_path, "rb"); assert(tf);
+        size_t rn = fread(raw_disk, 1, sizeof(raw_disk) - 1, tf); fclose(tf); raw_disk[rn] = 0;
+        assert(!strstr(raw_disk, "anchors") && !strstr(raw_disk, "deadbeef") && !strstr(raw_disk, "\"paid\"") && !strstr(raw_disk, "\"files\""));
+    }
+    toc_mode = 5; assert(weread_toc_sync("A") == ESP_OK); assert(weread_toc_load("A", &toc) == ESP_OK);
+    assert(toc.count == 1 && toc.chapters[0].uid == 50 && toc.chapters[0].index == 2 && !strcmp(toc.chapters[0].title, "new"));
+    weread_toc_free(&toc);
+    toc_mode = 6; assert(weread_toc_sync("A") != ESP_OK);
+    toc_mode = 7; assert(weread_toc_sync("A") != ESP_OK);
+    toc_mode = 8; assert(weread_toc_sync("A") != ESP_OK);
+    assert(weread_toc_load("A", &toc) == ESP_OK && toc.count == 1 && toc.chapters[0].uid == 50);
+    weread_toc_free(&toc);
     assert(weread_toc_sync("../escape") == ESP_ERR_INVALID_ARG);
     account("456"); assert(weread_shelf_count() == 0 && weread_shelf_load() != ESP_OK);
     assert(!weread_shelf_cache_fresh((uint64_t)time(NULL))&&cover_key!=weread_cover_key("A","https://cdn.qq.com/one"));
