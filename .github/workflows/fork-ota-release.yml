@@ -1,0 +1,231 @@
+name: Fork OTA Release
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch:
+    inputs:
+      board:
+        description: Target board(s) to build and publish
+        type: choice
+        options:
+          - all
+          - pico
+          - metalio47
+        default: all
+        required: true
+      revision:
+        description: Optional fork revision number override (leave empty to auto-increment)
+        type: string
+        default: ""
+        required: false
+      notes:
+        description: Optional release notes shown in OTA prompt and GitHub Release
+        type: string
+        default: ""
+        required: false
+      skip_host_tests:
+        description: Emergency switch to skip host tests before building
+        type: boolean
+        default: false
+        required: false
+      dry_run:
+        description: Build and package artifacts without creating Releases or deploying Pages
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ota_origin: ${{ steps.calc.outputs.ota_origin }}
+      matrix: ${{ steps.calc.outputs.matrix }}
+      boards_json: ${{ steps.calc.outputs.boards_json }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: calc
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_REVISION: ${{ inputs.revision }}
+        run: |
+          if [ "${{ github.repository }}" = "wegooo-cell/read-pico-reader" ]; then
+            echo "Refusing to run Fork OTA Release on upstream repository." >&2
+            exit 1
+          fi
+          python3 tools/fork_ota_config.py plan-release \
+            --board "${{ inputs.board || 'all' }}" \
+            --revision "$INPUT_REVISION" \
+            --repo "${{ github.repository }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  host-tests:
+    runs-on: ubuntu-latest
+    needs: plan
+    if: ${{ inputs.skip_host_tests != true }}
+    env:
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Clang for sanitizer host regressions
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/kiiko-host-cc"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/kiiko-host-cc/cc"
+          echo "$RUNNER_TEMP/kiiko-host-cc" >> "$GITHUB_PATH"
+      - name: Install host test dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends zlib1g-dev libssl-dev
+      - name: Run fork OTA and board consistency host tests
+        shell: bash
+        run: bash tools/run_fork_ota_host_tests.sh
+      - name: Run WeRead host tests
+        shell: bash
+        run: |
+          if [ -f tools/run_weread_host_tests.sh ]; then
+            bash tools/run_weread_host_tests.sh
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v6.1
+    needs: [plan, host-tests]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.host-tests.result == 'success' || needs.host-tests.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package ${{ matrix.board }} (${{ matrix.version }})
+        shell: bash
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          if [ -z "$NOTES" ] && [ "${{ github.event_name }}" = "push" ]; then
+            NOTES="$(git -c safe.directory="$GITHUB_WORKSPACE" tag -l --format='%(contents)' "${{ github.ref_name }}" 2>/dev/null || true)"
+          fi
+          . "$IDF_PATH/export.sh"
+          python tools/build_firmware.py \
+            --board "${{ matrix.board }}" \
+            --version "${{ matrix.version }}" \
+            --ota-origin "${{ needs.plan.outputs.ota_origin }}" \
+            --require-fork-ota \
+            --idf-${{ matrix.board }} "$IDF_PATH" \
+            --python "$(command -v python)" \
+            --output build/boards
+          python tools/fork_package_ota.py \
+            --board "${{ matrix.board }}" \
+            --build-dir build/boards \
+            --version "${{ matrix.version }}" \
+            --ota-origin "${{ needs.plan.outputs.ota_origin }}" \
+            --notes "$NOTES" \
+            --output "build/ota-dist/${{ matrix.board }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ota-release-${{ matrix.board }}
+          path: build/ota-dist/${{ matrix.board }}
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [plan, build]
+    if: ${{ inputs.dry_run != true }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: build/ota-dist
+          pattern: ota-release-*
+          merge-multiple: false
+      - name: Publish GitHub Releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          : > build/ota-dist/published-tags.txt
+          published_count=0
+          for meta in build/ota-dist/*/ota-metadata.json; do
+            [ -f "$meta" ] || continue
+            published_count=$((published_count + 1))
+            dir="$(dirname "$meta")"
+            eval "$(python3 - "$meta" <<'PY'
+          import json, shlex, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              m = json.load(fh)
+          for k in ("tag", "board", "name", "version", "base_version", "sha256", "size", "free_app_bytes", "bin_filename", "feed_filename", "tf_zip_filename", "usb_zip_filename", "ota_origin"):
+              print(f"{k.upper()}={shlex.quote(str(m.get(k) or ''))}")
+          PY
+          )"
+            notes_file="$dir/release-notes.md"
+            python3 - "$meta" "$notes_file" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              m = json.load(fh)
+          lines = [
+              f"## {m['name']} (`{m['board']}`) {m['version']}",
+              "",
+              f"- **上游基线**: `{m['base_version']}`",
+              f"- **OTA 源**: `{m['ota_origin']}`",
+              f"- **固件大小**: `{m['size']}` bytes（剩余槽位 `{m['free_app_bytes']}` bytes）",
+              f"- **SHA-256**: `{m['sha256']}`",
+              "",
+              "### 更新说明",
+              m["notes"],
+              "",
+              "### 首次从官方固件切入",
+              f"下载 `{m['tf_zip_filename']}` 解压到 TF 卡根目录，在设备「设置 → 升级和恢复」进行一次 TF 卡升级后，后续可直接在设备端联网 OTA。",
+          ]
+          with open(sys.argv[2], "w", encoding="utf-8") as fh:
+              fh.write("\n".join(lines) + "\n")
+          PY
+            assets=("$dir/$BIN_FILENAME" "$dir/$FEED_FILENAME" "$dir/$TF_ZIP_FILENAME")
+            if [ -n "$USB_ZIP_FILENAME" ] && [ -f "$dir/$USB_ZIP_FILENAME" ]; then
+              assets+=("$dir/$USB_ZIP_FILENAME")
+            fi
+            gh release create "$TAG" "${assets[@]}" \
+              --repo "${{ github.repository }}" \
+              --target "${{ github.sha }}" \
+              --title "$NAME ($BOARD) $VERSION" \
+              --notes-file "$notes_file"
+            echo "$TAG" >> build/ota-dist/published-tags.txt
+          done
+          if [ "$published_count" -eq 0 ]; then
+            echo "No packaged OTA metadata found under build/ota-dist" >&2
+            exit 1
+          fi
+      - name: Stage GitHub Pages OTA site from Releases
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          require_args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && require_args+=(--require-tag "$tag")
+          done < build/ota-dist/published-tags.txt
+          python3 tools/fork_stage_ota_pages.py _site \
+            --repo "${{ github.repository }}" \
+            --ota-origin "${{ needs.plan.outputs.ota_origin }}" \
+            "${require_args[@]}"
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4

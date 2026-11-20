@@ -4,7 +4,13 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
-static const char *valid = "{\"schema\":1,\"version\":\"0.3.3-rc79\",\"project\":\"" PICO_OTA_PROJECT "\",\"board\":\"" PICO_OTA_BOARD "\",\"layout\":\"" PICO_OTA_LAYOUT "\",\"minimum_base_version\":\"0.3.3-rc72\",\"url\":\"https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc79.bin\",\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"notes\":\"Test release\",\"size\":4096}";
+static const char *valid = "{\"schema\":1,\"version\":\"0.3.3-rc79\",\"project\":\"" PICO_OTA_PROJECT "\",\"board\":\"" PICO_OTA_BOARD "\",\"layout\":\"" PICO_OTA_LAYOUT "\",\"minimum_base_version\":\"0.3.3-rc72\",\"url\":\"" PICO_OTA_ORIGIN "Pico-update-0.3.3-rc79.bin\",\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"notes\":\"Test release\",\"size\":4096}";
+static void make_with_version(char *out, size_t cap, const char *ver) {
+ int n = snprintf(out, cap,
+  "{\"schema\":1,\"version\":\"%s\",\"project\":\"" PICO_OTA_PROJECT "\",\"board\":\"" PICO_OTA_BOARD "\",\"layout\":\"" PICO_OTA_LAYOUT "\",\"minimum_base_version\":\"0.3.3-rc72\",\"url\":\"" PICO_OTA_ORIGIN "Pico-update-0.3.3-rc79.bin\",\"sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",\"notes\":\"Test release\",\"size\":4096}",
+  ver);
+ assert(n > 0 && (size_t)n < cap);
+}
 int main(void) {
  pico_release_t release;
  assert(pico_release_parse(valid,strlen(valid),&release)==ESP_OK);
@@ -12,6 +18,25 @@ int main(void) {
  assert(pico_version_compare("0.3.3-rc79","0.3.3-rc9")>0);
  assert(pico_version_compare("0.3.3","0.3.3-rc79")>0);
  assert(pico_version_compare("0.4.0-rc1","0.3.3")>0);
+ assert(pico_version_compare("0.3.3-rc108.1","0.3.3-rc108")>0);
+ assert(pico_version_compare("0.3.3-rc108","0.3.3-rc108.1")<0);
+ assert(pico_version_compare("0.3.3-rc108.1","0.3.3-rc108.1")==0);
+ assert(pico_version_compare("0.3.3-rc108.2","0.3.3-rc108.1")>0);
+ assert(pico_version_compare("0.3.3-rc108.10","0.3.3-rc108.2")>0);
+ assert(pico_version_compare("0.3.3-rc109","0.3.3-rc108.99")>0);
+ assert(pico_version_compare("0.3.3-rc109.1","0.3.3-rc108.99")>0);
+ assert(pico_version_compare("0.3.3","0.3.3-rc109.99")>0);
+ assert(pico_version_compare("0.3.3-r1","0.3.3")>0);
+ assert(pico_version_compare("0.3.3-r2","0.3.3-r1")>0);
+ assert(pico_version_compare("0.3.4-rc1","0.3.3-r99")>0);
+#ifdef KIIKO_OTA_ORIGIN
+ assert(pico_release_url_valid(PICO_OTA_ORIGIN "Pico-update-0.3.3-rc108.1.bin"));
+ assert(!pico_release_url_valid(PICO_OTA_ORIGIN "../a.bin"));
+ assert(!pico_release_url_valid(PICO_OTA_ORIGIN "sub/a.bin"));
+ assert(!pico_release_url_valid(PICO_OTA_ORIGIN "a.bin?url=evil"));
+ assert(!pico_release_url_valid("https://wegooo-cell.github.io/read-pico-reader/Pico-update-0.3.3-rc108.bin"));
+ assert(!pico_release_url_valid("https://kiikoread.com/Pico-update-0.3.3-rc108.bin"));
+#else
  assert(pico_release_url_valid("https://kiikoread.com/Pico-update-0.3.3-rc90.bin"));
  assert(!pico_release_url_valid("https://kiikoread.com.evil/a.bin"));
  assert(!pico_release_url_valid("https://kiikoread.com@evil/a.bin"));
@@ -21,9 +46,20 @@ int main(void) {
  assert(!pico_release_url_valid("http://wegooo-cell.github.io/read-pico-reader/a.bin"));
  assert(!pico_release_url_valid("https://wegooo-cell.github.io.evil/read-pico-reader/a.bin"));
  assert(!pico_release_url_valid("https://wegooo-cell.github.io/read-pico-reader/../a.bin"));
+#endif
+ char altered[2048];
+ make_with_version(altered,sizeof(altered),"0.3.3-rc108.1");
+ assert(pico_release_parse(altered,strlen(altered),&release)==ESP_OK && !strcmp(release.version,"0.3.3-rc108.1"));
+ make_with_version(altered,sizeof(altered),"0.3.3-r1");
+ assert(pico_release_parse(altered,strlen(altered),&release)==ESP_OK && !strcmp(release.version,"0.3.3-r1"));
+ const char *bad_versions[]={"0.3.3-rc108.0","0.3.3-r0","0.3.3-rc108.","0.3.3-foo","0.3.3-rc108.70000","0.3.3-r70000"};
+ for(size_t i=0;i<sizeof(bad_versions)/sizeof(bad_versions[0]);++i){
+  make_with_version(altered,sizeof(altered),bad_versions[i]);
+  assert(pico_release_parse(altered,strlen(altered),&release)!=ESP_OK);
+ }
  assert(pico_release_parse(valid,strlen(valid)+1,&release)!=ESP_OK);
  assert(pico_release_parse("{}",2,&release)!=ESP_OK);
- char altered[2048]; snprintf(altered,sizeof(altered),"%s junk",valid);
+ snprintf(altered,sizeof(altered),"%s junk",valid);
  assert(pico_release_parse(altered,strlen(altered),&release)!=ESP_OK);
  snprintf(altered,sizeof(altered),"{\"schema\":1,%s",valid+1);
  assert(pico_release_parse(altered,strlen(altered),&release)!=ESP_OK);
@@ -40,5 +76,5 @@ int main(void) {
   snprintf(altered,sizeof(altered),"%.*s%u%s",(int)prefix,valid,sizes[i],p+4);
   assert((pico_release_parse(altered,strlen(altered),&release)==ESP_OK)==(sizes[i]<=PICO_OTA_IMAGE_MAX));
  }
- puts("PASS: release schema, bounded size, hashes, version ordering, board, duplicate/trailing payload and HTTPS origin");
+ puts("PASS: release schema, bounded size, hashes, 5-part version ordering, board, duplicate/trailing payload and HTTPS origin");
 }

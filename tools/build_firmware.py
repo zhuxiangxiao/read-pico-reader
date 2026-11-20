@@ -13,6 +13,7 @@ import subprocess
 import sys
 import zipfile
 from board_source_view import BOARDS, BOARD_ALIASES, canonical_board, materialize
+from fork_ota_config import parse_version_tuple, resolve_ota_origin
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,22 +38,23 @@ def partition_entries(data):
     return result
 
 
-def check_image(data, board):
+def check_image(data, board, expected_version=None):
     info = metadata(board)
     if len(data) < 288 or data[0] != 0xe9 or struct.unpack_from('<I', data, 32)[0] != 0xabcd5432:
         raise ValueError('Invalid ESP app image')
     field = lambda start: data[start:start + 32].split(b'\0')[0].decode('ascii')
     chip = struct.unpack_from('<H', data, 12)[0]
-    if chip != info['image_chip_id'] or field(80) != info['project'] or field(48) != info['version']:
+    target_version = expected_version or info['version']
+    if chip != info['image_chip_id'] or field(80) != info['project'] or field(48) != target_version:
         raise ValueError('Image chip/project/version does not match selected board')
     return {'chip_id': chip, 'project': field(80), 'version': field(48), 'size': len(data),
             'sha256': hashlib.sha256(data).hexdigest()}
 
 
-def export(build, output, board):
+def export(build, output, board, version=None, ota_origin=None):
     info = metadata(board)
     app = build / (info['project'] + '.bin')
-    identity = check_image(app.read_bytes(), board)
+    identity = check_image(app.read_bytes(), board, expected_version=version)
     entries = partition_entries((build / 'partition_table/partition-table.bin').read_bytes())
     csv = (ROOT / 'boards' / board / info['partitions']).read_text(encoding='utf-8')
     expected = {}
@@ -172,6 +174,8 @@ def export(build, output, board):
               'experimental_early_power_key': bool(early_key),
               'requires_bootloader_update': bool(early_key),
               'built': True, 'device_flashed': False, 'published': False}
+    if ota_origin:
+        result['ota_origin'] = ota_origin
     (output / 'verification.json').write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n')
     with zipfile.ZipFile(output.parent / f"kiikoread-{board}-{identity['version']}-USB.zip", 'w', zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(output.iterdir()):
@@ -215,8 +219,17 @@ def build_one(board, args):
         for index,value in enumerate(command):
             if value.startswith('-DSDKCONFIG_DEFAULTS='):
                 command[index]=value+';'+str(source/'.kiiko-early-key.defaults')
+    version = getattr(args, 'version', None) or info['version']
+    ota_origin = None
+    if not args.dry_run or args.ota_origin is not None or args.require_fork_ota:
+        ota_origin = resolve_ota_origin(explicit=args.ota_origin, require_fork=args.require_fork_ota)
     if args.dry_run:
-        print(json.dumps({'board': board, 'sdk': str(sdk), 'experimental_early_power_key':early_key, 'command': command}, ensure_ascii=False))
+        plan = {'board': board, 'sdk': str(sdk), 'experimental_early_power_key': early_key, 'command': command}
+        if args.version:
+            plan['version'] = version
+        if ota_origin:
+            plan['ota_origin'] = ota_origin
+        print(json.dumps(plan, ensure_ascii=False))
         return None
     # Retain the published HTTPS trust behavior on both boards, including real certificate dates.
     from prepare_tls_bundle import prepare
@@ -273,9 +286,13 @@ def build_one(board, args):
         shutil.copytree(cache, source / 'managed_components', dirs_exist_ok=True)
     env = dict(os.environ)
     env.update(IDF_PATH=str(sdk), IDF_TARGET=info['idf_target'], KIIKO_BOARD=board,
-               KIIKO_PROJECT_VER=info['version'], IDF_PYTHON_ENV_PATH=str(python.parent.parent),
+               KIIKO_PROJECT_VER=version, IDF_PYTHON_ENV_PATH=str(python.parent.parent),
                IDF_PYTHON_CHECK_CONSTRAINTS='no', IDF_SKIP_CHECK_SUBMODULES='1',
                IDF_CCACHE_ENABLE='0', IDF_VER='v6.1', ESP_IDF_VERSION='6.1.0')
+    if ota_origin:
+        env['KIIKO_OTA_ORIGIN'] = ota_origin
+    else:
+        env.pop('KIIKO_OTA_ORIGIN', None)
     for key in ('PICO_PROJECT_VER', 'METALIO_PROJECT_VER', 'KIIKO_LOCAL_LATENCY', 'METALIO_LOCAL_LATENCY'):
         env.pop(key, None)
     extra = [str(python.parent)]
@@ -291,7 +308,7 @@ def build_one(board, args):
     if result.returncode:
         print((work / 'build.log').read_text(errors='replace')[-8000:])
         raise RuntimeError(f'{board} build failed; see {work / "build.log"}')
-    result = export(build, args.output.resolve() / 'packages' / board, board)
+    result = export(build, args.output.resolve() / 'packages' / board, board, version=version, ota_origin=ota_origin)
     print(json.dumps(result, ensure_ascii=False))
     return result
 
@@ -320,8 +337,18 @@ def main():
     parser.add_argument('--s31-network-probe', action='store_true', help='Local S31 read-only radio counters; not a delivery default')
     parser.add_argument('--s31-transfer-startup-test', action='store_true', help='Unattended local S31 transfer startup; never deliver')
     parser.add_argument('--s31-early-power-key', action='store_true', help='Local S31 bootloader P17 capture experiment; requires a matched bootloader and application')
+    parser.add_argument('--version', default=None, help='Override firmware version (single-board builds only)')
+    parser.add_argument('--ota-origin', default=None, help='Override fork OTA HTTPS origin URL')
+    parser.add_argument('--require-fork-ota', action='store_true', help='Fail unless a valid non-upstream fork OTA origin is resolved')
     args = parser.parse_args()
     args.board = canonical_board(args.board)
+    if args.version:
+        if args.board == 'all':
+            parser.error('--version requires a single --board (pico or metalio47)')
+        try:
+            parse_version_tuple(args.version)
+        except ValueError as err:
+            parser.error(str(err))
     if args.s31_pie and args.board == 'pico':
         parser.error('--s31-pie requires metalio47 or all')
     if args.s31_text_ripple and args.board == 'pico':

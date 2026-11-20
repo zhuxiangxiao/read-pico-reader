@@ -10,10 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-// 只接收正式版本号，拒绝截断、溢出和未知后缀。/ Accept bounded release versions without truncation or unknown suffixes.
-static bool version_parts(const char *s, unsigned parts[4]) {
+// 只接收正式及派生版本号，拒绝截断、溢出和未知后缀。/ Accept bounded release and fork-revision versions without truncation or unknown suffixes.
+static bool version_parts(const char *s, unsigned parts[5]) {
     if (!s || !*s || strlen(s) > 32) return false;
-    memset(parts, 0, 4 * sizeof(*parts));
+    memset(parts, 0, 5 * sizeof(*parts));
     for (unsigned i = 0; i < 3; ++i) {
         if (!isdigit((unsigned char)*s)) return false;
         char *end; unsigned long n = strtoul(s, &end, 10);
@@ -21,31 +21,52 @@ static bool version_parts(const char *s, unsigned parts[4]) {
         parts[i] = (unsigned)n; s = end;
         if (i < 2 && *s++ != '.') return false;
     }
-    // 正式版排在该版本所有 rc 之后。/ A stable release sorts after its release candidates.
+    // 正式版排在该版本所有 rc 之后；派生修订号排在同基线之后。/ A stable release sorts after its release candidates; fork revisions sort after their base.
     parts[3] = 65536;
     if (!*s) return true;
-    if (strncmp(s, "-rc", 3)) return false;
-    s += 3;
-    if (!isdigit((unsigned char)*s)) return false;
-    char *end; unsigned long n = strtoul(s, &end, 10);
-    if (*end || n > 65535) return false;
-    parts[3] = (unsigned)n;
-    return true;
+    if (!strncmp(s, "-rc", 3)) {
+        s += 3;
+        if (!isdigit((unsigned char)*s)) return false;
+        char *end; unsigned long n = strtoul(s, &end, 10);
+        if (n > 65535) return false;
+        parts[3] = (unsigned)n;
+        s = end;
+        if (!*s) return true;
+        if (*s != '.') return false;
+        ++s;
+        if (!isdigit((unsigned char)*s)) return false;
+        unsigned long rev = strtoul(s, &end, 10);
+        if (*end || rev == 0 || rev > 65535) return false;
+        parts[4] = (unsigned)rev;
+        return true;
+    }
+    if (!strncmp(s, "-r", 2)) {
+        s += 2;
+        if (!isdigit((unsigned char)*s)) return false;
+        char *end; unsigned long rev = strtoul(s, &end, 10);
+        if (*end || rev == 0 || rev > 65535) return false;
+        parts[4] = (unsigned)rev;
+        return true;
+    }
+    return false;
 }
 int pico_version_compare(const char *a, const char *b) {
-    unsigned left[4], right[4];
+    unsigned left[5], right[5];
     if (!version_parts(a, left) || !version_parts(b, right)) return 0;
-    for (unsigned i = 0; i < 4; ++i) {
+    for (unsigned i = 0; i < 5; ++i) {
         if (left[i] < right[i]) return -1;
         if (left[i] > right[i]) return 1;
     }
     return 0;
 }
 bool pico_release_url_valid(const char *url) {
-    // 升级源限定官方 HTTPS 站点，避免重定向泄漏或被替换为任意下载源。
-    // Limit updates to the official HTTPS origin; do not follow arbitrary redirects.
+    // 升级源限定允许的 HTTPS 站点，避免重定向泄漏或被替换为任意下载源。
+    // Limit updates to allowed HTTPS origins; do not follow arbitrary redirects.
     static const char *const prefixes[] = {
-        "https://kiikoread.com/", "https://wegooo-cell.github.io/read-pico-reader/"
+        PICO_OTA_ORIGIN,
+#ifndef KIIKO_OTA_ORIGIN
+        PICO_OTA_FALLBACK_ORIGIN,
+#endif
     };
     if (!url || strlen(url) >= 256) return false;
     const char *name = NULL;
@@ -81,7 +102,7 @@ esp_err_t pico_release_parse(const char *json, size_t length, pico_release_t *re
     if (!end || end != json + length) valid = false;
     const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "schema");
     const cJSON *size = cJSON_GetObjectItemCaseSensitive(root, "size");
-    unsigned version[4], base[4];
+    unsigned version[5], base[5];
     valid = valid && cJSON_IsNumber(schema) && schema->valuedouble == 1 &&
         field(root, "version", release->version, sizeof(release->version)) &&
         field(root, "project", release->project, sizeof(release->project)) &&
@@ -91,10 +112,10 @@ esp_err_t pico_release_parse(const char *json, size_t length, pico_release_t *re
         field(root, "url", release->url, sizeof(release->url)) &&
         field(root, "sha256", release->sha256, sizeof(release->sha256)) &&
         field(root, "notes", release->notes, sizeof(release->notes)) &&
-        cJSON_IsNumber(size) && size->valuedouble >= 288 && size->valuedouble <= 0x400000 &&
+        cJSON_IsNumber(size) && size->valuedouble >= 288 && size->valuedouble <= PICO_OTA_IMAGE_MAX &&
         size->valuedouble == (uint32_t)size->valuedouble &&
         version_parts(release->version, version) && version_parts(release->minimum_base_version, base) &&
-        !strcmp(release->board, PICO_OTA_BOARD) && !strcmp(release->layout, PICO_OTA_LAYOUT) &&
+        !strcmp(release->project, PICO_OTA_PROJECT) && !strcmp(release->board, PICO_OTA_BOARD) && !strcmp(release->layout, PICO_OTA_LAYOUT) &&
         pico_release_url_valid(release->url) && strlen(release->sha256) == 64;
     if (valid) {
         for (unsigned i = 0; i < 64; ++i)

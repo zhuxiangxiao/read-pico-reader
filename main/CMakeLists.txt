@@ -418,6 +418,9 @@ if(NOT KIIKO_BOARD_METALIO47)
 endif()
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE KIIKO_UI_LOCALIZATION=1)
+if(EXISTS "${CMAKE_BINARY_DIR}/kiiko_fork_inc/kiiko_ota_origin_gen.h")
+    target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_BINARY_DIR}/kiiko_fork_inc")
+endif()
 
 # 解析、设置与页面调度按体积编译，为在线书源保留原分区；S31 保留热点绘制与微信读书/封面路径为性能优化(-O2)。
 # 首页概览、时钟控件与封面裁剪/缩放开销低、可重建，一并换出应用槽余量。

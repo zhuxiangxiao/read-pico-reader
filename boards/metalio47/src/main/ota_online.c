@@ -215,12 +215,19 @@ static bool check_feed(void) {
     char *json = heap_caps_malloc(8193, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     pico_release_t *release = heap_caps_calloc(1, sizeof(*release), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!json || !release) { state(PICO_UPDATE_FAILED, "内存不足，请退出传书后重试"); goto failed; }
-    // GitHub Pages清单优先，官网清单备用；同一缓冲区顺序请求，无并发TLS连接。
-    // Prefer GitHub Pages metadata, falling back to the website with one shared buffer and no concurrent TLS clients.
-    static const char *const feeds[] = {PICO_OTA_FEED_URL, PICO_OTA_FEED_FALLBACK_URL};
+    // GitHub Pages清单优先，官网清单备用（定制OTA源仅请求自身清单）；同一缓冲区顺序请求，无并发TLS连接。
+    // Prefer GitHub Pages metadata, falling back to the website unless KIIKO_OTA_ORIGIN pins a single fork origin.
+    static const char *const feeds[] = {
+        PICO_OTA_FEED_URL,
+#ifndef KIIKO_OTA_ORIGIN
+        PICO_OTA_FEED_FALLBACK_URL,
+#endif
+    };
     bool valid = false;
     for (size_t source = 0; source < sizeof(feeds) / sizeof(feeds[0]) && !atomic_load(&s_cancel); ++source) {
-        char url[192]; snprintf(url, sizeof(url), "%s?t=%lld", feeds[source], (long long)time(NULL));
+        char url[256];
+        int url_len = snprintf(url, sizeof(url), "%s?t=%lld", feeds[source], (long long)time(NULL));
+        if (url_len < 0 || (size_t)url_len >= sizeof(url)) continue;
         int code = -1; int64_t length = -1;
         esp_http_client_handle_t client = NULL;
         for (int i = 0; i < 2 && !atomic_load(&s_cancel); ++i) {
@@ -276,17 +283,23 @@ static bool download(void) {
     if (!layout_valid() || !target || target == esp_ota_get_running_partition() || release->size > target->size) {
         state(PICO_UPDATE_FAILED, "基础包不兼容，请通过官网完整刷机"); goto failed;
     }
-    // 两个允许的 HTTPS 源使用同一固定文件名和 SHA，连接失败才切换备用源。
-    // Both trusted HTTPS origins use the same immutable name/hash; switch only after connection failure.
-    static const char *const origins[] = {"https://wegooo-cell.github.io/read-pico-reader/", "https://kiikoread.com/"};
+    // 允许的 HTTPS 源使用同一固定文件名和 SHA，有备用源且连接失败时才切换。
+    // Trusted HTTPS origins use the same immutable name/hash; switch on connection failure when a fallback exists.
+    static const char *const origins[] = {
+        PICO_OTA_ORIGIN,
+#ifndef KIIKO_OTA_ORIGIN
+        PICO_OTA_FALLBACK_ORIGIN,
+#endif
+    };
+    const size_t origin_count = sizeof(origins) / sizeof(origins[0]);
     const char *filename = strrchr(release->url, '/');
     if (!filename || !pico_release_url_valid(release->url)) goto failed;
-    char download_urls[2][256];
-    for (unsigned source = 0; source < 2; ++source) {
+    char download_urls[sizeof(origins) / sizeof(origins[0])][256];
+    for (size_t source = 0; source < origin_count; ++source) {
         int size = snprintf(download_urls[source], sizeof(download_urls[source]), "%s%s", origins[source], filename + 1);
         if (size < 0 || (size_t)size >= sizeof(download_urls[source])) goto failed;
     }
-    unsigned download_source = 0;
+    size_t download_source = 0;
     int code = -1; int64_t length = -1;
     esp_http_client_handle_t client = NULL;
     download_range_t range;
@@ -304,7 +317,7 @@ static bool download(void) {
         if (!client) {
             if (wait_network()) client = open_http_range(download_urls[download_source], total, &range, &code, &length);
             if (!client) {
-                download_source = 1;
+                if (download_source + 1 < origin_count) ++download_source;
                 if (atomic_load(&s_cancel) || retries++ >= 3) { error = ESP_FAIL; break; }
                 vTaskDelay(pdMS_TO_TICKS(250 * retries)); continue;
             }
@@ -323,7 +336,7 @@ static bool download(void) {
             esp_http_client_cleanup(client); client = NULL;
             if (n == 0 && complete && total == release->size) break;
             complete = false;
-            download_source = 1;
+            if (download_source + 1 < origin_count) ++download_source;
             if (total >= release->size || atomic_load(&s_cancel) || retries++ >= 3) { error = ESP_FAIL; break; }
             vTaskDelay(pdMS_TO_TICKS(250 * retries));
             continue;

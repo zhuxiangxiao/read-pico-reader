@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "github_repo": "",
+  "ota_origin": "",
+  "upstream_repo": "wegooo-cell/read-pico-reader",
+  "upstream_remote": "upstream",
+  "upstream_branch": "main",
+  "retain_versions": 3,
+  "tag_prefix": {
+    "pico": "ota-pico-v",
+    "metalio47": "ota-s31-v"
+  }
+}
