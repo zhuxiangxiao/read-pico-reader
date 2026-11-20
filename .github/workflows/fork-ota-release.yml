@@ -96,7 +96,15 @@ jobs:
         shell: bash
         run: |
           if [ -f tools/run_weread_host_tests.sh ]; then
-            bash tools/run_weread_host_tests.sh
+            parser_dir="$RUNNER_TEMP/idf-v6.1/components/http_parser"
+            mkdir -p "$parser_dir"
+            curl -fsSL https://raw.githubusercontent.com/espressif/esp-idf/v6.1/components/http_parser/http_parser.c -o "$parser_dir/http_parser.c"
+            curl -fsSL https://raw.githubusercontent.com/espressif/esp-idf/v6.1/components/http_parser/http_parser.h -o "$parser_dir/http_parser.h"
+            printf '%s  %s\n%s  %s\n' \
+              'c164edcb06099b026e7ed853ed4d25536e83b4463d5e79921b28621e16588455' "$parser_dir/http_parser.c" \
+              '21fcfe834198349472a878e0334dd74b8571fafc70c6dd701169f525dd463041' "$parser_dir/http_parser.h" \
+              | sha256sum -c -
+            IDF_PATH="$RUNNER_TEMP/idf-v6.1" bash tools/run_weread_host_tests.sh
           fi
 
   build:
