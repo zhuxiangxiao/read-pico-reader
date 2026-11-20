@@ -453,12 +453,12 @@ foreach(weread_source IN LISTS kiiko_selected_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
         # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
         if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock|lock_screen|lock_pin|lock_pin_flow|setup_state|factory_reset|time_service|sleep|crash_note|sd_recovery|pmu_selftest|debug_panel|file_tree|file_search|usb_storage|book_added|book_ticket|book_excerpt|book_cover_auto|book_image_header|ui_home_widget|ui_quick_menu|ui_ai_menu|ui_lock_feedback|ui_avatar|app_weread|book_source_weread|book_weread_crypto|weread_client|weread_store|weread_shelf|weread_toc|weread_progress|weread_position|weread_runtime)\\.c$")
-            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
+            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions;-Wno-error=format-truncation")
         endif()
         # Pico 应用槽更紧：封面裁剪/缩放也走 Oz；S31 保留 Os 以免书架封面生成变慢。
         # Pico app slots are tighter: cover crop/scale also uses Oz; S31 keeps Os so shelf cover generation stays fast.
         if(NOT KIIKO_BOARD_METALIO47 AND weread_source_name STREQUAL "book_cover.c")
-            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
+            set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions;-Wno-error=format-truncation")
         endif()
     endif()
     if(weread_source MATCHES "(^|/)weread/" OR weread_source_name MATCHES "^(app_weread|book_weread_crypto|book_source_weread)\\.c$")
