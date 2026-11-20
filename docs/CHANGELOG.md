@@ -1,5 +1,64 @@
 # 版本变更 / Changelog
 
+## 本地测试 / Local test — 2026-11-20（设备同步失败提示）
+
+- 设备同步失败时显示「阶段：原因」：未找到另一台设备 / 配对后连接中断 / 传输中断 / 写入设置失败，并附具体错误原因；未知错误显示十六进制错误码。对端重开后自动跟随新的配对码，旧码不再被误报为「配对码或被拒绝」。
+- Device-sync failures now show the failed stage plus the concrete reason (no peer / link dropped after pairing / transfer interrupted / apply failed), with a hex code for unknown errors. A restarted peer's new pairing code is adopted, so a stale code is never reported as a rejection.
+
+## 本地测试 / Local test — 2026-11-20（全刷间隔迁移）
+
+- 升级后首次开机把「默认全刷间隔」一次性强制为「不强制」，覆盖旧设置；标记落盘后用户仍可自行改回。只关闭按页自动全刷，手动全刷不变。
+- The first boot after this update forces the periodic full-refresh interval to “never” once, overriding earlier values; once the marker is stored, later choices stick. Only the automatic page-count refresh is disabled; manual full refresh is unchanged.
+
+## 本地测试 / Local test — 2026-11-20（Pico 插图拖动）
+
+- Pico 双击放大插图后的单指拖动改用跟随 DU 逐帧差分（与设置滑块一致），松手后整屏 GC16 定稿，拖动更顺且不留残影。
+- Pico one-finger panning of a zoomed illustration now uses follow-DU frame diffs like the settings sliders, with a full-panel GC16 settle on release.
+
+## 本地测试 / Local test — 2026-11-19（Pico 保轨）
+
+- Pico 高压轨空闲保留时间由 8 秒延长到 30 秒，减少反复放电/上电次数，改善阳光下淡墨与连续翻页的一致性；像素驱动仍在每轮输出后立即释放。
+- Pico keeps the HV rails for thirty seconds instead of eight between outputs, cutting repeated discharge/power-up cycles and improving sunlight density and consecutive-turn consistency; pixel drive still releases after each output.
+
+## 本地测试 / Local test — 2026-11-19（Pico 翻页信息栏）
+
+- Pico 每次翻页后只把顶部状态栏与底部进度条的白底再退一次白，未变化的文字和图形保持不动；普通翻页本身仍整屏推白。
+- After each Pico turn only the white background of the status row and progress bar is pushed white again; unchanged text and graphics are held. Ordinary turns still push the whole panel white.
+
+## S31 0.3.3-rc116 — 2026-11-19
+
+- 优化 TXT/EPUB 章节识别、题头样式、卷页与章节分页，修复章首和段落异常留白。
+- 修复后续页章名显示，保留精排 EPUB 的图片、题头及自带格式。
+- 修复阅读线手势，新增保存格式，开关恢复样式、范围和位置。
+- 优化大书分段加载、插图内存管理与异常开书恢复。
+- 优化阅读进度存储，修复票根及拼贴锁屏的 TXT 封面。
+- 新增设备间设置和阅读资料同步。
+- 优化普通和水波纹翻页、工具栏与目录刷新，减少多余全刷，修复启动重启。
+
+## PICO 0.3.3-rc109 / S31 0.3.3-rc115 — 2026-11-19
+
+- 优化 TXT/EPUB 章节识别、题头样式、卷页与章节分页，修复章节首页和段落异常留白；精排 EPUB 优先保留自带格式。
+- 修复后续页章名显示和阅读线手势，新增「保存阅读线格式」。
+- 优化大书分段加载、插图内存管理、异常开书恢复及阅读进度存储。
+- 修复票根及拼贴锁屏的 TXT 封面，新增设备间设置与阅读资料同步。
+- S31 优化普通、水波纹、工具栏与目录刷新，减少重复全刷，修复启动循环重启。
+
+## 本地测试 / Local test — 2026-11-19
+
+- 两款机型修复章节首页提前截断正文、底部异常留白；全屏下使用完整正文区域，工具栏显隐保持分页及阅读位置。
+- Both boards fix prematurely shortened chapter-opening pages and unused space below the text. Chapter starts use the complete body, with pagination and source positions retained across toolbar visibility changes.
+- 两款机型修复触摸手势的阅读线开关；新增「保存阅读线格式」，一键恢复已保存的样式、范围和上下位置，支持重启、备份和设备同步。
+- Both boards fix reading-guide gesture toggles and add Save reading guide format. The saved style, span and position survive restarts, backups and device sync.
+
+- 两款机型的章节题头按实际高度加一行正文间距，不再按双行设计框整块留白；无书内样式的空白段不与阅读段距叠加，修正首段、第二段之间异常大空隙，保留原书明确样式。
+- Both boards reserve measured chapter headings plus one body row instead of a fixed two-row canvas. Unstyled source blanks no longer stack with reader paragraph spacing,fixing excessive gaps between opening paragraphs while preserving authored layouts.
+
+- S31阅读水波纹使用四带错相、尾两带合并，纯文字扫描由44拍减至39拍，保留37相GL16完整灰阶与正文局刷。插图40→35拍、背景36→31拍；普通翻页、主页、设置列表及PICO保持原样。
+- S31 reader ripple uses four staggered bands with a paired tail, reducing text scans from44 to39 ticks while retaining all37 GL16 phases and body-only crops. Art40→35,background36→31; ordinary turns,main pages,settings lists andPICO retain their profiles.
+
+- S31纯文字水波纹保持重合黑字和灰边，目标白色在尾部三拍补白、最后一拍保持，整理旧字残影与空白区域。继续37相GL16、39拍，非白目标及普通/插图/背景原表保持。残影与过渡观感待实机验收。
+- S31 text ripple holds overlapping black/grays,reinforces white targets in three tail phases and holds the final phase to settle erased text and blank areas. Keep37-phase GL16 over39 ticks,nonwhite transitions and ordinary/art/background tables; optical acceptance remains pending.
+
 ## 本地测试 / Local test — 2026-11-18
 
 - Pico 普通翻页改为整屏推白并重推黑：顶部状态栏、书名与底部章节/进度一起擦白；波形把厂商定稿保持挪到擦白之前，重推黑作为最后一段驱动，减少阳光下黑字发灰。

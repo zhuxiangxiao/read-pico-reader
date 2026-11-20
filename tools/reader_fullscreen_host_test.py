@@ -8,7 +8,7 @@ from home_cover_cache_host_test import function
 
 ROOT = Path(__file__).resolve().parents[1]
 BOOK = ROOT / 'main/apps/app_book.c'
-unit = r'''
+unit = '#define TEST_IMAGE_RIPPLE '+str(int('from_image_frame' in function('turn_page',BOOK)))+'\n'+r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -35,7 +35,8 @@ static void weread_reader_input(bool local){if(!local)weread_runtime_cancel_join
 static void wr_reader_move(void){}
 static struct {bool pending;}s_wr_jump;
 static void wr_chapter_cancel(void){s_wr_jump.pending=false;}
-static bool s_requested_fullscreen=true,s_requested_resume_mode;static uint8_t s_requested_open_origin;
+static bool s_requested_fullscreen=true,s_requested_open_home,s_requested_resume_mode,s_shelf_open_queued;
+static uint8_t s_requested_open_origin;
 static bool default_fullscreen;
 static bool app_settings_reader_default_fullscreen(void){return default_fullscreen;}
 // Real reader_zoom_reset dependencies: keep its cleanup in the exercised turn path.
@@ -47,7 +48,12 @@ static uint32_t s_image_zoom_start_distance;
 static uint8_t *s_zoom_bits;
 static struct {bool pending;} s_reader_tap;
 static const char *s_text="text";
-static size_t s_text_len=900,s_block_count,s_chapter,s_page,s_jump_offset;
+static size_t s_text_len=900,s_block_count,s_chapter,s_page,s_jump_offset,s_part_base;
+static bool s_part_more;
+static bool from_image_frame __attribute__((unused));
+static bool s_reader_image_frame __attribute__((unused)),s_reader_image_exit_pending __attribute__((unused));
+static int s_turn_direction __attribute__((unused));
+static char s_reader_notice[128];static int64_t s_reader_notice_until;
 typedef struct {int image;unsigned image_width,image_height;} blk_t;
 static blk_t *s_blocks;
 static int s_px=48,s_reader_panel=READER_PANEL_NONE,s_reader_slider=-1,s_view=READING;
@@ -56,7 +62,6 @@ static bool s_reader_fullscreen,s_clear_confirm,s_reader_text_frame,s_reader_tur
 static bool s_water_turn_pending,s_reader_cleanup,draw_locked,load_failed;
 static int s_water_turn_dir;
 static unsigned s_stats_pending_turns,s_session_turns,s_turns,s_unsaved;
-static void ticket_count_turn(void){++s_stats_pending_turns;++s_session_turns;}
 static int64_t s_last_turn_ms,s_stats_activity_ms;
 static bool s_save_failed;
 static char s_message[128];
@@ -84,10 +89,9 @@ static void app_settings_set_reader_power_turn(bool v){power_turn=v;}
 static EpdRect body_rect(void){
  return(EpdRect){0,0,684,app_settings_reader_immersive()?180:100};
 }
-static char s_chapter_heading_title[8],s_chapter_heading_label[8],s_reader_notice[128];
+static char s_chapter_heading_title[8],s_chapter_heading_label[8];
 static size_t s_chapter_lead_skip,s_image_count;static unsigned s_chapter_lead_row_height;
 static bool s_reader_footer_pending,s_reader_image_refresh_pending;
-static int64_t s_reader_notice_until;
 static void *s_images[1];
 static int book_chapter_image_dimensions(size_t ch,void *image,unsigned *w,unsigned *h){(void)ch;(void)image;*w=*h=1;return 0;}
 #define ESP_OK 0
@@ -104,6 +108,11 @@ static bool book_layout_build_blocks(const char *text,size_t len,const void *blo
 static void release_page_images(void){}
 static void prepare_inline_image(void){}
 static void save_progress(void){++saves;}
+// Chapter geometry is verified with the real paginator in reader_chapter_viewport_host_test.
+static void reader_heading_viewport(void){}
+#define READER_TICKET_DAY_MS UINT64_C(86400000)
+static uint64_t book_ticket_local_time_ms(void){return 0;}
+static void ticket_add(uint32_t day,uint32_t ms,uint32_t turns){(void)day;assert(!ms);s_stats_pending_turns+=turns;}
 static void free_book(void){assert(!draw_locked);s_text=NULL;}
 static size_t book_chapter_count(void){return 2;}
 static bool load_chapter(app_ctx_t *ctx,size_t chapter,int off,bool last){(void)ctx;(void)off;if(load_failed)return false;s_chapter=chapter;s_page=last?book_layout_page_count()-1:0;return true;}
@@ -130,6 +139,7 @@ static void book_layout_set_first_line_indent(unsigned em){assert(draw_locked);l
 static void book_layout_set_first_line_indent_adjust(int px){assert(draw_locked);layout_adjustment=px;}
 """
 unit+='static bool s_rc_auto_turning,s_rc_auto_waiting;\nstatic reader_auto_clock_t s_rc_auto;\n'+function('rc_pause_auto',ROOT/'main/apps/book_reader_controls_runtime.inc')+'\n'
+unit += function('ticket_count_turn',ROOT/'main/apps/book_ticket_reader.inc')+'\n'
 unit += function('apply_reader_indent', BOOK) + '\n'
 for name in ('wr_reader_text_page','wr_reader_text_turn'):
     unit += function(name, ROOT/'main/apps/book_weread_bridge.inc') + '\n'
@@ -206,8 +216,8 @@ int main(void){
  }
  reset(true,false,2,0);test_images=1;assert(turn_page(&ctx,1)==APP_REDRAW_AREA);
  test_images=0;effect=1;
- // Mixed/image targets and leaving an image never run the text ripple waveform.
- reset(true,false,2,0);test_images=2;assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_water_turn_pending&&!s_reader_turn_pending);
+ // S31 mixed/image targets use the image-capable ripple; Pico retains its existing image routing.
+ reset(true,false,2,0);test_images=2;assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&s_water_turn_pending==TEST_IMAGE_RIPPLE&&!s_reader_turn_pending);
  reset(true,false,2,0);test_images=0;s_reader_text_frame=false;
  assert(turn_page(&ctx,1)==APP_REDRAW_AREA&&!s_water_turn_pending&&!s_reader_turn_pending);
  test_images=0;
