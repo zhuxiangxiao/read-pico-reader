@@ -113,25 +113,32 @@ def test_config_and_versions() -> None:
     assert cfg.next_revision_for_base("0.3.3-rc109", ["0.3.3-rc108.1", "0.3.3-rc108.2"]) == 1
     assert cfg.next_revision_for_base("0.3.3", ["0.3.3-rc109.2", "0.3.3-r1"]) == 2
 
+    pico_base = cfg.board_spec("pico", root=ROOT)["base_version"]
+    s31_base = cfg.board_spec("metalio47", root=ROOT)["base_version"]
+    pico_rev1 = cfg.format_fork_version(pico_base, 1)
+    pico_rev2 = cfg.format_fork_version(pico_base, 2)
+    s31_rev2 = cfg.format_fork_version(s31_base, 2)
+    s31_rev3 = cfg.format_fork_version(s31_base, 3)
+
     plan = cfg.plan_release(
         board="all",
         repo="example-fork/read-pico-reader",
         releases=[
-            {"tag_name": "ota-pico-v0.3.3-rc108.1", "draft": False},
-            {"tag_name": "ota-s31-v0.3.3-rc114.2", "draft": False},
+            {"tag_name": f"ota-pico-v{pico_rev1}", "draft": False},
+            {"tag_name": f"ota-s31-v{s31_rev2}", "draft": False},
         ],
     )
     assert plan["ota_origin"] == FORK_ORIGIN
     by_board = {entry["board"]: entry for entry in plan["boards"]}
-    assert by_board["pico"]["version"] == "0.3.3-rc108.2"
-    assert by_board["metalio47"]["version"] == "0.3.3-rc114.3"
+    assert by_board["pico"]["version"] == pico_rev2
+    assert by_board["metalio47"]["version"] == s31_rev3
 
     try:
         cfg.plan_release(
             board="pico",
             revision="1",
             repo="example-fork/read-pico-reader",
-            releases=[{"tag_name": "ota-pico-v0.3.3-rc108.1", "draft": False}],
+            releases=[{"tag_name": f"ota-pico-v{pico_rev1}", "draft": False}],
         )
     except ValueError:
         pass

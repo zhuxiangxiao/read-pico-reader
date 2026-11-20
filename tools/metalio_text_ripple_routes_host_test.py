@@ -33,6 +33,14 @@ static void reader_zoom_reset(void){}
 static size_t current_toc_position(void){return 0;}
 static int book_toc_open(size_t position){(void)position;return 0;}
 static void toc_cached_markers_prepare(int page){(void)page;}
+static char s_path[64]="/sdcard/book.epub";
+static bool book_path_is_weread(const char*p){(void)p;return false;}
+static struct {bool pending;} s_wr_jump;
+static void wr_chapter_cancel(void){s_wr_jump.pending=false;}
+static bool wr_reader_text_page(void){return false;}
+static bool wr_reader_text_turn(int dir){(void)dir;return false;}
+static void weread_reader_input(bool local){(void)local;}
+static void wr_reader_move(void){}
 static int images,effect,full,s_turns,s_turn_direction,s_view,s_water_turn_dir,s_unsaved;
 static unsigned s_page,s_chapter;
 static int64_t s_last_turn_ms,s_stats_activity_ms;
