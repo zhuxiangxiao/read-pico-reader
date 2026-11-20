@@ -127,6 +127,10 @@ jobs:
             NOTES="$(git -c safe.directory="$GITHUB_WORKSPACE" tag -l --format='%(contents)' "${{ github.ref_name }}" 2>/dev/null || true)"
           fi
           . "$IDF_PATH/export.sh"
+          board_release_flags=()
+          if [ "${{ matrix.board }}" = metalio47 ]; then
+            board_release_flags=(--s31-pie --s31-reader-panel37 --s31-shelf37 --s31-settings-short-motion)
+          fi
           python tools/build_firmware.py \
             --board "${{ matrix.board }}" \
             --version "${{ matrix.version }}" \
@@ -134,7 +138,8 @@ jobs:
             --require-fork-ota \
             --idf-${{ matrix.board }} "$IDF_PATH" \
             --python "$(command -v python)" \
-            --output build/boards
+            --output build/boards \
+            "${board_release_flags[@]}"
           python tools/fork_package_ota.py \
             --board "${{ matrix.board }}" \
             --build-dir build/boards \

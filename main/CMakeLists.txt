@@ -434,18 +434,25 @@ set(weread_cold_size_sources
     app_cloud_sync.c ui_keyboard.c ota_online.c ota_release.c app_onboarding.c ui_wallpaper.c
     boot_state.c app_registry.c app_boot_recovery.c ota_update.c
     app_font_pick.c ui_online_fonts.c online_font_store.c online_font.c
-    ui_ime.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c)
+    ui_ime.c book_store.c ui_pinpad.c ui_power_dialog.c datamatrix.c ui_menu.c ui_nav.c ui_wifi_qr.c ui_click_feedback.c ui_text_input.c ui_text_edit.c ui_quick_menu_input.c
+    lock_screen.c lock_pin.c lock_pin_flow.c setup_state.c factory_reset.c time_service.c sleep.c
+    crash_note.c sd_recovery.c pmu_selftest.c debug_panel.c file_tree.c file_search.c usb_storage.c
+    book_added.c book_ticket.c book_excerpt.c book_cover_auto.c book_image_header.c
+    ui_home_widget.c ui_quick_menu.c ui_ai_menu.c ui_lock_feedback.c ui_avatar.c
+    app_weread.c book_source_weread.c book_weread_crypto.c
+    weread_client.c weread_store.c weread_shelf.c weread_toc.c weread_chapter.c
+    weread_progress.c weread_position.c weread_runtime.c)
 set(weread_size_sources ${weread_cold_size_sources})
 if(NOT KIIKO_BOARD_METALIO47)
     list(APPEND weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_reader.c
-        app_book.c)
+        app_book.c ui_shelf.c ui_kit.c book_progress.c)
 endif()
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
         # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
-        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock)\\.c$")
+        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock|lock_screen|lock_pin|lock_pin_flow|setup_state|factory_reset|time_service|sleep|crash_note|sd_recovery|pmu_selftest|debug_panel|file_tree|file_search|usb_storage|book_added|book_ticket|book_excerpt|book_cover_auto|book_image_header|ui_home_widget|ui_quick_menu|ui_ai_menu|ui_lock_feedback|ui_avatar|app_weread|book_source_weread|book_weread_crypto|weread_client|weread_store|weread_shelf|weread_toc|weread_progress|weread_position|weread_runtime)\\.c$")
             set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions")
         endif()
         # Pico 应用槽更紧：封面裁剪/缩放也走 Oz；S31 保留 Os 以免书架封面生成变慢。
