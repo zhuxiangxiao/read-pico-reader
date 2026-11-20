@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LicenseRef-Kiikoread-Personal-Study-1.0
 from pathlib import Path
-import re,subprocess
+import os,re,subprocess
 root=Path(__file__).resolve().parents[1]; out=root/'build/weread-tests/cache-ui'
 out.mkdir(parents=True,exist_ok=True)
 def function(path,name):
@@ -27,6 +27,6 @@ funcs=['message','release_covers','stop_job','compare_match','filter_page','filt
 (out/'shared.inc').write_text(''.join(function(Path('main/ui/ui_shelf.c'),n) for n in ['ui_shelf_rows','ui_shelf_entry','ui_shelf_cover','ui_shelf_order_mode','ui_shelf_order_desc','ui_shelf_order_value','ui_shelf_order_rect','ui_shelf_order_select','shelf_pager_group_rect','ui_shelf_search_rect']))
 (out/'production.inc').write_text(state+'\n'+''.join(function(Path('main/apps/app_weread.c'),n) for n in funcs))
 (out/'cover.inc').write_text(''.join(function(Path('main/weread/weread_shelf.c'),n) for n in ['weread_cover_key','weread_cover_get_url','weread_cover_retry_url','weread_cover_retry_result']))
-args=['/usr/bin/cc','-pthread','-std=c11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-Wno-unused-parameter','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-Imain','-Imain/book','-Imain/weread','-Itools/weread_stubs','-I'+str(out),str(root/'tools/test_weread_cache_ui.c'),'-o',str(out/'probe')]
+args=[os.environ.get('CC','cc'),'-pthread','-std=c11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror','-Wno-unused-function','-Wno-unused-variable','-Wno-unused-parameter','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-Imain','-Imain/book','-Imain/weread','-Itools/weread_stubs','-I'+str(out),str(root/'tools/test_weread_cache_ui.c'),'-o',str(out/'probe')]
 subprocess.run(args,check=True,cwd=root)
 subprocess.run([str(out/'probe')],check=True,cwd=root)

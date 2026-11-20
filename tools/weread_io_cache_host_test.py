@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: LicenseRef-Kiikoread-Personal-Study-1.0
 """Exercise production extract and worker cover-routing boundaries under sanitizers."""
 from pathlib import Path
+import os
 import re
 import subprocess
 
 root = Path(__file__).resolve().parents[1]
 out = root / 'build/weread-tests/io-cache'
 out.mkdir(parents=True, exist_ok=True)
-flags = ['/usr/bin/cc', '-pthread', '-std=c11', '-D_DEFAULT_SOURCE', '-Wall',
+flags = [os.environ.get('CC', 'cc'), '-pthread', '-std=c11', '-D_DEFAULT_SOURCE', '-Wall',
          '-Wextra', '-Werror', '-Wno-deprecated-declarations', '-g',
          '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-Imain',
          '-Imain/book', '-Imain/weread', '-Itools/weread_stubs', '-I'+str(out)]

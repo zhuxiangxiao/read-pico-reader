@@ -490,7 +490,7 @@ int main(void) {
             f.write(c_test_src)
 
         cmd = [
-            "/usr/bin/cc",
+            os.environ.get("CC", "cc"),
             "-std=c11",
             "-Wall",
             "-Wextra",

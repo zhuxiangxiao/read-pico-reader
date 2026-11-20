@@ -11,7 +11,7 @@ build=root/'build/night-optimization/outbox-tests'
 build.mkdir(parents=True,exist_ok=True)
 source=(root/'main/weread/weread_store.c').read_text()
 (build/'store.c').write_text(source.replace('esp_err_t wr_write_json(', 'esp_err_t actual_write_json(',1))
-args=['/usr/bin/cc','-std=c11','-D_DEFAULT_SOURCE','-pthread','-Wall','-Wextra','-Werror',
+args=[os.environ.get('CC','cc'),'-std=c11','-D_DEFAULT_SOURCE','-pthread','-Wall','-Wextra','-Werror',
       '-Wno-deprecated-declarations','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
       '-Imain','-Imain/book','-Imain/weread','-Itools/weread_stubs',
       'tools/test_weread_outbox.c','main/weread/weread_progress.c','main/book/book_weread_crypto.c',

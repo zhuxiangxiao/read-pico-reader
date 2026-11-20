@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LicenseRef-Kiikoread-Personal-Study-1.0
 """Extract production CSS/version functions for bounded host fault-injection tests."""
 from pathlib import Path
-import re,subprocess
+import os,re,subprocess
 root=next(p for p in Path(__file__).resolve().parents if (p/'main/weread').is_dir() and (p/'tools/weread_stubs').is_dir())
 out=root/'build/weread-tests/cache-regression';out.mkdir(parents=True,exist_ok=True)
 def function(path,name):
@@ -95,5 +95,5 @@ int main(void){
     puts("Version: persistent OOM and creation OOM retain old value; unchanged avoids persistence.");return 0;
 }
 ''')
-args=['/usr/bin/cc','-std=c11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-Imain/weread','-Itools/weread_stubs','-I'+str(out),str(out/'test.c'),'tools/weread_stubs/cJSON.c','-lm','-o',str(out/'test')]
+args=[os.environ.get('CC','cc'),'-std=c11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror','-Wno-deprecated-declarations','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer','-Imain/weread','-Itools/weread_stubs','-I'+str(out),str(out/'test.c'),'tools/weread_stubs/cJSON.c','-lm','-o',str(out/'test')]
 subprocess.run(args,cwd=root,check=True);subprocess.run([str(out/'test')],cwd=root,check=True)

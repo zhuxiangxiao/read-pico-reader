@@ -108,7 +108,8 @@ static void ui_shelf_order_menu(uint8_t*f,unsigned order,const char*s){}
 #include "shared.inc"
 static const void *app_at(int i){return(void*)1;}
 bool weread_runtime_start(weread_job_t job,const char*id,const char*value){
-    if(mock_busy||mock_ready)return false;assert(nstarts<256);
+    if(mock_busy||mock_ready)return false;
+    assert(nstarts<256);
     starts[nstarts].job=job;snprintf(starts[nstarts].id,64,"%s",id?id:"");snprintf(starts[nstarts].value,600,"%s",value?value:"");nstarts++;if(job==WR_JOB_SYNC)nsync++;mock_busy=true;return true;
 }
 bool weread_runtime_busy(void){return mock_busy;}

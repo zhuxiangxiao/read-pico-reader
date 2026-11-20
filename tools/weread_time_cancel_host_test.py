@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: LicenseRef-Kiikoread-Personal-Study-1.0
 """Exercise production WeRead/transfer cancellation, ownership and late DNS callbacks."""
 from pathlib import Path
+import os
 import re
 import subprocess
 
@@ -217,6 +218,6 @@ int main(void){struct sockaddr_in peer={0};
 for name, unit in [('owner', OWNER), ('pico', PICO), ('connect', CONNECT), ('s31', S31), ('dns', DNS)]:
     source, binary = BUILD / f'{name}.c', BUILD / name
     source.write_text(unit)
-    subprocess.run(['/usr/bin/cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-variable',
+    subprocess.run([os.environ.get('CC', 'cc'), '-std=c11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-variable',
                     '-g', '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

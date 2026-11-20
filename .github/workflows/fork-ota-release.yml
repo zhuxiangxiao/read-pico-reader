@@ -83,6 +83,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kiiko-host-cc"
           ln -s "$(command -v clang)" "$RUNNER_TEMP/kiiko-host-cc/cc"
           echo "$RUNNER_TEMP/kiiko-host-cc" >> "$GITHUB_PATH"
+          echo "CC=$(command -v clang)" >> "$GITHUB_ENV"
       - name: Install host test dependencies
         shell: bash
         run: |
