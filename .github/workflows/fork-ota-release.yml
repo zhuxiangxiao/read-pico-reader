@@ -63,8 +63,16 @@ jobs:
             echo "Refusing to run Fork OTA Release on upstream repository." >&2
             exit 1
           fi
+          board="${{ inputs.board }}"
+          if [ -z "$board" ]; then
+            case "${{ github.ref_name }}" in
+              release-s31-*|release-metalio47-*) board=metalio47 ;;
+              release-pico-*) board=pico ;;
+              *) board=all ;;
+            esac
+          fi
           python3 tools/fork_ota_config.py plan-release \
-            --board "${{ inputs.board || 'all' }}" \
+            --board "$board" \
             --revision "$INPUT_REVISION" \
             --repo "${{ github.repository }}" \
             --github-output "$GITHUB_OUTPUT"

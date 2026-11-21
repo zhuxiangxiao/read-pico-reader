@@ -38,6 +38,8 @@ git tag -a release-20261120 -m "本次更新说明（将显示在固件 OTA 提�
 git push origin release-20261120
 ```
 
+- 仅发单板时也可使用对应前缀标签：`release-s31-*`（仅发布 Metalio S31 / `metalio47`）或 `release-pico-*`（仅发布 Pico / `pico`）。
+
 > 若仓库 `Settings → Environments → github-pages` 的 Deployment branches and tags 仅限 `main`，请在该环境规则中添加 `release-*` 标签放行（或改在 `main` 分支通过下方方式 B 触发）。
 
 ### 方式 B：GitHub 网页手动触发
