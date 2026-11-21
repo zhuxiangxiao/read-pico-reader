@@ -155,6 +155,10 @@ int main(void){
  // Async cloud-sync forward jump commits directly and shows toast.
  cloud_jump_ready=true;cloud_jump_ch=12;cloud_jump_off=40;
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&cloud_jump_committed&&s_chapter==12&&strstr(s_reader_notice,"已同步云端进度"));
+ // Cold-chapter OOM surfaces the retry-later toast instead of generic load failure.
+ assert(wr_chapter_queue(&ctx,13,0,false,NULL,SIZE_MAX));
+ complete(ESP_ERR_NO_MEM);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
+ assert(!s_wr_jump.pending&&s_chapter==12&&!strcmp(s_reader_notice,"内存不足，请稍后重试"));
  puts("PASS: production chapter controller adopts prefetch, applies cloud jumps, coalesces targets, and cancels safely");
 }
 '''

@@ -415,7 +415,7 @@ void weread_client_strip_sensitive_headers(const char *url, const char *in_heade
     }
 }
 
-static struct { char vid[WEREAD_VID_MAX_LEN], token[WEREAD_TOKEN_MAX_LEN], refresh[WEREAD_TOKEN_MAX_LEN]; } s_login_cookies;
+static WR_EXT_BSS struct { char vid[WEREAD_VID_MAX_LEN], token[WEREAD_TOKEN_MAX_LEN], refresh[WEREAD_TOKEN_MAX_LEN]; } s_login_cookies;
 void weread_client_forget_login_cookies(void) { weread_secure_zero(&s_login_cookies,sizeof(s_login_cookies)); }
 bool weread_client_login_cookie(const char *key, char *out, size_t cap) {
     const char *v = !strcmp(key,"wr_vid") ? s_login_cookies.vid : !strcmp(key,"wr_skey") ? s_login_cookies.token : !strcmp(key,"wr_rt") ? s_login_cookies.refresh : "";
@@ -460,7 +460,7 @@ static uint64_t client_now_ms(void) {
 }
 #if defined(ESP_PLATFORM)
 #define HTTP_POOL_IDLE_MS 25000u
-static struct {
+static WR_EXT_BSS struct {
     esp_http_client_handle_t client;
     char host[128];
     char peer[48];

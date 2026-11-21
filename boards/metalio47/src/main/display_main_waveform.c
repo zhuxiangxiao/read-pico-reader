@@ -16,6 +16,13 @@
 #include <stdbool.h>
 #include <string.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#define MAIN_WAVE_RAM EXT_RAM_BSS_ATTR
+#else
+#define MAIN_WAVE_RAM
+#endif
+
 // 仅追加目标白驱动及释放；源动作、灰阶、电压和扫描节拍不变。
 // Append changed-white drives and release holds without altering native actions, grays, voltage or cadence.
 typedef struct {
@@ -54,7 +61,7 @@ static const EpdWaveform* main_quality_waveform_impl(
     const EpdWaveform* source,enum EpdDrawMode draw_mode,unsigned white_phases,bool equal_white
 ) {
     enum { SLOTS=24 };
-    static white_tail_t slots[SLOTS];
+    static MAIN_WAVE_RAM white_tail_t slots[SLOTS];
     const int mode=draw_mode&0x3f;
     if(!source || (mode!=MODE_DU && mode!=MODE_GL16) ||
        (white_phases!=6 && white_phases!=8))return source;
@@ -100,7 +107,7 @@ const EpdWaveform* display_main_clean_waveform(const EpdWaveform* source,enum Ep
 // 列表保留灰阶，整片背景补八相，下半区补十相；各自保留两相释放。
 // Lists retain grays with eight white-background drives, ten below, and two release phases each.
 static const EpdWaveform* settings_scroll_waveform(bool lower) {
-    static white_tail_t slots[2];
+    static MAIN_WAVE_RAM white_tail_t slots[2];
     white_tail_t* slot=&slots[lower?1:0];
     if(slot->source)return &slot->wave;
     const EpdWaveform* source=display_main_normal_waveform();
@@ -124,7 +131,7 @@ const EpdWaveform* display_main_switch_waveform(const EpdWaveform* source, enum 
         const EpdWaveformMode *profile_ptr;
         EpdWaveform wave;
     } slot_t;
-    static slot_t slots[SLOTS];
+    static MAIN_WAVE_RAM slot_t slots[SLOTS];
     const int mode=draw_mode&0x3f;
     if(!source || (mode!=MODE_DU && mode!=MODE_GL16))return source;
     bool derived=false;
@@ -162,14 +169,14 @@ const EpdWaveform* display_main_switch_waveform(const EpdWaveform* source, enum 
     return &slot->wave;
 }
 
-static uint8_t s_gray[E0470_GL16_FRAMES][16][4];
+static MAIN_WAVE_RAM uint8_t s_gray[E0470_GL16_FRAMES][16][4];
 static const EpdWaveformPhases s_gray_phases={E0470_GL16_FRAMES,(const uint8_t*)s_gray,NULL};
 static const EpdWaveformPhases *s_gray_ranges[]={&s_gray_phases};
 static const EpdWaveformMode s_gray_mode={5,1,s_gray_ranges};
 static const EpdWaveformMode *s_gray_modes[]={&s_gray_mode};
 static EpdWaveform s_gray_waveform={.num_modes=1,.num_temp_ranges=1,.mode_data=s_gray_modes};
 static bool s_gray_ready;
-static uint8_t s_bw[E0470_FULL_DU_FRAMES][16][4];
+static MAIN_WAVE_RAM uint8_t s_bw[E0470_FULL_DU_FRAMES][16][4];
 static const EpdWaveformPhases s_bw_phases={E0470_FULL_DU_FRAMES,(const uint8_t*)s_bw,NULL};
 static const EpdWaveformPhases *s_bw_ranges[]={&s_bw_phases};
 static const EpdWaveformMode s_bw_mode={1,1,s_bw_ranges};
@@ -214,7 +221,7 @@ const EpdWaveform* display_main_bw_waveform(void) {
 const EpdWaveform* display_du14_white_waveform(void) {
 #if KIIKO_S31_DU14
     enum { PHASES=14, WHITE_TAIL=3 };
-    static uint8_t data[PHASES][16][4];
+    static MAIN_WAVE_RAM uint8_t data[PHASES][16][4];
     static const EpdWaveformPhases phases={PHASES,(const uint8_t*)data,NULL};
     static const EpdWaveformPhases *ranges[]={&phases};
     static const EpdWaveformMode mode={MODE_DU,1,ranges};
@@ -262,7 +269,7 @@ const EpdWaveform* display_main_bw_turn_waveform(void) {
 // Avoid gray-table black resets and navigation quantization; retain vendor tables/cadence, with optical tones subject to panel validation.
 const EpdWaveform* display_main_navigation_waveform(void) {
     enum { PHASES=E0470_FULL_DU_FRAMES+E0470_FOLLOW_FRAMES };
-    static uint8_t data[PHASES][16][4];
+    static MAIN_WAVE_RAM uint8_t data[PHASES][16][4];
     static const EpdWaveformPhases phases={PHASES,(const uint8_t*)data,NULL};
     static const EpdWaveformPhases* ranges[]={&phases};
     static const EpdWaveformMode mode={MODE_GL16,1,ranges};
@@ -408,7 +415,7 @@ const EpdWaveform* display_main_shelf37_waveform(bool art) {
 
 // 整页补白与固定底栏/局部反馈分开；保持厂商表和相数。
 // Separate page white maintenance from frozen navigation/local feedback; preserve vendor arrays and phase counts.
-static uint8_t s_page_gray[E0470_GL16_FRAMES][16][4];
+static MAIN_WAVE_RAM uint8_t s_page_gray[E0470_GL16_FRAMES][16][4];
 static const EpdWaveformPhases s_page_gray_phases={E0470_GL16_FRAMES,(const uint8_t*)s_page_gray,NULL};
 static const EpdWaveformPhases *s_page_gray_ranges[]={&s_page_gray_phases};
 static const EpdWaveformMode s_page_gray_mode={5,1,s_page_gray_ranges};
@@ -416,7 +423,7 @@ static const EpdWaveformMode *s_page_gray_modes[]={&s_page_gray_mode};
 static EpdWaveform s_page_gray_waveform={.num_modes=1,.num_temp_ranges=1,.mode_data=s_page_gray_modes};
 static bool s_page_gray_ready;
 #if !KIIKO_S31_DU14
-static uint8_t s_page_bw[E0470_FULL_DU_FRAMES][16][4];
+static MAIN_WAVE_RAM uint8_t s_page_bw[E0470_FULL_DU_FRAMES][16][4];
 static const EpdWaveformPhases s_page_bw_phases={E0470_FULL_DU_FRAMES,(const uint8_t*)s_page_bw,NULL};
 static const EpdWaveformPhases *s_page_bw_ranges[]={&s_page_bw_phases};
 static const EpdWaveformMode s_page_bw_mode={1,1,s_page_bw_ranges};

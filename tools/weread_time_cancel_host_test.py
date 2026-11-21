@@ -117,21 +117,46 @@ static void pause_ms(unsigned ms){mono+=(int64_t)ms*1000;}
 #define READ_PICO_TRANSFER_MODE_STA 1
 #define READ_PICO_TRANSFER_MODE_AP 0
 #define READ_PICO_TRANSFER_ERROR 4
-typedef struct {bool network_ready;int mode,state,last_error;} read_pico_transfer_status_t;
+typedef struct {bool network_ready,wifi_enabled;int mode,state,last_error;} read_pico_transfer_status_t;
 typedef struct {int mode;bool network_only,cover_lookup;} read_pico_transfer_cfg_t;
 static time_t wall;
 static bool sync_cancel;
-static bool connect_starting,started;
-static int syncs,sync_error;
-static void read_pico_transfer_get_status(read_pico_transfer_status_t *out){*out=(read_pico_transfer_status_t){!connect_starting||started,READ_PICO_TRANSFER_MODE_STA,connect_starting&&!started?READ_PICO_TRANSFER_STOPPED:READ_PICO_TRANSFER_READY,0};}
-static esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg){assert(connect_starting&&!started&&cfg->mode==READ_PICO_TRANSFER_MODE_STA&&cfg->network_only);started=true;return ESP_OK;}
-static void read_pico_transfer_service_poll(void){}
+static bool connect_starting,started,mock_wifi_enabled,poll_stop_external,mock_use_custom;
+static int syncs,sync_error,mock_state,mock_last_error,mock_start_error,poll_error_on_started,mock_polls,mock_stop_calls,mock_start_calls,mock_radio_awake_calls;
+static void read_pico_transfer_get_status(read_pico_transfer_status_t *out){
+ if(mock_use_custom){
+  *out=(read_pico_transfer_status_t){mock_state==READ_PICO_TRANSFER_READY&&mock_wifi_enabled,mock_wifi_enabled,READ_PICO_TRANSFER_MODE_STA,mock_state,mock_last_error};
+  return;
+ }
+ *out=(read_pico_transfer_status_t){!connect_starting||started,started,READ_PICO_TRANSFER_MODE_STA,connect_starting&&!started?READ_PICO_TRANSFER_STOPPED:READ_PICO_TRANSFER_READY,0};
+}
+static esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg){
+ assert(cfg->mode==READ_PICO_TRANSFER_MODE_STA&&cfg->network_only);
+ ++mock_start_calls;
+ if(mock_use_custom){
+  assert(mock_state==READ_PICO_TRANSFER_STOPPED);
+  if(mock_start_error!=ESP_OK){mock_state=READ_PICO_TRANSFER_ERROR;mock_last_error=mock_start_error;mock_wifi_enabled=false;return mock_start_error;}
+  started=true;mock_state=10;mock_wifi_enabled=true;return ESP_OK;
+ }
+ assert(connect_starting&&!started);started=true;return ESP_OK;
+}
+static void read_pico_transfer_stop(void){
+ ++mock_stop_calls;started=false;mock_wifi_enabled=false;mock_state=READ_PICO_TRANSFER_STOPPED;mock_last_error=0;
+}
+static void read_pico_transfer_service_poll(void){
+ ++mock_polls;
+ if(mock_use_custom){
+  if(poll_error_on_started&&started&&mock_polls==1){mock_state=READ_PICO_TRANSFER_ERROR;mock_last_error=poll_error_on_started;mock_wifi_enabled=false;}
+  else if(poll_stop_external&&started&&mock_polls==1){started=false;mock_wifi_enabled=false;mock_state=READ_PICO_TRANSFER_STOPPED;}
+  else if(started&&mock_state==10&&!poll_error_on_started&&!poll_stop_external){mock_state=READ_PICO_TRANSFER_READY;}
+ }
+}
 static esp_err_t read_pico_transfer_sync_time_online_cancelable(uint32_t *utc,bool(*check)(void*),void *ctx){++syncs;assert(ctx==NULL);for(int i=0;i<30;++i){mono+=100000;if(sync_cancel&&i==1)atomic_store(&s_cancel,true);if(check(ctx))return ESP_ERR_INVALID_STATE;}if(sync_error)return sync_error;*utc=wall=1800000000;return ESP_OK;}
 static time_t test_time(time_t *out){if(out)*out=wall;return wall;}
 #define time test_time
-#define weread_client_set_radio_awake(awake) ((void)(awake))
-''' + function(RUNTIME, 'connect_network') + r'''
-static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=s_connect_timed_out=false;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
+#define weread_client_set_radio_awake(awake) do{(void)(awake);++mock_radio_awake_calls;}while(0)
+''' + function(RUNTIME, 'stop_network') + function(RUNTIME, 'connect_network') + r'''
+static void reset(void){mono=0;wall=0;syncs=sync_error=0;s_network_active=0;connect_starting=started=sync_cancel=s_owns_network=s_connect_timed_out=mock_wifi_enabled=poll_stop_external=mock_use_custom=false;mock_state=mock_last_error=mock_start_error=poll_error_on_started=mock_polls=mock_stop_calls=mock_start_calls=mock_radio_awake_calls=0;atomic_store(&s_cancel,false);atomic_store(&s_deadline,0);}
 int main(void){
  reset();sync_cancel=true;assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==200000&&syncs==1);
  reset();atomic_store(&s_deadline,1800);assert(connect_network()==ESP_ERR_INVALID_STATE&&mono==1800000&&syncs==1);
@@ -143,6 +168,24 @@ int main(void){
  reset();atomic_store(&s_cancel,true);assert(connect_network()==ESP_ERR_INVALID_STATE&&!syncs);
  reset();connect_starting=true;wall=1800000000;assert(connect_network()==ESP_OK&&started&&s_owns_network&&s_network_active==100);
  mono+=600000;assert(connect_network()==ESP_OK&&s_network_active==700&&!syncs);
+ // 前次启动 OOM 遗留 ERROR 且射频未开启时，先清错误再重试，不能永久锁死后续开书/跳章。
+ // Stale ERROR with radio off (e.g., failed OOM start) must be cleared before retrying rather than locking out later opens/chapters.
+ reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_STOPPED;mock_start_error=ESP_ERR_NO_MEM;
+ assert(connect_network()==ESP_ERR_NO_MEM&&mock_start_calls==1&&mock_state==READ_PICO_TRANSFER_ERROR&&!mock_wifi_enabled&&!s_owns_network);
+ mock_start_error=ESP_OK;mock_start_calls=mock_stop_calls=0;
+ assert(connect_network()==ESP_OK&&mock_stop_calls==1&&mock_start_calls==1&&started&&s_owns_network);
+ // 射频仍标启用时的外部 ERROR 不被擅自清理，透传原错误。
+ // An active ERROR (wifi_enabled=true) is not cleared by connect_network and propagates its error.
+ reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_ERROR;mock_last_error=ESP_ERR_NO_MEM;mock_wifi_enabled=true;
+ assert(connect_network()==ESP_ERR_NO_MEM&&!mock_stop_calls&&!mock_start_calls&&!s_owns_network);
+ // 本次启动后在轮询期进入 ERROR(ESP_ERR_TIMEOUT) 时清理会话并标记建连超时。
+ // If a started session later enters ERROR(ESP_ERR_TIMEOUT), clean up ownership and mark s_connect_timed_out.
+ reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_STOPPED;poll_error_on_started=ESP_ERR_TIMEOUT;
+ assert(connect_network()==ESP_ERR_TIMEOUT&&mock_start_calls==1&&mock_stop_calls==1&&!started&&!s_owns_network&&s_connect_timed_out);
+ // 本次启动后被外部停止时立即放弃归属并返回取消，不重开或冗长超时。
+ // External stop while started_here relinquishes ownership immediately and returns ESP_ERR_INVALID_STATE.
+ reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_STOPPED;poll_stop_external=true;
+ assert(connect_network()==ESP_ERR_INVALID_STATE&&mock_start_calls==1&&!mock_stop_calls&&!started&&!s_owns_network);
  puts("PASS: production WeRead connect propagates its cancel/deadline and time failure; first TLS calibration retained");
 }
 '''

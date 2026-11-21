@@ -25,10 +25,10 @@
 #endif
 
 static char s_storage_root[256] = WEREAD_STORAGE_ROOT_DEFAULT;
-static char s_device_id[WEREAD_DEVICE_ID_MAX_LEN] = {0};
+static WR_EXT_BSS char s_device_id[WEREAD_DEVICE_ID_MAX_LEN];
 static char s_device_name[WEREAD_DEVICE_NAME_MAX_LEN] = "KiikoReader";
 
-static weread_auth_session_t s_current_session;
+static WR_EXT_BSS weread_auth_session_t s_current_session;
 static bool s_authenticated = false;
 
 typedef struct {
@@ -36,7 +36,7 @@ typedef struct {
     char skey[WEREAD_SKEY_MAX_LEN];
 } pending_auth_t;
 
-static pending_auth_t s_pending_auth;
+static WR_EXT_BSS pending_auth_t s_pending_auth;
 static bool credential(const char *text, size_t cap, bool required);
 
 static bool login_url(const cJSON *body, char *url, size_t cap) {

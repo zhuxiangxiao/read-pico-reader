@@ -27,10 +27,10 @@
 #include "read_pico_sd.h"
 _Static_assert(WEREAD_MEDIA_ID_BYTES==READ_PICO_SD_MEDIA_ID_BYTES,"media identity ABI");
 #endif
-static char s_retry_id[WEREAD_BOOK_ID_CAP];
+static WR_EXT_BSS char s_retry_id[WEREAD_BOOK_ID_CAP];
 static uint64_t s_retry_at, s_retry_started;
-static struct { char id[WEREAD_BOOK_ID_CAP]; uint32_t session; weread_progress_t cloud; } s_observed;
-static struct { DIR *dir; uint32_t session; uint64_t next_scan; char hint[WEREAD_BOOK_ID_CAP]; } s_outbox;
+static WR_EXT_BSS struct { char id[WEREAD_BOOK_ID_CAP]; uint32_t session; weread_progress_t cloud; } s_observed;
+static WR_EXT_BSS struct { DIR *dir; uint32_t session; uint64_t next_scan; char hint[WEREAD_BOOK_ID_CAP]; } s_outbox;
 static uint32_t session_stamp(void) {
     const weread_auth_session_t *session=weread_auth_get_current_session();
     if(!session)return 0;

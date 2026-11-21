@@ -9,6 +9,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef ESP_PLATFORM
+#include "esp_attr.h"
+#define WR_EXT_BSS EXT_RAM_BSS_ATTR
+#else
+#define WR_EXT_BSS
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

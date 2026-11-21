@@ -134,6 +134,7 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
             err==WEREAD_ERR_PURCHASE?"请在手机端购买或领取此章节":
             err==WEREAD_ERR_SOLD_OUT?"章节已下架":
             err==WEREAD_ERR_VERSION?"书籍已更新，请返回书架重新打开":
+            err==ESP_ERR_NO_MEM?"内存不足，请稍后重试":
             err==ESP_ERR_INVALID_STATE?"章节准备已取消":"加载失败，可返回目录重试");
         s_reader_notice_until=ctx->now_ms+3000;s_message[0]=0;
     }

@@ -62,7 +62,7 @@ static uint64_t s_next_sync;
 static uint64_t s_sync_check, s_sync_not_before, s_last_input, s_owner;
 static unsigned s_epoch;
 static bool s_force_cover;
-static char s_search_draft[65],s_query[65], s_uid[64], s_qr[256], s_id[64], s_requested[64], s_message[128];
+static WR_EXT_BSS char s_search_draft[65],s_query[65], s_uid[64], s_qr[256], s_id[64], s_requested[64], s_message[128];
 static ui_text_edit_t s_edit;
 static uint64_t s_next_poll, s_next_action;
 static EpdRect s_area;
@@ -80,7 +80,7 @@ static uint64_t s_warm_page, s_cover_paint_at;
 static unsigned s_warm_slot;
 static int s_warm_direction=1;
 typedef struct { uint8_t *pixels; bool checked; weread_cover_retry_t retry; uint64_t key; } row_cover_t;
-static row_cover_t s_covers[ROWS];
+static WR_EXT_BSS row_cover_t s_covers[ROWS];
 static int display_style(void){return s_query[0]?5:s_style;}
 static int page_rows(void){return ui_shelf_rows(display_style());}
 static int page_count(void){return s_visible?(int)((s_visible+page_rows()-1)/page_rows()):1;}

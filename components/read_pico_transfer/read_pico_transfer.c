@@ -2243,7 +2243,10 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     // internal RAM; under rc111 a network-only session (router connect/time sync/cloud) must also
     // release it when memory is tight, otherwise WiFi static RX buffers fail to init and the UI
     // reports "connection start failed". Keep the old coexistence behaviour when RAM is ample.
-    const bool low_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 100u * 1024u;
+    const bool low_internal =
+        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 100u * 1024u ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24u * 1024u ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 16u * 1024u;
     if (!cfg->network_only || low_internal) {
         if (cfg->network_only) ESP_LOGW("transfer", "wifi network-only: release BLE for memory (internal free=%u)",
                                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -2260,7 +2263,6 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     memset(&s_status, 0, sizeof(s_status)); s_status.state = READ_PICO_TRANSFER_STARTING;
     s_stopping = s_upload_active = s_http_active = false;
     s_wifi_last_use_us = started_us;
-    s_status.wifi_enabled = true;
     s_status.mode = cfg->mode;
     s_status.cover_lookup = cfg->cover_lookup;
     portEXIT_CRITICAL(&s_lock);
@@ -2438,13 +2440,13 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     if (err != ESP_OK) goto fail;
     if (cfg->mode == READ_PICO_TRANSFER_MODE_AP) {
         portENTER_CRITICAL(&s_lock);
-        s_status.network_ready = true; strcpy(s_status.url, READ_PICO_TRANSFER_URL);
+        s_status.wifi_enabled = true; s_status.network_ready = true; strcpy(s_status.url, READ_PICO_TRANSFER_URL);
         portEXIT_CRITICAL(&s_lock);
         set_error(ESP_OK);
         ESP_LOGI("transfer", "ap ready url=%s", READ_PICO_TRANSFER_URL);
     } else {
         int64_t now = esp_timer_get_time() / 1000;
-        portENTER_CRITICAL(&s_lock); connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
+        portENTER_CRITICAL(&s_lock); s_status.wifi_enabled = true; connection_begin(&s_connection, now); portEXIT_CRITICAL(&s_lock);
         read_pico_transfer_service_poll();
     }
     release_config();

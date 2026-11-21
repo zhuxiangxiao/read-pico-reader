@@ -55,16 +55,16 @@ static bool s_configured;
 static atomic_bool s_owns_network;
 static unsigned s_cache_epoch;
 static uint64_t s_idle_at,s_network_active;
-static weread_result_t s_result;
-static struct {
+static WR_EXT_BSS weread_result_t s_result;
+static WR_EXT_BSS struct {
     weread_job_t job;
     char id[64], value[512];
     size_t chapter, chapter_idx;
     uint64_t now;
     bool prefetch_forward;
 } s_work;
-static struct { char id[64]; weread_progress_t progress; uint32_t fresh_version,last_chapter;bool valid, resume_ready, pending_cloud_sync; } s_choice;
-static struct { char id[64]; weread_progress_t progress; } s_cloud_jump;
+static WR_EXT_BSS struct { char id[64]; weread_progress_t progress; uint32_t fresh_version,last_chapter;bool valid, resume_ready, pending_cloud_sync; } s_choice;
+static WR_EXT_BSS struct { char id[64]; weread_progress_t progress; } s_cloud_jump;
 static struct {
     char id[64];
     size_t total;
@@ -74,7 +74,7 @@ static struct {
     unsigned cached;
     bool scanned;
 } s_book_cache;
-static struct {
+static WR_EXT_BSS struct {
     char id[64], summary[256], owner_root[256], owner_vid[WEREAD_VID_MAX_LEN], owner_device[WEREAD_DEVICE_ID_MAX_LEN];
     uint32_t owner_version,nav_version;unsigned owner_epoch;
     size_t chapter, nav_chapter, total_chapters, prefetch_cursor;
@@ -185,6 +185,13 @@ static bool in_worker(void) {
     return atomic_load(&s_alive) && s_joinable && pthread_equal(pthread_self(), s_thread);
 #endif
 }
+static void stop_network(void) {
+#if defined(ESP_PLATFORM)
+    weread_client_set_radio_awake(false);
+    if (s_owns_network) read_pico_transfer_stop();
+#endif
+    s_owns_network = false;s_network_active=0;
+}
 static esp_err_t connect_network(void) {
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
     // 每次建连尝试都从干净状态开始：前一次建连超时不能阻止后续 HTTP 超时的静默重试。
@@ -192,44 +199,58 @@ static esp_err_t connect_network(void) {
     s_connect_timed_out = false;
 #if defined(ESP_PLATFORM)
     read_pico_transfer_status_t status;
+    bool started_here = false, cleared_error = false;
     for(unsigned i=0;i<150 && !cancelled(NULL);++i){
         read_pico_transfer_get_status(&status);
         if(status.network_ready && status.mode==READ_PICO_TRANSFER_MODE_STA){
             if(time(NULL)<1700000000){
                 uint32_t utc;
                 esp_err_t err=read_pico_transfer_sync_time_online_cancelable(&utc,cancelled,NULL);
-                if(err!=ESP_OK)return err;
+                if(err!=ESP_OK){if(started_here)stop_network();return err;}
             }
             weread_client_set_radio_awake(true);
-            s_network_active=now_ms();return cancelled(NULL)?ESP_ERR_INVALID_STATE:ESP_OK;
+            s_network_active=now_ms();
+            if(cancelled(NULL)){if(started_here)stop_network();return ESP_ERR_INVALID_STATE;}
+            return ESP_OK;
+        }
+        // 前次 Wi-Fi 启动失败（如 OOM）且射频未开启时，先复位错误状态再重试建连。
+        // Clear a prior failed start (e.g., OOM) when radio is off before attempting a fresh start.
+        if(!started_here && !cleared_error && status.state==READ_PICO_TRANSFER_ERROR && !status.wifi_enabled){
+            cleared_error=true;
+            read_pico_transfer_stop();
+            read_pico_transfer_get_status(&status);
         }
         if(status.state==READ_PICO_TRANSFER_STOPPED){
+            if(started_here){
+                s_owns_network=false;
+                return ESP_ERR_INVALID_STATE;
+            }
             s_owns_network=false;
             read_pico_transfer_cfg_t cfg={.mode=READ_PICO_TRANSFER_MODE_STA,.network_only=true,.cover_lookup=true};
             esp_err_t err=read_pico_transfer_start(&cfg);
-            if(err==ESP_OK){s_owns_network=true;s_network_active=now_ms();}
+            if(err==ESP_OK){started_here=true;s_owns_network=true;s_network_active=now_ms();}
             else if(err!=ESP_ERR_INVALID_STATE && err!=ESP_ERR_NOT_FINISHED)return err;
         } else if(status.mode!=READ_PICO_TRANSFER_MODE_STA){
+            if(started_here)s_owns_network=false;
             return ESP_ERR_INVALID_STATE;
         } else if(status.state==READ_PICO_TRANSFER_ERROR){
-            return status.last_error!=ESP_OK?status.last_error:ESP_ERR_INVALID_STATE;
+            esp_err_t err=status.last_error!=ESP_OK?status.last_error:ESP_ERR_INVALID_STATE;
+            if(started_here){
+                stop_network();
+                if(err==ESP_ERR_TIMEOUT)s_connect_timed_out=true;
+            }
+            return err;
         }
         // 已有STA正在连接时等待IP，不中断外部会话。/ Wait for an existing STA's IP without interrupting its owner.
         read_pico_transfer_service_poll();pause_ms(100);
     }
+    if (started_here) stop_network();
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
     s_connect_timed_out = true;
     return ESP_ERR_TIMEOUT;
 #else
     s_owns_network = true;s_network_active=now_ms(); return ESP_OK;
 #endif
-}
-static void stop_network(void) {
-#if defined(ESP_PLATFORM)
-    weread_client_set_radio_awake(false);
-    if (s_owns_network) read_pico_transfer_stop();
-#endif
-    s_owns_network = false;s_network_active=0;
 }
 void weread_runtime_result_free(weread_result_t *r) {
     if (r) { free(r->books); free(r->cover); memset(r, 0, sizeof(*r)); }
@@ -734,14 +755,16 @@ static esp_err_t prefetch_job(void) {
 static esp_err_t cover_job_impl(const char *url,bool retry) {
     WR_MEMORY_SCOPE;
 #if defined(ESP_PLATFORM)
-    char path[512], temporary[544],uri[80];
+    char uri[80];
     snprintf(uri,sizeof(uri),"weread://%s",s_work.id);
     s_result.cover=wr_alloc(WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT);
     if (!s_result.cover) return ESP_ERR_NO_MEM;
     if (book_weread_cover(uri,s_result.cover,WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT)) return ESP_OK;
     free(s_result.cover);s_result.cover=NULL;
-    if(!url&&!retry&&weread_cover_cache_path(s_work.id,"failed",path,sizeof(path))==ESP_OK){
-        uint64_t failed=0;FILE *f=fopen(path,"rb");
+    struct { char path[512], temporary[544], parent[512]; } *io __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*io));
+    if (!io) return ESP_ERR_NO_MEM;
+    if(!url&&!retry&&weread_cover_cache_path(s_work.id,"failed",io->path,sizeof(io->path))==ESP_OK){
+        uint64_t failed=0;FILE *f=fopen(io->path,"rb");
         if(f){if(fread(&failed,sizeof(failed),1,f)!=1)failed=0;fclose(f);}
         uint64_t now=(uint64_t)time(NULL);
         if(failed>=1700000000&&now>=failed&&now-failed<300){
@@ -750,12 +773,12 @@ static esp_err_t cover_job_impl(const char *url,bool retry) {
             s_result.cover_retry_seconds=(unsigned)(300-(now-failed));
         }
     }
-    if (weread_cover_cache_path(s_work.id,"img",path,sizeof(path)) != ESP_OK) return ESP_ERR_INVALID_ARG;
+    if (weread_cover_cache_path(s_work.id,"img",io->path,sizeof(io->path)) != ESP_OK) return ESP_ERR_INVALID_ARG;
     if (url && *url) {
-        snprintf(temporary, sizeof(temporary), "%s.part", path);
-        char parent[512]; strcpy(parent, path); *strrchr(parent, '/') = 0;
-        if (wr_mkdirs(parent) != ESP_OK) return ESP_FAIL;
-        FILE *out = fopen(temporary, "w+b"); if (!out) return ESP_FAIL;
+        snprintf(io->temporary, sizeof(io->temporary), "%s.part", io->path);
+        strcpy(io->parent, io->path); *strrchr(io->parent, '/') = 0;
+        if (wr_mkdirs(io->parent) != ESP_OK) return ESP_FAIL;
+        FILE *out = fopen(io->temporary, "w+b"); if (!out) return ESP_FAIL;
         weread_download_info_t info={0};
         esp_err_t err = weread_client_download(url, out, 1024u * 1024u, cancelled, NULL, &info);
         s_result.http_status = info.status;
@@ -764,19 +787,19 @@ static esp_err_t cover_job_impl(const char *url,bool retry) {
         ok = ok && n >= 3 && (!memcmp(magic, "\x89PNG", 4) || (magic[0] == 255 && magic[1] == 216 && magic[2] == 255) ||
             (n==12&&!memcmp(magic,"RIFF",4)&&!memcmp(magic+8,"WEBP",4)));
         if (fclose(out)) ok = false;
-        if (!ok || cancelled(NULL)) { unlink(temporary); return err != ESP_OK ? err : ESP_ERR_INVALID_RESPONSE; }
-        unlink(path); if (rename(temporary, path)) { unlink(temporary); return ESP_FAIL; }
+        if (!ok || cancelled(NULL)) { unlink(io->temporary); return err != ESP_OK ? err : ESP_ERR_INVALID_RESPONSE; }
+        unlink(io->path); if (rename(io->temporary, io->path)) { unlink(io->temporary); return ESP_FAIL; }
     }
-    FILE *file = fopen(path, "rb"); if (!file) return ESP_ERR_NOT_FOUND;
+    FILE *file = fopen(io->path, "rb"); if (!file) return ESP_ERR_NOT_FOUND;
     unsigned char first[8]; size_t n = fread(first, 1, 8, file); fclose(file);
     bool png = n == 8 && !memcmp(first, "\x89PNG", 4);
     s_result.cover = wr_alloc(WEREAD_COVER_WIDTH * WEREAD_COVER_HEIGHT);
     if (!s_result.cover) return ESP_ERR_NO_MEM;
-    if (!book_image_file_grayscale(path, png, WEREAD_COVER_WIDTH, WEREAD_COVER_HEIGHT, s_result.cover)) {
+    if (!book_image_file_grayscale(io->path, png, WEREAD_COVER_WIDTH, WEREAD_COVER_HEIGHT, s_result.cover)) {
         free(s_result.cover); s_result.cover = NULL; return ESP_ERR_INVALID_RESPONSE;
     }
-    if (weread_cover_cache_path(s_work.id,"gray",path,sizeof(path)) == ESP_OK)
-        (void)wr_write_bytes(path,s_result.cover,WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT);
+    if (weread_cover_cache_path(s_work.id,"gray",io->path,sizeof(io->path)) == ESP_OK)
+        (void)wr_write_bytes(io->path,s_result.cover,WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT);
     s_result.cover_retry_seconds=0;
     return ESP_OK;
 #else
@@ -788,8 +811,9 @@ static esp_err_t cover_job(const char *url){
     esp_err_t err=cover_job_impl(url,retry);
 #if defined(ESP_PLATFORM)
     if((err==ESP_OK||(url&&*url))&&err!=ESP_ERR_NO_MEM&&err!=ESP_ERR_INVALID_STATE&&!cancelled(NULL)&&read_pico_sd_io_ready()){
-        char path[512];
-        if(weread_cover_cache_path(s_work.id,"failed",path,sizeof(path))==ESP_OK){
+        char *path __attribute__((cleanup(wr_release))) = wr_alloc(512);
+        if(!path)return err==ESP_OK?ESP_OK:ESP_ERR_NO_MEM;
+        if(weread_cover_cache_path(s_work.id,"failed",path,512)==ESP_OK){
             if(err==ESP_OK)(void)unlink(path);
             else if(s_result.http_status!=404||weread_cover_is_original(s_work.id,url)){
                 uint64_t now=(uint64_t)time(NULL);
@@ -801,6 +825,32 @@ static esp_err_t cover_job(const char *url){
     }
 #endif
     return err;
+}
+static esp_err_t cover_dispatch(void) {
+    if (!strcmp(s_work.value, "remote") || !strcmp(s_work.value, "original")) {
+        struct { weread_book_t book; char url[512]; } *s __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*s));
+        if (!s) return ESP_ERR_NO_MEM;
+        weread_cover_retry_t retry = {.original = !strcmp(s_work.value, "original")};
+        esp_err_t err = weread_shelf_find(s_work.id, &s->book)
+            ? weread_cover_retry_url(s->book.cover, &retry, 0, s->url, sizeof(s->url))
+            : ESP_ERR_NOT_FOUND;
+        return err == ESP_OK ? cover_job(s->url) : err;
+    }
+    if (!strcmp(s_work.value, "warm") || !strcmp(s_work.value, "warm-disk")) {
+        struct { weread_book_t book; char url[512], ready[512]; } *s __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*s));
+        if (!s) return ESP_ERR_NO_MEM;
+        struct stat st;
+        if (weread_cover_cache_path(s_work.id, "gray", s->ready, sizeof(s->ready)) == ESP_OK &&
+            !stat(s->ready, &st) && S_ISREG(st.st_mode) && st.st_size == WEREAD_COVER_WIDTH * WEREAD_COVER_HEIGHT)
+            return ESP_OK;
+        esp_err_t err = cover_job(NULL);
+        if (err != ESP_OK && !s_result.cover_retry_seconds && !cancelled(NULL) &&
+            weread_shelf_find(s_work.id, &s->book) &&
+            weread_cover_get_url(s->book.cover, s->url, sizeof(s->url)) == ESP_OK)
+            err = cover_job(s->url);
+        return err;
+    }
+    return cover_job(s_work.value);
 }
 static bool retryable_job(weread_job_t job) {
     // 仅前台开书/本地/云端开书和冷章在瞬时超时后静默重放一次；目录任务由阅读页在UI线程同步等待，重试只会加倍开书冻结，故不重试。
@@ -829,22 +879,12 @@ static esp_err_t job_run(void) {
             err = prepare_open(true, s_work.job == WR_JOB_CLOUD);
             break;
         case WR_JOB_COVER:
-            if(!strcmp(s_work.value,"remote")||!strcmp(s_work.value,"original")){
-                weread_book_t book;char url[512];weread_cover_retry_t retry={.original=!strcmp(s_work.value,"original")};
-                err=weread_shelf_find(s_work.id,&book)?weread_cover_retry_url(book.cover,&retry,0,url,sizeof(url)):ESP_ERR_NOT_FOUND;
-                if(err==ESP_OK)err=cover_job(url);
-            }else if(!strcmp(s_work.value,"warm")||!strcmp(s_work.value,"warm-disk")){
-                char ready[512];struct stat st;
-                if(weread_cover_cache_path(s_work.id,"gray",ready,sizeof(ready))==ESP_OK&&!stat(ready,&st)&&S_ISREG(st.st_mode)&&st.st_size==WEREAD_COVER_WIDTH*WEREAD_COVER_HEIGHT)break;
-                err=cover_job(NULL);
-                weread_book_t b;char url[512];
-                if(err!=ESP_OK&&!s_result.cover_retry_seconds&&!cancelled(NULL)&&weread_shelf_find(s_work.id,&b)&&
-                    weread_cover_get_url(b.cover,url,sizeof(url))==ESP_OK)err=cover_job(url);
-            }else err = cover_job(s_work.value);
+            err = cover_dispatch();
             break;
         case WR_JOB_CLEAR: {
-            char path[512];
-            if (wr_cache_path(s_work.id, ".", path, sizeof(path)) != ESP_OK) err = ESP_ERR_INVALID_ARG;
+            char *path __attribute__((cleanup(wr_release))) = wr_alloc(512);
+            if (!path) { err = ESP_ERR_NO_MEM; break; }
+            if (wr_cache_path(s_work.id, ".", path, 512) != ESP_OK) err = ESP_ERR_INVALID_ARG;
             else { *strrchr(path, '/') = 0; err = remove_cache(path, 0); }
             break;
         }
@@ -1089,7 +1129,7 @@ bool weread_runtime_start(weread_job_t job, const char *id, const char *value) {
 #if defined(ESP_PLATFORM)
         if (!s_queue) s_queue = xQueueCreateStatic(1, 1, &s_queue_byte, &s_queue_storage);
         // WiFi/NVS会关闭Flash缓存，调用栈必须位于内部RAM。/ WiFi/NVS disables flash caches, so the caller's stack must stay in internal RAM.
-        if (!s_queue || xTaskCreateWithCaps(worker, "weread", 20480, NULL, 1, &s_task,
+        if (!s_queue || xTaskCreateWithCaps(worker, "weread", 16384, NULL, 1, &s_task,
             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) != pdPASS) {
             ESP_LOGW("weread", "worker allocation failed internal=%u largest=%u",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),

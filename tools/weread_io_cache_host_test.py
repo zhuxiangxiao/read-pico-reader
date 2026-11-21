@@ -46,6 +46,7 @@ runtime = (root/'main/weread/weread_runtime.c').read_text()
 case = runtime[runtime.index('        case WR_JOB_COVER:'):runtime.index('        case WR_JOB_CLEAR:')]
 (out/'cover-routing.inc').write_text(''.join(function(shelf, name) for name in (
     'weread_cover_get_url', 'weread_cover_retry_url', 'weread_cover_retry_result'))+
+    function(runtime, 'cover_dispatch')+
     'static esp_err_t dispatch(void){esp_err_t err=ESP_OK;switch(WR_JOB_COVER){\n'+
     case+'default:assert(false);\n}return err;}\n')
 subprocess.run(flags+['tools/test_weread_cover_routing.c', '-o', str(out/'cover')], cwd=root, check=True)

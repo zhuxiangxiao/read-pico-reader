@@ -26,10 +26,10 @@
 #define lstat stat
 #endif
 
-static char s_id[64];
+static WR_EXT_BSS char s_id[64];
 static weread_toc_t s_toc;
 static bool s_txt, s_prepared_local;
-static char s_prepared_id[64],s_prepared_owner[32];
+static WR_EXT_BSS char s_prepared_id[64],s_prepared_owner[32];
 static weread_toc_t s_prepared_toc;
 typedef struct {
     char root[512],resources[512],owner[32],storage[256];

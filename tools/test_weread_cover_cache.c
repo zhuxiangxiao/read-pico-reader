@@ -23,6 +23,7 @@ static time_t wall=1800000000;
 static time_t test_time(time_t *out){if(out)*out=wall;return wall;}
 #define time test_time
 static void *wr_alloc(size_t n){return alloc_fail?NULL:calloc(1,n);}
+static void wr_release(void *p){void **q=p;free(*q);*q=NULL;}
 static bool cancelled(void *ctx){(void)ctx;return cancel_flag;}
 static bool read_pico_sd_io_ready(void){return true;}
 static bool book_weread_cover(const char *uri,uint8_t *out,size_t cap){(void)uri;(void)out;(void)cap;return false;}
