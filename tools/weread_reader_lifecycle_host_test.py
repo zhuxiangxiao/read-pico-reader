@@ -48,6 +48,8 @@ static uint8_t app_book_resume_origin(void){return 6;}
 static esp_err_t pico_boot_save_resume(const pico_resume_t *resume){++checkpoints;mark('K');committed=*resume;return ESP_OK;}
 static void __attribute__((unused)) app_book_shelf_prefetch_cancel(void){mark('I');}
 static void __attribute__((unused)) app_lock_set_resume_ready(bool ready){resume_ready=ready;mark('A');}
+static const app_desc_t app_book __attribute__((unused)) = {.tab = 1};
+static bool __attribute__((unused)) app_book_checkpoint_ready(void){return true;}
 static int64_t __attribute__((unused)) esp_timer_get_time(void){return 100000;}
 #define ESP_LOGI(...) ((void)0)
 #define TAG "lifecycle"

@@ -49,7 +49,6 @@ static void ui_fill_rect_fast(EpdRect r,int c,uint8_t *fb){assert(r.y==active_to
 '''
 header=(root/'main/ui/ui_kit.h').read_text()
 unit+=re.search(r'enum \{ UI_PAGER_NONE=[^}]+\};',header)[0]+'\n'
-unit += '#include "'+str(root/'main/ui/ui_icon_unpack.inc')+'"\n'
 for name in ('ui_rect_hit','icon_nibble','ui_draw_icon','ui_pager_area_at','ui_pager_rect_at','ui_pager_hit_at','ui_pager_target','ui_pager_draw_at','ui_pager_area','ui_pager_rect','ui_pager_hit','ui_pager_draw'):
     unit+=function(name,kit)+'\n'
 for name in ('file_pager_top','file_action_rect','visible_rows','root_rows','file_pager_pages','draw_file_pager','file_pager_paint','file_pager_event'):

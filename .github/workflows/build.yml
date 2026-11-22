@@ -82,6 +82,17 @@ jobs:
         shell: bash
         run: |
           python3 tools/progress_boot_storage_host_test.py
+          python3 tools/reader_resume_durability_host_test.py
+          python3 tools/book_library_host_test.py
+          python3 tools/book_library_ui_host_test.py
+          python3 tools/management_layout_host_test.py
+          python3 tools/home_initial_empty_host_test.py
+          python3 tools/pico_reader_metadata_present_host_test.py
+          python3 tools/pico_home_progress_sync_host_test.py
+          python3 tools/reader_full_off_migration_host_test.py
+          python3 tools/device_sync_pairing_host_test.py
+          python3 build/host/pico/tools/settings_backup_pair_host_test.py
+          python3 build/host/metalio47/tools/settings_backup_pair_host_test.py
           python3 tools/settings_restore_storage_host_test.py
           python3 build/host/pico/tools/settings_restore_storage_host_test.py
       - name: Water-turn, display recovery, navigation and waveform regressions
@@ -139,7 +150,7 @@ jobs:
           . "$IDF_PATH/export.sh"
           board_release_flags=()
           if [ "${{ matrix.board }}" = metalio47 ]; then
-            board_release_flags=(--s31-pie --s31-reader-panel37 --s31-shelf37 --s31-settings-short-motion)
+            board_release_flags=(--s31-pie --s31-reader-panel37 --s31-shelf37 --s31-settings-short-motion --s31-early-power-key --s31-rc110-ripple)
           fi
           python tools/build_firmware.py --board "${{ matrix.board }}" \
             --idf-${{ matrix.board }} "$IDF_PATH" --python "$(command -v python)" \
@@ -213,6 +224,7 @@ jobs:
             python3 tools/reader_panel_entry_host_test.py
             python3 tools/reader_panel_host_test.py
             python3 tools/metalio_text_ripple_routes_host_test.py
+            python3 tools/s31_rc110_ripple_route_host_test.py
             python3 tools/metalio_vcom_host_test.py
             python3 tools/s31_flash_guard_host_test.py
           fi

@@ -35,6 +35,7 @@ static void weread_reader_input(bool local){if(!local)weread_runtime_cancel_join
 static void wr_reader_move(void){}
 static struct {bool pending;}s_wr_jump;
 static void wr_chapter_cancel(void){s_wr_jump.pending=false;}
+static int64_t s_resume_media_deadline_ms;
 static bool s_requested_fullscreen=true,s_requested_open_home,s_requested_resume_mode,s_shelf_open_queued;
 static uint8_t s_requested_open_origin;
 static bool default_fullscreen;

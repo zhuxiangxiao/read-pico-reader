@@ -535,6 +535,13 @@ static bool jpeg_gray(const uint8_t *data, size_t size, unsigned out_width,
 #endif
         return jpegdec_gray(data, size, frame_width, frame_height, out_width, out_height, out);
     }
+    // 试验：基线 JPEG 也先交给 JPEGDEC 的全平面灰度解码（1/1~1/8，按目标尺寸选取），
+    // 与 TJpgDec 同级的清晰度，失败仍回落 TJpgDec。
+    // Trial: decode baseline JPEGs with JPEGDEC's full plane (1/1..1/8 chosen from the target size),
+    // matching TJpgDec's sharpness; TJpgDec remains the fallback.
+    if (have_frame && sof != 0xC2 &&
+        jpegdec_gray_fallback(data, size, frame_width, frame_height, out_width, out_height, out))
+        return true;
     esp_jpeg_image_cfg_t cfg = { .indata = (uint8_t *)data, .indata_size = (uint32_t)size,
                                  .out_format = JPEG_IMAGE_FORMAT_RGB565 };
     esp_jpeg_image_output_t info = {0};
@@ -1621,6 +1628,17 @@ bool book_image_file_grayscale(const char *path, bool png, unsigned width, unsig
                 } else {
                     ok=jpeg_baseline_file(file,source_w,source_h,width,height,&plane);
                     ok=ok&&plane.pixels>=(size_t)width*height;
+                    // ROM TJpgDec 只解三分量 YCbCr；灰度等其他基线 JPEG 失败时由 JPEGDEC 从头再解一次，
+                    // 与内存解码的兜底一致。
+                    // The ROM TJpgDec decodes three-component YCbCr only; when grayscale or other baseline
+                    // JPEGs fail, let JPEGDEC decode the file again, matching the in-memory fallback.
+                    if(!ok&&!fseek(file,0,SEEK_SET)) {
+                        plane=(jpeg_file_plane_t){.out=out,.width=width,.height=height};
+                        memset(out,255,(size_t)width*height);
+                        ok=jpegdec_gray_file(file,(int)st.st_size,source_w,source_h,width,height,false,
+                            jpeg_file_collect,&plane,&plane.source_w,&plane.source_h)!=0;
+                        ok=ok&&plane.pixels>=(size_t)width*height;
+                    }
                 }
             }
         }

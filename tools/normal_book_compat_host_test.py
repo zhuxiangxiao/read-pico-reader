@@ -66,6 +66,8 @@ static int s_count,s_visible_count,s_view=0;
 enum {SHELF};
 static char s_query[65],s_latest_path[288],s_requested_open[288];
 static bool s_recent_sort=true,s_requested_fullscreen,s_requested_resume_mode,s_chapters_started;static uint8_t s_requested_open_origin;
+static bool s_shelf_open_queued,s_requested_open_home,s_import_candidates,s_manage_books;
+static int64_t s_resume_media_deadline_ms;
 typedef struct {nvs_handle_t favorites,hidden;bool truncated;} shelf_backfill_t;
 static bool shelf_reserve(void){++reserves;return s_count<8;}
 static void shelf_category_restore(app_ctx_t *ctx){(void)ctx;}
@@ -82,6 +84,11 @@ static void shelf_added_load(void){}
 static int shelf_order_mode(void){return 1;}
 static int book_target_stat(const char*p,struct stat*s){assert(!book_path_is_weread(p));return stat(p,s);}
 static void weread_runtime_load_local(void){}
+static bool book_library_contains(const char *p){(void)p;return true;}
+static bool book_display_name_from_path(const char *p,char *n,size_t nc,char *a,size_t ac){return book_name_from_path(p,n,nc,a,ac);}
+static int book_library_list(bool (*visit)(const char*,void*),void *ctx){(void)visit;(void)ctx;return ESP_OK;}
+static bool shelf_library_visit(const char *p,void *ctx){(void)p;(void)ctx;return true;}
+static bool app_setup_library_pending(void){return false;}
 '''
 for name in ('app_book_request_open','app_book_request_open_from_home','app_book_request_resume',
              'shelf_backfill_visit','shelf_backfill_read_books','refresh_cached_progress'):

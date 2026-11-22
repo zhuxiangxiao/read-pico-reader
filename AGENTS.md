@@ -8,6 +8,35 @@ Agent entry for this tree. Humans can read it too. Product overview, hardware, p
 
 Newcomers (human or agent): read [docs/ONBOARDING.md](docs/ONBOARDING.md). Taking over an in-flight task: read [docs/HANDOFF.md](docs/HANDOFF.md) first.
 
+## 2026-11-21 · S31 RC118正式发布 / S31 RC118 publication
+
+用户确认最新S31测试版同步GitHub源码、在线刷机及OTA，正式递增RC118；RC117保持撤回草稿，原RC116和全部历史保留。显式启用--s31-rc110-ripple与配套early-power-key，恢复RC110阅读水波纹，保留书架/排版/进度及远端PR107。PICO RC110及PR99关闭状态保持；此授权取代下方仅本地限制，不要求再次刷设备。
+The user authorizes the latest S31 comparison build for source,web flashing and OTA as RC118. Keep withdrawn RC117 as a draft and preserve original RC116/history. Enable --s31-rc110-ripple with the matching early-key bootloader,retaining library,typography,progress and upstream PR107. Preserve Pico RC110 and closed PR99; this supersedes local-only restrictions without requiring another device flash.
+
+## 2026-11-21 · S31 RC110水波纹本地测试 / Local S31 RC110 ripple comparison
+
+用户明确只做S31测试版本，把阅读水波纹恢复为S31 RC110原28相/八带/末对同拍及六相尾部补白；保留当前普通、书架、排版、进度和安全开机修复。使用显式--s31-rc110-ripple，仅本地包，沿用RC116版本号；不发布官网/Release/OTA，不刷物理设备，PICO与PR99状态保持。
+The user requests an S31-only test restoring RC110 reader ripple: original28 phases,eight paired-tail bands and six tail white phases. Retain current ordinary turns,library,typography,progress and safe-start fixes. Use explicit --s31-rc110-ripple and local RC116 packages; no website/Release/OTA publication or device flashing. Preserve Pico and PR99 status.
+
+## 2026-11-21 · S31 RC117撤回 / S31 RC117 withdrawal
+
+用户在双板发布后取消S31更新。S31官网刷机、TF/USB下载和Pages OTA恢复原正式RC116字节与清单，RC117 Release转草稿保留附件和标签、不再推荐；源码改动保留为未发布状态。PICO RC110及其他已发布历史版本保持，PR99仍关闭不合并。本条取代下方S31 RC117继续发布授权。
+After dual-board publication the user canceled the S31 update. Restore original RC116 bytes and metadata for S31 web/TF/USB and Pages OTA; keep RC117 as a draft with its assets/tag, retaining later source changes as unpublished. Preserve Pico RC110 and release history, and keep PR99 closed/unmerged. This supersedes the S31 RC117 publication authorization below.
+
+## 2026-11-21 · 书架、导入与阅读更新 / Library and reader release
+
+用户授权同步当前双板固件到GitHub源码、正式Release、官网在线刷机/USB/TF下载和既有Pages OTA。发布PICO RC110、S31 RC117，保留原RC109/RC116及历史原字节；PR99保持关闭且不纳入，保留已验证的PR100/102/103及Moku98/101/104–106。此授权取代本轮仅本地/不发布限制，不要求重刷设备。
+The user authorizes source, Releases, web/USB/TF and existing Pages OTA publication as Pico RC110/S31 RC117, preserving immutable history and excluding closed PR99. Retain verified PR100/102/103 and Moku98/101/104–106; this supersedes local-only constraints without requesting another device flash.
+
+书架管理分为Books目录和已上架书籍；前者按真实目录/文件名显示，不使用书架排序，后者严格按所选排序、收藏不置顶。管理/手动导入13行或4×3封面，本页全选/取消不影响其他页选择；作者限宽不覆盖书名，导入页不显示进度。重扫先保存清空上架成员再重新选书，失败保留原成员；不删源书/进度。关闭/取消首次导入不完成入架，未导入时返回书架重弹；成功主动开书自动入架。
+Books directories follow real hierarchy/name order without shelf sorting; enrolled books honor the selected sort without favorite pinning. Use13 rows or4×3 covers, page-scoped selection, bounded authors and no import progress. Rescan persists empty membership before reselection, retaining the old library on failure and preserving books/progress. Dismissal/cancellation leaves initial enrollment pending; successful deliberate opening enrolls a book.
+
+两板字号20..120，行高100..300%（最小字格紧挨），段距−100..100%且10%一步，失败保留旧排版/位置。标准TF设置备份保留旧格式兼容投影、精确完整配置配对存储；保存失败不当作零进度或允许丢失后断电。
+Both boards use20..120px type,100..300% line height with touching cells at minimum, and−100..100% paragraph gaps in10% steps. Failed layout/save operations preserve old state. Retain compatible standard TF backups plus paired full settings; failures never masquerade as zero progress or permit losing state on power-off.
+
+PICO普通/水波纹/快速三入口，快速沿用灰阶ID3、旧ID2迁移为3；上下信息栏按实际变化独立局刷并即时更新数字，首页重新读取真实进度，读取失败保留并重试。S31保留原模式，水波纹使用已验证的条带/擦白时序；配套引导程序在应用加载前稳定面板引脚并采样物理开机键，只在核实POWERON证据后略过重复短按门禁，不绕过PIN，不改原厂LUT/VCOM/eFuse。
+Pico offers Ordinary/Ripple/Fast, retaining grayscaleID3 and migrating oldID2. Update changed metadata independently and reread true Home progress with retries. Retain S31 modes and verified ripple/whitening; the matching bootloader stabilizes panel pins and samples physical power-on evidence before loading. Only verified POWERON can skip the redundant short-press gate; retain PIN, factory LUTs, VCOM and eFuses.
+
 ## S31阅读GL16 / S31 reader GL16
 
 用户2026-11-19已实测确认进度保存、底栏章名及配置恢复均正常，追加授权发布S31 RC116到官网/在线刷机与联网OTA，沿用RC115更新日志，导出Cloudzao 0x0单文件全量BIN；保持PICO正式RC109原字节与RC115历史归档。

@@ -29,7 +29,7 @@ unit = r'''
 typedef struct {unsigned x,y,width,height;} book_crop_t;
 typedef struct {uint16_t at;uint8_t frac;} scale_step_t;
 static size_t budget=8u*1024u*1024u,allocations,fail_at;
-static size_t heap_caps_get_free_size(unsigned caps){assert(caps==3);return budget;}
+static size_t __attribute__((unused)) heap_caps_get_free_size(unsigned caps){assert(caps==3);return budget;}
 static void *heap_caps_malloc(size_t n,unsigned caps){assert(caps==3);if(++allocations==fail_at)return NULL;return malloc(n);}
 static void heap_caps_free(void *p){free(p);}
 '''

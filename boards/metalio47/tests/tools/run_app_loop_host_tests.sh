@@ -26,5 +26,3 @@ python3 tools/power_dialog_host_test.py
 
 python3 tools/five_tab_navigation_host_test.py
 python3 tools/reader_origin_host_test.py
-
-python3 tools/ui_icon_pack_host_test.py

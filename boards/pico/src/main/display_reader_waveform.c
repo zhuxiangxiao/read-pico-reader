@@ -11,6 +11,7 @@
  * phases before the original three settle holds; the underlying37-phase function stays unchanged.
  */
 #include "display_reader_waveform.h"
+#include "settings.h"
 #include "e0470_epaper_waveform.h"
 #include <stdbool.h>
 #include <string.h>
@@ -81,31 +82,31 @@ static EpdWaveform s_soft_waveform = {
     .num_modes = 1, .num_temp_ranges = 1, .mode_data = s_soft_modes
 };
 static bool s_soft_ready;
+static bool s_soft_low;
 
-static void soft_set_action(int phase, int to, int from, int action) {
+static void set_action_in(uint8_t (*data)[16][4], int phase, int to, int from, int action) {
     const int shift = 6 - 2 * (from % 4);
-    s_soft_data[phase][to][from / 4] = (uint8_t)(
-        (s_soft_data[phase][to][from / 4] & ~(3u << shift)) | ((unsigned)action << shift)
+    data[phase][to][from / 4] = (uint8_t)(
+        (data[phase][to][from / 4] & ~(3u << shift)) | ((unsigned)action << shift)
     );
 }
 
 // 官方阅读翻页时序：整块全像素走厂商 GL16（右对齐、擦除+饱和+灰阶尾+定稿保持）。
-// 改动：等值“黑→黑”去掉擦白相只保留压黑相；并在厂商 3 相定稿保持之前插入 12 相
+// 改动：等值“黑→黑”去掉擦白相只保留压黑相；并在厂商 3 相定稿保持之后追加 12 相
 // “全屏擦白”（三轮，所有目标为白的像素，含本来也白的空白区），翻页后白底擦得更狠；
 // 擦白之后再加 4 相“重推黑”（所有目标为黑的像素），抵消整屏白推对黑字的冲淡；
 // 其余所有迁移（灰阶、变黑、变白）完全按厂商原序列。
 // Official reader turn timing: full-pixel vendor GL16. Equal black-on-black drops the erase
 // phases and keeps the darken phases; twelve extra white phases (three full erase rounds) are
-// inserted before the vendor's three settle holds so every white target (including already-white
+// appended after the vendor's three settle holds so every white target (including already-white
 // blanks) is erased harder after a page turn, then four extra black re-drive phases darken every
 // black target to compensate for the whole-panel white push. All other transitions stay
 // vendor-original.
-const EpdWaveform* display_reader_soft_turn_waveform(void) {
-    if (s_soft_ready) return &s_soft_waveform;
-    const EpdWaveformPhases* gl = e0470_waveform_phases(&E0470_WAVEFORM, MODE_GL16);
-    if (!gl || !gl->luts || gl->phase_times ||
-        gl->phases + READER_SOFT_TURN_SETTLE_EXTRA + READER_SOFT_TURN_BLACK_EXTRA > 64)
-        return &E0470_WAVEFORM;
+// 上面的构造抽成通用函数，供普通翻页（GL16 37 相）与快速灰阶（GRAY8 30 相）共用；普通翻页输出逐相不变。
+// The construction above, shared by ordinary (GL16 37) and fast-gray (GRAY8 30) turns; ordinary output is unchanged phase for phase.
+static bool build_turn_phases(const EpdWaveformPhases* gl, int extra, int black,
+                              uint8_t (*data)[16][4], EpdWaveformPhases* out) {
+    if (!gl || !gl->luts || gl->phase_times || gl->phases + extra + black > 64) return false;
     int hold = 0;
     while (hold < gl->phases) {
         const int f = gl->phases - 1 - hold;
@@ -116,25 +117,78 @@ const EpdWaveform* display_reader_soft_turn_waveform(void) {
         if (nonzero) break;
         ++hold;
     }
-    if (hold < 1) return &E0470_WAVEFORM;
+    if (hold < 1) return false;
     const int drive = gl->phases - hold;
-    const int extra = READER_SOFT_TURN_SETTLE_EXTRA;
-    const int black = READER_SOFT_TURN_BLACK_EXTRA;
-    // 定稿保持相先走完，再整屏擦白，最后以重推黑收尾。
-    // Vendor settle holds first, then the whole-panel white erase, finishing on the black re-drive.
-    memcpy(s_soft_data, gl->luts, (size_t)drive * 16 * 4);
-    memcpy(s_soft_data + drive, (const uint8_t*)gl->luts + (size_t)drive * 16 * 4, (size_t)hold * 16 * 4);
-    memset(s_soft_data + drive + hold, 0, (size_t)(extra + black) * 16 * 4);
+    // 定稿保持相先走完，再整屏擦白，最后以重推黑收尾（与上游 PR96 顺序一致）。
+    // Vendor settle holds first, then the whole-panel white erase, finishing on the black re-drive (upstream PR96 order).
+    memcpy(data, gl->luts, (size_t)drive * 16 * 4);
+    memcpy(data + drive, (const uint8_t*)gl->luts + (size_t)drive * 16 * 4, (size_t)hold * 16 * 4);
+    memset(data + drive + hold, 0, (size_t)(extra + black) * 16 * 4);
     for (int f = 0; f < gl->phases; ++f)
-        if (e0470_phase_action(gl, f, 0, 0) == 2) soft_set_action(f, 0, 0, 0);
+        if (e0470_phase_action(gl, f, 0, 0) == 2) set_action_in(data, f, 0, 0, 0);
     for (int i = 0; i < extra; ++i)
-        for (int from = 0; from < 16; ++from) soft_set_action(drive + hold + i, 15, from, 2);
+        for (int from = 0; from < 16; ++from) set_action_in(data, drive + hold + i, 15, from, 2);
     for (int i = 0; i < black; ++i)
-        for (int from = 0; from < 16; ++from) soft_set_action(drive + hold + extra + i, 0, from, 1);
-    s_soft_phases = (EpdWaveformPhases){gl->phases + extra + black, (const uint8_t*)s_soft_data, NULL};
+        for (int from = 0; from < 16; ++from) set_action_in(data, drive + hold + extra + i, 0, from, 1);
+    *out = (EpdWaveformPhases){gl->phases + extra + black, (const uint8_t*)data, NULL};
+    return true;
+}
+
+const EpdWaveform* display_reader_soft_turn_waveform(void) {
+    // 低残影模式保留额外擦白/重推黑；关闭时去掉这些白刷，回到 DC 平衡的厂商序列。
+    // Low-ghost keeps the extra white and black pulses; disabling drops the extra white push so
+    // the sequence returns to the DC-balanced vendor table.
+    const bool low = app_settings_low_ghost();
+    if (s_soft_ready && s_soft_low == low) return &s_soft_waveform;
+    s_soft_ready = false;
+    if (!build_turn_phases(e0470_waveform_phases(&E0470_WAVEFORM, MODE_GL16),
+                           low ? READER_SOFT_TURN_SETTLE_EXTRA : 0,
+                           low ? READER_SOFT_TURN_BLACK_EXTRA : 0,
+                           s_soft_data, &s_soft_phases))
+        return &E0470_WAVEFORM;
     s_soft_waveform.temp_intervals = E0470_WAVEFORM.temp_intervals;
+    s_soft_low = low;
     s_soft_ready = true;
     return &s_soft_waveform;
+}
+
+// 快速灰阶翻页：用官方 GRAY8 的 GL16（30 相，8 级可分辨灰）代替默认 GL16（37 相），同样去掉“黑→黑”的擦白。
+// 实屏验收：不加额外相时白底残影明显，追加 4 相整屏擦白后可接受；不加重推黑。两个宏可在编译时覆盖。
+// 只给纯文字翻页用，封面/插图/周期全刷仍走原路径。
+// Fast-gray turns: official GRAY8 GL16 (30 phases, 8 distinguishable grays) replaces the default GL16 (37),
+// with the same equal black-on-black erase removal. On the panel, zero extra phases ghosted visibly and four
+// whole-panel white phases were acceptable; no black re-drive. Both macros are compile-time tunable.
+// Text-only turns; covers, images and periodic cleanup keep their paths.
+#ifndef READER_GRAY8_TURN_SETTLE_EXTRA
+#define READER_GRAY8_TURN_SETTLE_EXTRA 4
+#endif
+#ifndef READER_GRAY8_TURN_BLACK_EXTRA
+#define READER_GRAY8_TURN_BLACK_EXTRA 0
+#endif
+static uint8_t s_gray8_turn_data[64][16][4];
+static EpdWaveformPhases s_gray8_turn_phases = {30, (const uint8_t*)s_gray8_turn_data, NULL};
+static const EpdWaveformPhases* s_gray8_turn_ranges[] = {&s_gray8_turn_phases};
+static const EpdWaveformMode s_gray8_turn_mode = {MODE_GL16, 1, s_gray8_turn_ranges};
+static const EpdWaveformMode* s_gray8_turn_modes[] = {&s_gray8_turn_mode};
+static EpdWaveform s_gray8_turn_waveform = {
+    .num_modes = 1, .num_temp_ranges = 1, .mode_data = s_gray8_turn_modes
+};
+static bool s_gray8_turn_ready;
+static bool s_gray8_low;
+
+const EpdWaveform* display_reader_gray8_turn_waveform(void) {
+    const bool low = app_settings_low_ghost();
+    if (s_gray8_turn_ready && s_gray8_low == low) return &s_gray8_turn_waveform;
+    s_gray8_turn_ready = false;
+    if (!build_turn_phases(e0470_gray8_gl16_phases_only(),
+                           low ? READER_GRAY8_TURN_SETTLE_EXTRA : 0,
+                           low ? READER_GRAY8_TURN_BLACK_EXTRA : 0,
+                           s_gray8_turn_data, &s_gray8_turn_phases))
+        return display_reader_soft_turn_waveform();
+    s_gray8_turn_waveform.temp_intervals = E0470_WAVEFORM.temp_intervals;
+    s_gray8_low = low;
+    s_gray8_turn_ready = true;
+    return &s_gray8_turn_waveform;
 }
 
 // 只驱白：所有目标为白的像素从任意状态再补白，其他目标完全保持，不动未变化的正文/文字。
@@ -227,6 +281,9 @@ static EpdWaveform s_water_waveform = {
 static bool s_water_ready;
 
 const EpdWaveform* display_reader_water_waveform(void) {
+    // 关闭低残影模式时水波纹直接用原文字表：没有额外白刷，DC 平衡。
+    // With low-ghost off the ripple uses the plain text table: no extra white push, DC balanced.
+    if (!app_settings_low_ghost()) return display_reader_text_waveform();
     if (s_water_ready) return &s_water_waveform;
     const EpdWaveform* source=display_reader_text_waveform();
     const EpdWaveformPhases* phases=e0470_waveform_phases(source,MODE_GL16);

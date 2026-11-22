@@ -15,6 +15,7 @@ static inline bool app_book_reading_active(void) { return test_reader_open; }
 #include <stddef.h>
 uint8_t app_book_resume_origin(void);
 bool app_book_resume_context(char *path, size_t capacity, bool *fullscreen);
+static inline bool app_book_checkpoint_ready(void) { return true; }
 
 void app_book_cover_mode_changed(void);
 void app_home_cover_mode_changed(void);

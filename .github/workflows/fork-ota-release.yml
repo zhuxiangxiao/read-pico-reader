@@ -137,7 +137,7 @@ jobs:
           . "$IDF_PATH/export.sh"
           board_release_flags=()
           if [ "${{ matrix.board }}" = metalio47 ]; then
-            board_release_flags=(--s31-pie --s31-reader-panel37 --s31-shelf37 --s31-settings-short-motion)
+            board_release_flags=(--s31-pie --s31-reader-panel37 --s31-shelf37 --s31-settings-short-motion --s31-early-power-key --s31-rc110-ripple)
           fi
           python tools/build_firmware.py \
             --board "${{ matrix.board }}" \

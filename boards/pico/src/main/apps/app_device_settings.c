@@ -128,6 +128,7 @@ static int settings_nav_hit(uint16_t x,uint16_t y) {
 }
 
 static bool s_reset_confirm, s_reset_pending;
+static bool s_lowghost_dialog;
 static char s_reset_notice[96];
 static ui_pinpad_t s_pinpad;
 static lock_pin_flow_t s_pinflow;
@@ -376,17 +377,21 @@ static int settings_main_row_height(void) {
     return 82;
 }
 #define SETTINGS_ROW_H settings_main_row_height()
+
 #define SETTINGS_WIRELESS_ROWS 4
-#define SETTINGS_DISPLAY_ROWS 8
+#define SETTINGS_DISPLAY_ROWS 9
 #define SETTINGS_PERSONAL_ROWS 5
 #define SETTINGS_MAINTENANCE_ROWS 5
 #define SETTINGS_WIRELESS_Y (180 + settings_profile_height() + 77)
 #define SETTINGS_DISPLAY_Y (SETTINGS_WIRELESS_Y + SETTINGS_WIRELESS_ROWS * SETTINGS_ROW_H + 78)
 #define SETTINGS_PERSONAL_Y (SETTINGS_DISPLAY_Y + SETTINGS_DISPLAY_ROWS * SETTINGS_ROW_H + 78)
 #define SETTINGS_MAINTENANCE_Y (SETTINGS_PERSONAL_Y + SETTINGS_PERSONAL_ROWS * SETTINGS_ROW_H + 78)
+
 // 设置行图标：32 像素盒，在行高 68 里垂直居中；墨色统一，避免一行一个灰度。
 // Setting row icons: a 32 px box centred in the 68 px row with one shared ink level.
 #define SETTINGS_UNLOCK_ICON 18
+// 行尾画开关、状态取低残影设置（图标本身不画）。/ Row-end switch bound to the low-ghost setting (no glyph).
+#define SETTINGS_LOWGHOST_SWITCH_ICON 22
 #define SETTINGS_ICON_PX 32
 #define SETTINGS_ICON_INK UI_GRAY_BLACK
 // 主页面滚动上限：把最后一组的最后一行刚好推到导航栏之上，多留 8px 余量。
@@ -1038,7 +1043,15 @@ static void setting_group(uint8_t *fb, int title_y, const char *title,
         int y = card_y + i * row_height;
         if (y + row_height <= 160 || y >= settings_viewport_end()) continue;
         if (i) settings_divider(fb, y, 88, 544);
-        setting_icon(fb, icons[i], 67, y + row_height / 2);
+        if (icons[i] != SETTINGS_LOWGHOST_SWITCH_ICON)
+            setting_icon(fb, icons[i], 67, y + row_height / 2);
+        if (icons[i] == SETTINGS_LOWGHOST_SWITCH_ICON) {
+            // 闭眼图标：低残影。/ Closed-eye glyph for low ghosting.
+            setting_icon(fb, 14, 67, y + row_height / 2);
+            ui_text_vc(fb, 100, y + row_height / 2, 25, labels[i], EPD_DRAW_ALIGN_LEFT, false);
+            settings_switch(fb, y + row_height / 2, app_settings_low_ghost());
+            continue;
+        }
         if(icons[i]==20){
             ui_text_vc(fb,100,y+row_height/2,25,labels[i],EPD_DRAW_ALIGN_LEFT,false);
             settings_switch(fb,y+row_height/2,app_settings_shelf_progress_badges());continue;
@@ -1103,9 +1116,14 @@ static void draw_style_thumbnail(uint8_t *fb, int style, int top) {
     }
 }
 
-// 仅 82x82 灰阶头像，不缓存整屏或第二份字库；文件变更/拔卡会使缓存失效。
-// One 82x82 gray avatar, never a full frame or second font; file changes/removal invalidate it.
-static EXT_RAM_BSS_ATTR uint8_t s_avatar_pixels[82*82];
+// 与首页共用 60x60 头像小图，首页准备好后进设置无需再解码或补刷；居中放在原 82px 位置，文字排版不变。
+// Share the home page's 60x60 avatar so settings needs no extra decode or repaint; it is centred in the
+// former 82px slot so the text layout stays unchanged.
+#define SETTINGS_AVATAR_SIDE 60
+#define SETTINGS_AVATAR_X (57 + (82 - SETTINGS_AVATAR_SIDE) / 2)
+// 仅一张灰阶头像，不缓存整屏或第二份字库；文件变更/拔卡会使缓存失效。
+// One gray avatar, never a full frame or second font; file changes/removal invalidate it.
+static EXT_RAM_BSS_ATTR uint8_t s_avatar_pixels[SETTINGS_AVATAR_SIDE*SETTINGS_AVATAR_SIDE];
 static char s_avatar_path[288];
 static bool s_avatar_ready, s_avatar_pending;
 static char s_main_wifi[33];
@@ -1430,11 +1448,18 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
         char shown[64] = "未设置";
         if (now >= 1704067200) {
             struct tm tm; time_t local = now + 8 * 3600;
-            if (gmtime_r(&local, &tm)) snprintf(shown, sizeof(shown), "%04d-%02d-%02d  %02d:%02d",
-                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+            if (gmtime_r(&local, &tm)) {
+                if (app_settings_clock_12h()) {
+                    const int hour = tm.tm_hour % 12 ? tm.tm_hour % 12 : 12;
+                    snprintf(shown, sizeof(shown), "%04d-%02d-%02d  %s %d:%02d",
+                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                        tm.tm_hour < 12 ? "上午" : "下午", hour, tm.tm_min);
+                } else snprintf(shown, sizeof(shown), "%04d-%02d-%02d  %02d:%02d",
+                    tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min);
+            }
         }
         section(fb, 253, "当前时间 · 北京时间");
-        row(fb, 296, shown, "");
+        row(fb, 296, shown, app_settings_clock_12h() ? "12 小时" : "24 小时");
         row(fb, 407, "通过 WiFi 对时", "立即同步  ›");
         row(fb, 518, "手动设置", "编辑  ›");
         ui_text(fb, 54, 656, 21, "对时成功后由内部时钟持续走时；无需保持联网。", EPD_DRAW_ALIGN_LEFT, false);
@@ -1662,12 +1687,14 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
     const int profile_y=180-s_main_scroll, profile_h=settings_profile_height();
     if (profile_y+profile_h>160) {
         settings_card(fb,(EpdRect){36,profile_y,612,profile_h},24,UI_GRAY_WHITE,0x70);
-        int avatar_y=profile_y+(profile_h-82)/2;
+        int avatar_y=profile_y+(profile_h-SETTINGS_AVATAR_SIDE)/2;
+        const EpdRect avatar={SETTINGS_AVATAR_X,avatar_y,SETTINGS_AVATAR_SIDE,SETTINGS_AVATAR_SIDE};
         bool avatar_ok=s_avatar_ready;
-        if (avatar_ok) ui_wallpaper_draw_avatar(fb,s_avatar_pixels,(EpdRect){57,avatar_y,82,82},20);
+        if (avatar_ok) ui_wallpaper_draw_avatar(fb,s_avatar_pixels,avatar,15);
         if (!avatar_ok) {
-            ui_fill_round_rect(fb,(EpdRect){57,avatar_y,82,82},20,0x30);
-            ui_text_fixed_vc(fb,98,avatar_y+41,49,"K",EPD_DRAW_ALIGN_CENTER,true);
+            ui_fill_round_rect(fb,avatar,15,0x30);
+            ui_text_fixed_vc(fb,SETTINGS_AVATAR_X+SETTINGS_AVATAR_SIDE/2,avatar_y+SETTINGS_AVATAR_SIDE/2,36,"K",
+                             EPD_DRAW_ALIGN_CENTER,true);
         }
         char name[64];snprintf(name,sizeof(name),"%s",app_settings_device_name());
         int width=588-ui_text_fixed_width_px(ui_text_effective_px(20),"编辑")-188;
@@ -1689,13 +1716,26 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
     snprintf(contrast,sizeof(contrast),"%u%%",app_settings_system_contrast());
     unsigned minutes=app_settings_auto_lock_minutes();
     if(minutes)snprintf(idle,sizeof(idle),"%u 分钟",minutes);else snprintf(idle,sizeof(idle),"%s","关闭");
-    const char *display_labels[]={"系统字体","系统对比度","主页刷新模式","首页强刷","自动休眠锁屏","双击解锁","关机睡眠","语言"};
+    const char *display_labels[]={"系统字体","系统对比度","主页刷新模式","首页强刷","自动休眠锁屏","双击解锁","关机睡眠","语言","低残影模式"};
     const char *display_values[]={font_name,contrast,
         app_settings_main_refresh_mode()==APP_MAIN_REFRESH_FAST?"快刷":app_settings_main_refresh_mode()==APP_MAIN_REFRESH_WATER?"水波纹":"普通",
-        app_settings_home_full_refresh()?"开启":"关闭",idle,"",app_settings_staged_shutdown()?"先浅后深":"彻底断电",app_setup_english()?"English":"简体中文"};
-    const int display_icons[]={2,7,15,11,14,SETTINGS_UNLOCK_ICON,9,2};
+        app_settings_home_full_refresh()?"开启":"关闭",idle,"",app_settings_staged_shutdown()?"先浅后深":"彻底断电",app_setup_english()?"English":"简体中文",""};
+    const int display_icons[]={2,7,15,11,14,SETTINGS_UNLOCK_ICON,9,2,SETTINGS_LOWGHOST_SWITCH_ICON};
     setting_group(fb,SETTINGS_DISPLAY_Y-49,"显示",SETTINGS_DISPLAY_Y,
                   display_icons,display_labels,display_values,SETTINGS_DISPLAY_ROWS);
+    if (s_lowghost_dialog) {
+        const EpdRect dialog = {68, 435, 548, 306};
+        ui_fill_round_rect(fb, dialog, 26, UI_GRAY_WHITE);
+        ui_draw_control_frame(fb, dialog, 26, 0x50);
+        ui_text_vc(fb, 342, 495, 29, "开启低残影模式？", EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_vc(fb, 342, 552, 20, "阅读时残影更少、翻页更干净", EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_vc(fb, 342, 590, 20, "耗电会增加，续航大约减少 5%", EPD_DRAW_ALIGN_CENTER, false);
+        const EpdRect cancel = {94, 643, 232, 68}, confirm = {358, 643, 232, 68};
+        ui_fill_round_rect(fb, cancel, 18, 0xe0);
+        ui_fill_round_rect(fb, confirm, 18, 0x30);
+        ui_text_vc(fb, 210, 677, 24, "取消", EPD_DRAW_ALIGN_CENTER, false);
+        ui_text_vc(fb, 474, 677, 24, "开启", EPD_DRAW_ALIGN_CENTER, true);
+    }
     snprintf(signature,sizeof(signature),"%s",app_settings_status_signature()[0]?app_settings_status_signature():"未设置");
     const char *personal_labels[]={"书架样式","书籍百分比显示","锁屏样式","锁屏密码","状态栏签名"};
     const char *personal_values[]={app_settings_shelf_style()==5?"列表书架":app_settings_shelf_style()==6?"液态玻璃书架":app_settings_shelf_style()==1?"深色书轨":"亚克力书架","",
@@ -2071,8 +2111,8 @@ static void settings_prepare_profile(void) {
     if(pico_boot_recovery()||!path[0]){ui_avatar_request("",60);s_avatar_ready=s_avatar_pending=false;s_avatar_path[0]=0;return;}
     if(strcmp(path,s_avatar_path))s_avatar_ready=false;
     snprintf(s_avatar_path,sizeof(s_avatar_path),"%s",path);
-    ui_avatar_request(path,82);
-    ui_avatar_state_t state=ui_avatar_poll(path,82,s_avatar_pixels);
+    ui_avatar_request(path,SETTINGS_AVATAR_SIDE);
+    ui_avatar_state_t state=ui_avatar_poll(path,SETTINGS_AVATAR_SIDE,s_avatar_pixels);
     s_avatar_ready=state==UI_AVATAR_READY;s_avatar_pending=state==UI_AVATAR_PENDING;
 }
 static void on_enter(app_ctx_t *ctx) {
@@ -2177,13 +2217,14 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
     }
 
     if (s_page==SETTINGS_MAIN && s_avatar_pending && !(ctx->touch && ctx->touch->touched)) {
-        ui_avatar_state_t state=ui_avatar_poll(s_avatar_path,82,s_avatar_pixels);
+        ui_avatar_state_t state=ui_avatar_poll(s_avatar_path,SETTINGS_AVATAR_SIDE,s_avatar_pixels);
         s_avatar_pending=state==UI_AVATAR_PENDING;
         s_avatar_ready=state==UI_AVATAR_READY;
         if (s_avatar_ready && s_main_scroll < 180+settings_profile_height()-160) {
             settings_drag_reset();
             render(ctx,ctx->fb);
-            EpdRect area={57,180-s_main_scroll+(settings_profile_height()-82)/2,82,82};
+            EpdRect area={SETTINGS_AVATAR_X,180-s_main_scroll+(settings_profile_height()-SETTINGS_AVATAR_SIDE)/2,
+                           SETTINGS_AVATAR_SIDE,SETTINGS_AVATAR_SIDE};
             if (area.y<160) { area.height-=160-area.y; area.y=160; }
             if(area.height>0)guard_draw_result(ctx->hl,update_display_area_diff_with(ctx->hl,
                 app_settings_main_refresh_mode()==APP_MAIN_REFRESH_NORMAL?display_main_normal_waveform():display_main_gray_waveform(),MODE_GL16,area));
@@ -2416,6 +2457,16 @@ static app_redraw_t reset_gesture(app_ctx_t *ctx,const ui_gesture_event_t *ev) {
 }
 
 static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
+    if (s_lowghost_dialog) {
+        const EpdRect cancel = {94, 643, 232, 68}, confirm = {358, 643, 232, 68};
+        if (ui_rect_hit(cancel, ev->x0, ev->y0) && ui_rect_hit(cancel, ev->x, ev->y)) {
+            s_lowghost_dialog = false; return APP_REDRAW_PAGE;
+        }
+        if (ui_rect_hit(confirm, ev->x0, ev->y0) && ui_rect_hit(confirm, ev->x, ev->y)) {
+            s_lowghost_dialog = false; app_settings_set_low_ghost(true); return APP_REDRAW_PAGE;
+        }
+        return APP_REDRAW_NONE;
+    }
     if (s_page==SETTINGS_SYSTEM_FONT && s_font_sync_confirm) {
         if (ev->type!=UI_GESTURE_TAP) return APP_REDRAW_NONE;
         for (int i=0;i<2;++i) {
@@ -2759,6 +2810,10 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         return APP_REDRAW_PAGE;
     }
     if (s_page == SETTINGS_TIME) {
+        if (y >= 296 && y < 366) {
+            app_settings_set_clock_12h(!app_settings_clock_12h());
+            return APP_REDRAW_PAGE;
+        }
         if (y >= 407 && y < 477) {
             s_notice[0] = 0; s_sync_pending = true;
             snprintf(s_notice, sizeof(s_notice), "正在获取网络时间…");
@@ -2972,7 +3027,13 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         else if(row==4)s_page=SETTINGS_AUTO_LOCK;
         else if(row==5)app_settings_set_wake_presses(app_settings_wake_presses()==2?1:2);
         else if(row==6)s_page=SETTINGS_POWER_SLEEP;
-        else s_page=SETTINGS_LANGUAGE;
+        else if(row==7)s_page=SETTINGS_LANGUAGE;
+        else {
+            // 关闭立即生效；开启先弹确认。
+            // Disabling applies at once; enabling asks first.
+            if (app_settings_low_ghost()) app_settings_set_low_ghost(false);
+            else s_lowghost_dialog = true;
+        }
         return APP_REDRAW_PAGE;
     }
     if(y>=SETTINGS_PERSONAL_Y && y<SETTINGS_PERSONAL_Y+SETTINGS_PERSONAL_ROWS*SETTINGS_ROW_H) {

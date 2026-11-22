@@ -1,4 +1,56 @@
+## S31 0.3.3-rc118 — 2026-11-21
+
+- 恢复S31 RC110的阅读水波纹擦白顺序与八条带节奏，保留当前正文裁剪、上下栏局刷和逐页数字；中断后从白重建目标页，失败保持可重试。
+- Reader ripple restores the S31 RC110 erase order and eight-band cadence,retaining body crops,local metadata and page counters; interrupted scans rebuild from white with checked retries.
+- 包含当前书架双视图、真实目录导入、13行/4×3封面、本页选择、严格排序、排版范围及进度/配置恢复；保留普通、快速、长按开机修复和PR107蓝牙HID手柄支持。PR99未纳入。
+- Retain current library/import/selection/sorting,typography,progress/settings recovery,ordinary/FastBW,startup fixes and PR107 BLE HID gamepads. Exclude PR99.
+- 官网、TF/USB和OTA同步RC118；完整开机修复需网页USB安装匹配引导程序。RC117继续撤回，保留原RC116及历史字节，PICO RC110保持。
+- Publish matching web,TF/USB and OTA RC118; startup fixes require the matching USB bootloader. Keep RC117 withdrawn,original RC116/history immutable and Pico RC110 unchanged.
+
+## 本地测试 / Local test — 2026-11-21（S31 RC110阅读水波纹）
+
+- S31显式测试构建恢复RC110的28相、八条带和末尾六相擦白，保留当前正文裁剪、普通模式及书架/排版/进度修复；沿用RC116，只生成本地测试包。
+- Explicit S31 comparison builds restore RC110's28-phase,eight-band ripple and six tail white phases,retaining body crops,ordinary mode and library/typography/progress fixes. Keep RC116 and local packages only.
+
+## 0.3.3-rc110（PICO）/ 0.3.3-rc117（S31） · 2026-11-21
+
+S31 RC117已按用户要求撤回；官网、TF与OTA恢复原正式RC116。以下S31变更仅保留源码及本地包，PICO RC110继续发布。 / S31 RC117 is withdrawn; web, TF and OTA return to original RC116. Later S31 changes remain in source/local builds; Pico RC110 stays published.
+
+- 重做书架导入与管理：Books目录按真实文件夹浏览，已上架书籍独立管理；列表13项、封面4×3、本页全选/取消、目录递归导入，修复长作者遮挡和中文书名/进度/添加时间/最近阅读排序。
+- 新机书架等待明确导入，关闭或取消后返回仍提示；主动成功开书自动上架。重新扫描先清空上架列表再重新选择，书籍文件和阅读进度保留，保存失败保留原列表。
+- 阅读字号20–120，行高100%–300%，段距−100%–100%且每次10%；修复点击/拖动/侧滑的范围和失败回退，兼容标准与完整配置备份。
+- 修复阅读位置、锁屏/关机恢复及首页继续阅读百分比同步，进度保存失败保留可重试记录；目录与导入均支持取消和存储失败保护。
+- PICO保留普通、水波纹、快速三种效果，顶部/底部信息独立局刷并更新页数；压缩图标节省固件空间，修复灰度JPEG与设置头像，图片拖动采用跟随DU刷新。未纳入PR99连续快翻与延迟保存。
+- S31放慢水波纹并加入擦白过渡，配套引导程序修复长按启动重复按键及锁屏横条路径；完整开机改善请使用网页USB安装（TF/OTA只更新应用）。
+- 保留Moku高压轨保持、升级后一次性关闭周期全刷、设备同步失败阶段等已验证改动；历史正式版、原固定下载地址和默认数据保留不变。
+
 # 版本变更 / Changelog
+
+## 本地测试 / Local test — 2026-11-22（重启/关机）
+
+- 修复重启或关机后恢复记录未清除、下次开机被当成「从睡眠恢复」而停在锁屏浅睡的问题；现在重启与关机都从主页冷启动。
+- Fix restart and power-off leaving the resume record behind, which made the next boot treat it as a sleep resume and wait in light sleep on the lock screen; both actions now cold-boot to Home.
+
+## 本地测试 / Local test — 2026-11-21（JPEGDEC 基线解码）
+
+- 封面与插图解码：基线 JPEG 先走 JPEGDEC 的全平面 8 位灰度（按目标尺寸选 1/1~1/8，清晰度与 TJpgDec 同级），渐进式继续用 1/8 平面，失败回落 TJpgDec。
+- Covers and illustrations: baseline JPEGs now try JPEGDEC's full 8-bit gray plane first (1/1..1/8 chosen from the target size, matching TJpgDec's sharpness); progressive frames keep the 1/8 plane and TJpgDec remains the fallback.
+
+## 本地测试 / Local test — 2026-11-21（低残影模式）
+
+- 显示设置新增「低残影模式」开关（默认开启）：开启后阅读原文时持续保持面板供电，翻页保留额外擦白/重推黑；关闭后翻页波形去掉额外白刷，回到 DC 平衡。开启前弹窗提示续航大约减少 5%。
+- 普通翻页把状态栏与进度条并入同一次整屏擦白，白底随正文一起退白。
+- Add a “low ghosting” display switch (on by default): while reading, the panel supply stays up and turns keep the extra whitening. Turning it off drops those extra white pulses for a DC-balanced waveform. A dialog warns about roughly 5% shorter battery life. Ordinary turns now whiten the status and progress bars in the same full-panel erase.
+
+## 本地测试 / Local test — 2026-11-21（12 小时制）
+
+- 日期与时间新增 24/12 小时制切换：点「当前时间」那一行即可切换，状态栏时钟与日期时间页按所选制式显示；该设置写入 NVS 并随备份/设备同步保存。
+- Add a 24/12-hour toggle on the Date & time page (tap the current-time row). The status-bar clock and the page follow the choice, and the setting is stored in NVS and carried by backups/device sync.
+
+## 本地测试 / Local test — 2026-11-21（蓝牙手柄）
+
+- 蓝牙翻页器支持标准 BLE HID 手柄：从报告映射识别 Joystick/Game Pad，解析按钮位与 Hat 位；Hat 左右翻页，第一个按钮下一页、第二个按钮上一页，其余按键仍可在「试按学习」里绑定。
+- The BLE page turner now supports standard BLE HID gamepads: it detects Joystick/Game Pad in the report map, parses the button and hat bit layouts, turns pages on hat left/right and the first two buttons, and leaves other buttons to the learning UI.
 
 ## 本地测试 / Local test — 2026-11-20（设备同步失败提示）
 

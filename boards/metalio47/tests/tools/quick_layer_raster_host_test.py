@@ -84,7 +84,6 @@ static void heap_caps_free(void *p){if(p){--live;size_t *base=(size_t*)p-1;live_
 code+='static void ui_fill_rect_fast(EpdRect r,uint8_t gray,uint8_t *fb){epd_fill_rect(r,gray,fb);}\n'
 header=(root/'main/ui/ui_quick_menu.h').read_text()
 code+='\n'.join(re.findall(r'^#define UI_QUICK[^\n]*',header,re.M))+'\n'
-code += '#include "'+str(root/'main/ui/ui_icon_unpack.inc')+'"\n'
 for name in ('ui_read_pixel','ui_image_bw_rect','icon_nibble','ui_draw_icon'):
     code+=function('main/ui/ui_kit.c',name)
 for name in ('epd_draw_circle',):code+=function('components/epdiy/src/epdiy.c',name)
