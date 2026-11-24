@@ -5,6 +5,12 @@
  * English: Shared reader sampling; rendering never performs network requests.
  */
 #include "weread/weread_store.h"
+#ifndef WR_UNDO_LOCAL
+#define WR_UNDO_LOCAL 0
+#define WR_UNDO_CLOUD_BACK 1
+#define WR_UNDO_CLOUD_JUMP 2
+#endif
+static bool s_wr_undo_top_erase __attribute__((unused));
 static uint32_t s_wr_content_version;
 static bool wr_reader_text_page(void){
     return s_view==READING&&s_text&&!s_clear_confirm&&s_reader_panel==READER_PANEL_NONE&&
@@ -17,67 +23,65 @@ static bool wr_reader_text_turn(int dir){
 }
 static void wr_reader_move(void){
     if(!s_text||!book_path_is_weread(s_path)||!book_layout_page_count())return;
+    if(s_chapter_jump_undo.valid&&s_chapter_jump_undo.mode!=WR_UNDO_LOCAL){
+        uint8_t mode=s_chapter_jump_undo.mode;
+        s_chapter_jump_undo.valid=false;
+        s_wr_undo_top_erase=true;
+        if(mode==WR_UNDO_CLOUD_JUMP)weread_reader_commit_cloud_jump(s_path,false);
+    }
     size_t offset=reader_page_offset(s_page);if(offset>s_text_len)offset=s_text_len;
     weread_reader_navigated_version(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,s_wr_content_version);
 }
 static void wr_reader_sample(uint64_t now, bool active) {
     static uint64_t sampled;
-    static char footer_id[64];
-    static unsigned footer_cached, footer_total;
-    static bool footer_space;
     if (!s_text || !book_path_is_weread(s_path) || !book_layout_page_count()) return;
     if (active && now >= sampled && now - sampled < 200) return;
     sampled = now;
-    if (strcmp(footer_id, s_path + 9)) {
-        wr_copy(footer_id, sizeof(footer_id), s_path + 9);
-        weread_reader_cached_progress(&footer_cached, &footer_total);
-        footer_space = weread_reader_storage_blocked();
-    }
     size_t offset = reader_page_offset(s_page);
     if (offset > s_text_len) offset = s_text_len;
     weread_progress_state_t before=weread_reader_state();
     bool failed=weread_reader_save_failed(),pending=weread_reader_pending_save(),rescued=weread_reader_rescued();
-    unsigned offline=weread_reader_offline();
-    bool caching=weread_reader_caching();
+    bool space=weread_reader_storage_blocked();
     weread_reader_tick(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,now,active);
-    unsigned next_cached=0,next_total=0;
-    weread_reader_cached_progress(&next_cached,&next_total);
-    bool next_space=weread_reader_storage_blocked();
-    bool cache_delta=next_cached!=footer_cached||next_total!=footer_total||next_space!=footer_space;
-    footer_cached=next_cached;footer_total=next_total;footer_space=next_space;
     if(s_view==READING&&!s_toolbar&&
-        (before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||rescued!=weread_reader_rescued()||
-        offline!=weread_reader_offline()||cache_delta||caching!=weread_reader_caching())){s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;}
+        (before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||
+        rescued!=weread_reader_rescued()||space!=weread_reader_storage_blocked())){
+        s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;
+    }
 }
 static const char *wr_reader_status(void){
     if(!book_path_is_weread(s_path))return "";
-    if(weread_reader_save_failed())return "保存失败 · ";
+    if(weread_reader_save_failed())return "未保存 · ";
     if(weread_reader_pending_save())return "待保存 · ";
-    if(weread_reader_state()==WR_PROGRESS_CONFLICT)return "进度冲突，请重开 · ";
-    if(weread_reader_rescued())return "已暂存设备 · ";
+    if(weread_reader_state()==WR_PROGRESS_CONFLICT)return "进度冲突 · ";
+    if(weread_reader_rescued())return "暂存机内 · ";
     switch(weread_reader_state()){
         case WR_PROGRESS_PENDING:return "待同步 · ";
-        case WR_PROGRESS_SYNCED:return "已同步 · ";
+        case WR_PROGRESS_SYNCED:return "";
         case WR_PROGRESS_CONFLICT:return "进度冲突 · ";
-        default:return "本地保存 · ";
+        default:return weread_runtime_reader_has_turned(s_path)?"本地保存 · ":"";
     }
 }
 
 static void wr_reader_offline_caption(char *out,size_t cap){
+    if(!out||!cap)return;
     out[0]=0;if(!book_path_is_weread(s_path))return;
+    if(weread_reader_storage_blocked())snprintf(out,cap,"空间不足 · ");
+}
+
+// 工具栏第 6 按钮动态显示当前整本缓存进度或状态；静默后台下载不唤醒屏幕。
+// Toolbar button 6 dynamically reflects whole-book cache progress or state without waking the screen on silent prefetch.
+static void __attribute__((unused)) wr_reader_tool6_label(char *out,size_t cap){
+    if(!out||!cap)return;
     unsigned cached=0,total=0;
     weread_reader_cached_progress(&cached,&total);
-    if(weread_reader_storage_blocked()){
-        if(total)snprintf(out,cap,"缓存空间不足(%u/%u) · ",cached,total);
-        else snprintf(out,cap,"缓存空间不足 · ");
-    }else if(total){
-        snprintf(out,cap,"已缓存 %u/%u 章 · ",cached,total);
-    }else{
-        unsigned ready=weread_reader_offline();
-        if(ready)snprintf(out,cap,"后续%u章已缓存 · ",ready);
-        else if(weread_reader_caching())snprintf(out,cap,"缓存后续章节 · ");
-        else snprintf(out,cap,"本章已缓存 · ");
-    }
+    bool enabled=weread_reader_cache_fill_enabled();
+    bool stalled=enabled&&(weread_reader_cache_forward_stalled()||weread_reader_storage_blocked());
+    if(total>0&&cached>=total)snprintf(out,cap,"已全存");
+    else if(!enabled)snprintf(out,cap,"已暂停");
+    else if(stalled)snprintf(out,cap,"重试缓存");
+    else if(total>0)snprintf(out,cap,"缓存 %u/%u",cached,total);
+    else snprintf(out,cap,"缓存中");
 }
 
 // 手动缓存开关：只翻转后台补齐开关并给出短提示，不等待下载、不改动当前正文。
@@ -117,15 +121,19 @@ static void toc_cached_markers_prepare(int page){
 
 // 冷章只保存最新目标，旧正文保留到目标成功排版。/ Keep the old body until the latest cold target typesets successfully.
 static struct {
-    bool pending, started, committing, last_page;
+    bool pending, started, committing, last_page, cloud_commit;
     esp_err_t error;
     size_t chapter, offset, source_offset, toc;
+    int toc_page;
     char *anchor;
 } s_wr_jump;
 static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool last_page,const char *anchor,size_t source_offset);
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx);
 static void wr_chapter_cancel(void){
     weread_runtime_prefetch_adopt(0);
-    if(s_wr_jump.pending){weread_runtime_cancel();s_reader_notice[0]=0;s_reader_notice_until=0;}
+    if(s_wr_jump.pending){
+        if(s_wr_jump.cloud_commit)weread_reader_commit_cloud_jump(s_path,false);
+        weread_runtime_cancel();s_reader_notice[0]=0;s_reader_notice_until=0;
+    }
     free(s_wr_jump.anchor);memset(&s_wr_jump,0,sizeof(s_wr_jump));
 }

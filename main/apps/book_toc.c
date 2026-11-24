@@ -407,3 +407,15 @@ void book_toc_render_jump(uint8_t *fb, size_t chapters, int percent) {
     ui_fill_round_rect(fb, (EpdRect){354, 850, 255, 57}, 20, 0x40);
     ui_text_box(fb,(EpdRect){362,858,239,41},26,"跳转",EPD_DRAW_ALIGN_CENTER,true);
 }
+
+void book_toc_render_banner(uint8_t *fb, const char *message) {
+    if (!fb || !message || !*message) return;
+    EpdRect bar = {TOC_LEFT, 215, TOC_RIGHT - TOC_LEFT, 34};
+    ui_fill_round_rect(fb, bar, 12, 0xd8);
+    ui_draw_round_rect(fb, bar, 12, 0x40);
+    char info[160];
+    one_line(info, sizeof(info), message);
+    fit_line(info, ui_text_effective_px(20), bar.width - 24);
+    ui_text_box(fb, (EpdRect){bar.x + 12, bar.y + 3, bar.width - 24, bar.height - 6},
+                20, info, EPD_DRAW_ALIGN_CENTER, false);
+}

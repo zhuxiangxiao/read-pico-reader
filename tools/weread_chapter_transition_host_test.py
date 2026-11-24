@@ -20,10 +20,11 @@ enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER,WR_JOB_PREFETCH,M
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE,APP_REDRAW_AREA} app_redraw_t;
 typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {bool touched;} touch_t;
-typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;uint8_t *fb;} app_ctx_t;
+typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;uint8_t *fb;int leaf;} app_ctx_t;
 typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t;
-static struct {bool pending,started,committing,last_page;esp_err_t error;size_t chapter,offset,source_offset,toc;char *anchor;}s_wr_jump;
-static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,cached_flag,prefetch_busy,cloud_jump_ready,cloud_jump_committed;
+static struct {bool pending,started,committing,last_page,cloud_commit;esp_err_t error;size_t chapter,offset,source_offset,toc;int toc_page;char *anchor;}s_wr_jump;
+static struct {bool valid;uint8_t mode;size_t chapter,offset,target_chapter,target_offset;int64_t until_ms;}s_chapter_jump_undo;
+static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,cached_flag,prefetch_busy,cloud_jump_ready,cloud_jump_committed,mock_has_turned,rebase_fail;
 static bool stage_ready;static char stage_text[64];static EpdRect s_area;static int s_mode,renders;
 static int stage_kind;static uint64_t stage_bytes;
 typedef enum {WEREAD_STAGE_NONE=0,WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE,WEREAD_STAGE_RETRY} weread_stage_t;
@@ -32,10 +33,11 @@ static bool weread_reader_stage_text(char *out,size_t cap){if(!stage_ready)retur
 static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++renders;}
 static size_t cloud_jump_ch;static uint32_t cloud_jump_off,adopted_uid;
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE;
+static bool s_clear_confirm;
 static char s_path[]="weread://book_A",s_message[128],s_reader_notice[64],s_title[64];
 static int64_t s_reader_notice_until;
 static size_t s_chapter=2,s_page=7,s_selected_toc,s_selected_toc_offset;
-static unsigned starts,cancels,loads,moves,saves;
+static unsigned starts,cancels,loads,moves,saves,rebases,cloud_commits_false,toc_prepares;
 static const char *s_text="old complete body";
 static weread_result_t ready;
 static void *wr_alloc(size_t bytes){return alloc_fail?NULL:calloc(1,bytes);}
@@ -45,7 +47,12 @@ static bool weread_reader_cached(const char *uri,size_t ch){(void)uri;(void)ch;r
 static bool weread_runtime_prefetch_active(const char *id,uint32_t uid){(void)id;(void)uid;return prefetch_busy;}
 static void weread_runtime_prefetch_adopt(uint32_t uid){adopted_uid=uid;}
 static bool weread_reader_poll_cloud_jump(const char *uri,size_t *ch,uint32_t *off){(void)uri;if(!cloud_jump_ready)return false;*ch=cloud_jump_ch;*off=cloud_jump_off;return true;}
-static void weread_reader_commit_cloud_jump(const char *uri,bool committed){(void)uri;cloud_jump_ready=false;if(committed)cloud_jump_committed=true;}
+static void weread_reader_commit_cloud_jump(const char *uri,bool committed){(void)uri;cloud_jump_ready=false;if(committed)cloud_jump_committed=true;else ++cloud_commits_false;}
+static bool weread_runtime_reader_has_turned(const char *uri){(void)uri;return mock_has_turned;}
+static esp_err_t weread_runtime_cloud_jump_rebase(const char *uri){(void)uri;++rebases;if(rebase_fail)return ESP_FAIL;cloud_jump_ready=false;return ESP_OK;}
+static size_t book_navigation_count(void){return 12;}
+static size_t current_toc_position(void){return 0;}
+static void book_toc_prepare_page(size_t chapters,size_t current,int page){(void)chapters;(void)current;(void)page;++toc_prepares;}
 static void weread_runtime_cancel(void){++cancels;}
 static bool weread_runtime_poll(weread_result_t *r){if(busy||!done)return false;done=false;*r=ready;return true;}
 static void weread_runtime_result_free(weread_result_t *r){memset(r,0,sizeof(*r));}
@@ -110,7 +117,7 @@ int main(void){
  stage_ready=false;snprintf(stage_text,sizeof(stage_text),"解析章节…");
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&renders==renders_before+5);
  complete(WEREAD_ERR_PURCHASE);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
- assert(!s_wr_jump.pending&&!loads&&!moves&&s_chapter==2&&s_page==7&&strstr(s_reader_notice,"手机"));
+ assert(!s_wr_jump.pending&&!loads&&!moves&&s_chapter==2&&s_page==7&&!strcmp(s_reader_notice,"手机端购买本章后，再翻页即可加载")&&s_reader_notice_until==ctx.now_ms+5000);
  char anchor[]="owned-anchor";assert(wr_chapter_queue(&ctx,3,0,false,anchor,SIZE_MAX));anchor[0]='X';
  assert(starts==2&&busy); // No tick or feedback presentation is needed to start the request.
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&busy);
@@ -152,13 +159,56 @@ int main(void){
  cloud_jump_ready=true;cloud_jump_committed=false;cloud_jump_ch=12;cloud_jump_off=40;load_fail=true;
  assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&!cloud_jump_ready&&!cloud_jump_committed&&s_chapter==11);
  load_fail=false;
- // Async cloud-sync forward jump commits directly and shows toast.
+ // Async cloud-sync forward jump when not turned auto-jumps, commits, and shows 6s [返回原处] banner.
+ s_chapter_jump_undo.valid=false;mock_has_turned=false;s_page=7;
  cloud_jump_ready=true;cloud_jump_ch=12;cloud_jump_off=40;
- assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&cloud_jump_committed&&s_chapter==12&&strstr(s_reader_notice,"已同步云端进度"));
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&cloud_jump_committed&&s_chapter==12);
+ assert(s_chapter_jump_undo.valid&&s_chapter_jump_undo.mode==1&&s_chapter_jump_undo.chapter==12);
+ assert(s_chapter_jump_undo.target_chapter==11&&s_chapter_jump_undo.target_offset==700&&s_chapter_jump_undo.until_ms==ctx.now_ms+6000);
+ // Async cloud-sync when user already turned rebases without jumping and shows 6s [点击跳转] banner.
+ s_chapter_jump_undo.valid=false;mock_has_turned=true;cloud_jump_ready=true;cloud_jump_ch=14;cloud_jump_off=88;
+ unsigned loads_before=loads;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&loads==loads_before&&rebases==1);
+ assert(s_chapter_jump_undo.valid&&s_chapter_jump_undo.mode==2&&s_chapter_jump_undo.chapter==12);
+ assert(s_chapter_jump_undo.target_chapter==14&&s_chapter_jump_undo.target_offset==88&&s_chapter_jump_undo.until_ms==ctx.now_ms+6000);
+ s_chapter_jump_undo.valid=false;mock_has_turned=false;
+ // Offline/network failure on started job gives 5000ms retry prompt; TOC failure auto-returns to original TOC leaf.
+ assert(wr_chapter_queue(&ctx,15,0,false,NULL,SIZE_MAX));
+ s_wr_jump.toc=4;s_wr_jump.toc_page=3;ctx.leaf=3;s_view=READING;
+ complete(ESP_ERR_INVALID_STATE);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
+ assert(!s_wr_jump.pending&&s_view==TOC&&ctx.leaf==3&&toc_prepares==1);
+ assert(!strcmp(s_reader_notice,"本章未缓存且网络不可用，连网后再翻页重试")&&s_reader_notice_until==ctx.now_ms+5000);
+ s_view=READING;
+ // Cold-chapter cloud_commit cancels cleanly and commits false.
+ assert(wr_chapter_queue(&ctx,16,0,false,NULL,SIZE_MAX));
+ s_wr_jump.cloud_commit=true;unsigned cf=cloud_commits_false;
+ wr_chapter_cancel();assert(!s_wr_jump.pending&&cloud_commits_false==cf+1);
+ complete(ESP_ERR_INVALID_STATE);
  // Cold-chapter OOM surfaces the retry-later toast instead of generic load failure.
  assert(wr_chapter_queue(&ctx,13,0,false,NULL,SIZE_MAX));
  complete(ESP_ERR_NO_MEM);assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE);
  assert(!s_wr_jump.pending&&s_chapter==12&&!strcmp(s_reader_notice,"内存不足，请稍后重试"));
+ // Challenge 2: cloud jumps defer cleanly while an overlay panel or clear-confirm modal is open, then surface on close.
+ s_chapter_jump_undo.valid=false;mock_has_turned=true;cloud_jump_ready=true;cloud_jump_ch=15;cloud_jump_off=50;
+ s_reader_panel=1;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&cloud_jump_ready&&!s_chapter_jump_undo.valid);
+ s_reader_panel=READER_PANEL_NONE;s_clear_confirm=true;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&cloud_jump_ready&&!s_chapter_jump_undo.valid);
+ s_clear_confirm=false;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&!cloud_jump_ready&&s_chapter_jump_undo.valid&&s_chapter_jump_undo.mode==2);
+ s_chapter_jump_undo.valid=false;
+ mock_has_turned=false;cloud_jump_ready=true;cloud_jump_committed=false;cloud_jump_ch=16;cloud_jump_off=60;
+ s_reader_panel=1;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&cloud_jump_ready&&!cloud_jump_committed&&s_chapter==12&&s_reader_panel==1);
+ s_reader_panel=READER_PANEL_NONE;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_PAGE&&!cloud_jump_ready&&cloud_jump_committed&&s_chapter==16&&s_chapter_jump_undo.mode==1);
+ s_chapter_jump_undo.valid=false;
+ // Bug 1 regression: active WR_UNDO_LOCAL must be cleared when queuing a cold chapter load.
+ s_chapter_jump_undo.valid=true;s_chapter_jump_undo.mode=0;
+ assert(wr_chapter_queue(&ctx,14,0,false,NULL,SIZE_MAX));
+ assert(s_wr_jump.pending&&!s_chapter_jump_undo.valid);
+ wr_chapter_cancel();
+ complete(ESP_ERR_INVALID_STATE);
  puts("PASS: production chapter controller adopts prefetch, applies cloud jumps, coalesces targets, and cancels safely");
 }
 '''

@@ -94,13 +94,14 @@ for name in ('app_book_request_open','app_book_request_open_from_home','app_book
              'shelf_backfill_visit','shelf_backfill_read_books','refresh_cached_progress'):
     unit += function(name, reader) + '\n'
 unit += r'''
-typedef struct {char path[288],title[256],author[128];time_t modified;bool has_progress;book_progress_t progress;} home_book_t;
+typedef struct {char path[288],title[256],author[128];time_t modified;bool has_progress;bool weread_pending;book_progress_t progress;} home_book_t;
 static home_book_t s_current,s_recent[6];
 static home_book_t *book_at(int index){return index==0?&s_current:&s_recent[index-1];}
 static const char *app_settings_books_dir(void){return books_root;}
 static bool book_store_flash_ready(void){return false;}
 typedef struct {bool mounted;} read_pico_sd_info_t;
 static void read_pico_sd_get_info(read_pico_sd_info_t *out){out->mounted=true;}
+static bool dashboard_weread_pending(const char *p){(void)p;return false;}
 '''
 for name in ('is_book','copy_title','title_for','consider_book','scan_root','recent_visit','scan_books'):
     unit += function(name, home) + '\n'

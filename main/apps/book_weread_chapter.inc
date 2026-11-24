@@ -6,6 +6,11 @@
  */
 // 冷章提示文案的限速状态：下载阶段最多每 2 秒重绘一次，阶段切换立即刷新。
 // Toast rate limiter: a download stage repaints at most every 2 s while a stage change shows immediately.
+#ifndef WR_UNDO_LOCAL
+#define WR_UNDO_LOCAL 0
+#define WR_UNDO_CLOUD_BACK 1
+#define WR_UNDO_CLOUD_JUMP 2
+#endif
 static uint64_t s_stage_notice_at;
 static unsigned s_stage_notice_kind;
 static esp_err_t wr_chapter_start(app_ctx_t *ctx){
@@ -21,10 +26,16 @@ static bool wr_chapter_queue(app_ctx_t *ctx,size_t chapter,size_t offset,bool la
     char *owned=NULL;
     if(anchor){size_t bytes=strlen(anchor)+1;owned=wr_alloc(bytes);if(!owned)return false;memcpy(owned,anchor,bytes);}
     wr_chapter_cancel();
+    if(s_chapter_jump_undo.valid){
+        uint8_t mode=s_chapter_jump_undo.mode;
+        s_chapter_jump_undo.valid=false;
+        if(mode==WR_UNDO_CLOUD_JUMP)weread_reader_commit_cloud_jump(s_path,false);
+    }
     uint32_t target_uid=book_weread_uid(chapter);
     bool adopting=weread_runtime_prefetch_active(s_path+9,target_uid);
     s_wr_jump.pending=true;s_wr_jump.chapter=chapter;s_wr_jump.offset=offset;
-    s_wr_jump.last_page=last_page;s_wr_jump.source_offset=source_offset;s_wr_jump.anchor=owned;s_wr_jump.toc=SIZE_MAX;
+    s_wr_jump.last_page=last_page;s_wr_jump.source_offset=source_offset;s_wr_jump.anchor=owned;
+    s_wr_jump.toc=SIZE_MAX;s_wr_jump.toc_page=ctx->leaf;
     if(adopting){weread_runtime_prefetch_adopt(target_uid);s_wr_jump.started=true;}
     else{weread_runtime_prefetch_adopt(0);weread_runtime_cancel();}
     s_view=READING;s_reader_panel=READER_PANEL_NONE;
@@ -81,17 +92,43 @@ static app_redraw_t wr_chapter_stage_notice(app_ctx_t *ctx){
 }
 static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(!s_wr_jump.pending){
-        if(ctx->request_app||ctx->consumed||(ctx->touch&&ctx->touch->touched)||s_view!=READING||!s_text)return APP_REDRAW_NONE;
+        if(ctx->request_app||ctx->consumed||(ctx->touch&&ctx->touch->touched)||s_view!=READING||!s_text||s_reader_panel!=READER_PANEL_NONE||s_clear_confirm)return APP_REDRAW_NONE;
         size_t chapter=0;uint32_t offset=0;
         if(!weread_reader_poll_cloud_jump(s_path,&chapter,&offset))return APP_REDRAW_NONE;
+        if(weread_runtime_reader_has_turned(s_path)){
+            if(weread_runtime_cloud_jump_rebase(s_path)!=ESP_OK)return APP_REDRAW_NONE;
+            s_chapter_jump_undo.valid=true;
+            s_chapter_jump_undo.mode=WR_UNDO_CLOUD_JUMP;
+            s_chapter_jump_undo.chapter=s_chapter;
+            s_chapter_jump_undo.offset=reader_page_offset(s_page);
+            s_chapter_jump_undo.target_chapter=chapter;
+            s_chapter_jump_undo.target_offset=offset;
+            s_chapter_jump_undo.until_ms=ctx->now_ms+6000;
+            s_reader_notice[0]=0;s_reader_notice_until=0;
+            if(ctx->fb){
+                render(ctx,ctx->fb);
+                s_area=(EpdRect){96,152,492,142};s_mode=MODE_GL16;
+                return APP_REDRAW_AREA;
+            }
+            return APP_REDRAW_PAGE;
+        }
+        size_t prev_chapter=s_chapter,prev_offset=reader_page_offset(s_page);
         s_wr_jump.committing=true;
         bool ok=load_chapter_at(ctx,chapter,offset,false,NULL,SIZE_MAX);
         s_wr_jump.committing=false;
         weread_reader_commit_cloud_jump(s_path,ok);
         if(!ok)return APP_REDRAW_NONE;
         s_selected_toc=SIZE_MAX;s_view=READING;s_reader_panel=READER_PANEL_NONE;
-        copy_text(s_reader_notice,sizeof(s_reader_notice),"已同步云端进度");
-        s_reader_notice_until=ctx->now_ms+2000;
+        s_reader_notice[0]=0;s_reader_notice_until=0;
+        if(s_chapter!=prev_chapter||reader_page_offset(s_page)!=prev_offset){
+            s_chapter_jump_undo.valid=true;
+            s_chapter_jump_undo.mode=WR_UNDO_CLOUD_BACK;
+            s_chapter_jump_undo.chapter=s_chapter;
+            s_chapter_jump_undo.offset=reader_page_offset(s_page);
+            s_chapter_jump_undo.target_chapter=prev_chapter;
+            s_chapter_jump_undo.target_offset=prev_offset;
+            s_chapter_jump_undo.until_ms=ctx->now_ms+6000;
+        }
         save_progress();return APP_REDRAW_PAGE;
     }
     if(ctx->request_app){wr_chapter_cancel();return APP_REDRAW_NONE;}
@@ -114,6 +151,7 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
         s_wr_jump.committing=true;
         bool ok=load_chapter_at(ctx,s_wr_jump.chapter,s_wr_jump.offset,s_wr_jump.last_page,s_wr_jump.anchor,s_wr_jump.source_offset);
         if(ok){
+            bool cloud_commit=s_wr_jump.cloud_commit;
             s_selected_toc=s_wr_jump.toc==SIZE_MAX?SIZE_MAX:s_chapter;
             if(s_selected_toc!=SIZE_MAX){
                 s_selected_toc_offset=reader_page_offset(s_page);
@@ -121,22 +159,40 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
             }
             free(s_wr_jump.anchor);memset(&s_wr_jump,0,sizeof(s_wr_jump));
             s_view=READING;s_reader_panel=READER_PANEL_NONE;s_reader_notice[0]=0;
-            wr_reader_move();save_progress();return APP_REDRAW_PAGE;
+            if(cloud_commit)weread_reader_commit_cloud_jump(s_path,true);
+            else wr_reader_move();
+            save_progress();return APP_REDRAW_PAGE;
         }
         err=ESP_FAIL;
     }
+    bool from_toc=s_wr_jump.toc!=SIZE_MAX;
+    bool was_started=s_wr_jump.started;
+    bool cloud_commit=s_wr_jump.cloud_commit;
+    int toc_page=s_wr_jump.toc_page;
     free(s_wr_jump.anchor);memset(&s_wr_jump,0,sizeof(s_wr_jump));
+    if(cloud_commit)weread_reader_commit_cloud_jump(s_path,false);
     if(err!=ESP_OK){
 #if defined(ESP_PLATFORM)
         ESP_LOGW(TAG,"weread chapter failed err=%d msg=%s",(int)err,s_message);
 #endif
-        copy_text(s_reader_notice,sizeof(s_reader_notice),s_message[0]?s_message:
-            err==WEREAD_ERR_PURCHASE?"请在手机端购买或领取此章节":
-            err==WEREAD_ERR_SOLD_OUT?"章节已下架":
-            err==WEREAD_ERR_VERSION?"书籍已更新，请返回书架重新打开":
-            err==ESP_ERR_NO_MEM?"内存不足，请稍后重试":
-            err==ESP_ERR_INVALID_STATE?"章节准备已取消":"加载失败，可返回目录重试");
-        s_reader_notice_until=ctx->now_ms+3000;s_message[0]=0;
+        int64_t duration=3000;
+        const char *notice=s_message;
+        if(!notice[0]){
+            if(err==WEREAD_ERR_PURCHASE){notice="手机端购买本章后，再翻页即可加载";duration=5000;}
+            else if(err==WEREAD_ERR_SOLD_OUT)notice="章节已下架";
+            else if(err==WEREAD_ERR_VERSION)notice="书籍已更新，请返回书架重新打开";
+            else if(err==ESP_ERR_NO_MEM)notice="内存不足，请稍后重试";
+            else if(!was_started)notice="位置未保存，请检查存储卡后重试";
+            else{notice="本章未缓存且网络不可用，连网后再翻页重试";duration=5000;}
+        }else if(from_toc){
+            duration=5000;
+        }
+        copy_text(s_reader_notice,sizeof(s_reader_notice),notice);
+        s_reader_notice_until=ctx->now_ms+duration;s_message[0]=0;
+    }
+    if(err!=ESP_OK&&from_toc&&s_text){
+        s_view=TOC;ctx->leaf=toc_page>=0?toc_page:0;
+        book_toc_prepare_page(book_navigation_count(),current_toc_position(),ctx->leaf);
     }
     return APP_REDRAW_PAGE;
 }

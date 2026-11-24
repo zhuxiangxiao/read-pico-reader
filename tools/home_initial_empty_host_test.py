@@ -25,7 +25,7 @@ UNIT = r'''
 typedef int esp_err_t;
 enum {ESP_OK, ESP_FAIL, ESP_ERR_NOT_FINISHED};
 typedef struct {uint32_t file_size,last_open_s;uint8_t pct;} book_progress_t;
-typedef struct {char path[288],title[128],author[128];time_t modified;bool has_progress;book_progress_t progress;} home_book_t;
+typedef struct {char path[288],title[128],author[128];time_t modified;bool has_progress;bool weread_pending;book_progress_t progress;} home_book_t;
 typedef struct {bool present,mounted;} read_pico_sd_info_t;
 static home_book_t s_current,s_recent[6];
 static bool pending,s_books_cache_valid,s_cached_library_pending,s_cached_sd_present,s_cached_sd_mounted;
@@ -54,6 +54,7 @@ static int book_epub_metadata(const char *path,char *title,size_t tcap,char *aut
 static home_book_t *book_at(int index){return index?&s_recent[index-1]:&s_current;}
 static int book_target_stat(const char *path,struct stat *out){return stat(path,out);}
 static void weread_runtime_load_local(void){}
+static bool dashboard_weread_pending(const char *path){(void)path;return false;}
 '''
 
 CASES = r'''

@@ -98,6 +98,7 @@ typedef struct {
     time_t modified;
     book_progress_t progress;
     bool has_progress;
+    bool weread_pending;
 } home_book_t;
 
 // 首页冷数据不参与DMA或中断，在PSRAM保留原静态生命周期和零初始化。
@@ -255,6 +256,13 @@ static bool recent_visit(const char *path,const book_progress_t *progress,void *
         consider_book(path,&st);
     return true;
 }
+static bool dashboard_weread_pending(const char *path) {
+    if (!book_path_is_weread(path)) return false;
+    weread_progress_t wp = {0};
+    return weread_progress_load(path + 9, &wp) == ESP_OK &&
+           weread_progress_state(&wp) == WR_PROGRESS_PENDING;
+}
+
 static void scan_books(void) {
     // 首次未入架时不采用卡上旧历史或目录回退；原记录留待明确导入后使用。
     // Before initial enrollment, ignore card history and directory fallbacks without deleting them.
@@ -286,6 +294,7 @@ static void scan_books(void) {
     for (int i=0;i<7;++i) {
         home_book_t *b=book_at(i);
         if (!b->path[0]) continue;
+        b->weread_pending = dashboard_weread_pending(b->path);
         title_for(b);
         char metadata_title[128],metadata_author[128];
         if (book_epub_metadata_cached(b->path,metadata_title,sizeof(metadata_title),metadata_author,sizeof(metadata_author))==ESP_OK) {
@@ -722,7 +731,7 @@ static void render_root(uint8_t *fb) {
         draw_cover(fb,b,(EpdRect){60,continue_card_pressed()?274:278,176,240});
         int rows=title_lines(fb,b->title,card_gray);
         if(b->author[0]) {char author[128];snprintf(author,sizeof(author),"%s",b->author);fit(author,25,358);label_on(fb,264,rows==2?406:367,25,author,EPD_DRAW_ALIGN_LEFT,0x50,card_gray);}
-        snprintf(value,sizeof(value),"已读 %u%%",b->has_progress?b->progress.pct:0);
+        snprintf(value,sizeof(value),b->weread_pending?"已读 %u%% · 待同步":"已读 %u%%",b->has_progress?b->progress.pct:0);
         label_on(fb,264,482,27,value,EPD_DRAW_ALIGN_LEFT,0x20,card_gray);
         label_on(fb,622,482,24,"继续阅读 ›",EPD_DRAW_ALIGN_RIGHT,0,card_gray);
         EpdRect track={264,511,358,7};ui_fill_round_rect(fb,track,3,0xcc);
@@ -942,7 +951,13 @@ static unsigned s_shelf_warm_next;static int64_t s_shelf_warm_after;
 #endif
 static void on_enter(app_ctx_t *ctx) {
     weread_runtime_load_local();
-    for (int i=0;i<7;++i) if (book_path_is_weread(book_at(i)->path)) {s_books_cache_valid=false;break;}
+    for (int i=0;i<7;++i) {
+        home_book_t *b=book_at(i);
+        if (book_path_is_weread(b->path)) {
+            s_books_cache_valid=false;
+            b->weread_pending=dashboard_weread_pending(b->path);
+        }
+    }
     const unsigned cover_revision = book_weread_cover_revision();
     if (cover_revision != s_weread_cover_revision) {
         s_weread_cover_revision = cover_revision;

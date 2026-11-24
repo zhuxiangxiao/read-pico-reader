@@ -125,7 +125,7 @@ echo "Compiling and running new-open version binding tests..."
     tools/weread_stubs/cJSON.c -lz -lm -o build/weread-tests/test_weread_open_version
 python3 - <<'PY'
 import subprocess,tempfile
-for mode in ('updated','selfheal','moved','corrupt','corrupt-fail','bad-offset','bad-index','protection'):
+for mode in ('updated','selfheal','open-toc-heal','double-2063','expired-offline','expired-relogin-drain','mid-open-2013','mid-open-401','moved','corrupt','corrupt-fail','bad-offset','bad-index','protection'):
     with tempfile.TemporaryDirectory(prefix='weread-open-version-') as cache:
         subprocess.run(['build/weread-tests/test_weread_open_version',cache,mode],check=True)
 PY
@@ -204,4 +204,5 @@ python3 tools/weread_io_cache_host_test.py
 python3 tools/weread_time_cancel_host_test.py
 python3 tools/weread_reader_lifecycle_host_test.py
 python3 tools/weread_decoupling_host_test.py
+python3 tools/weread_m4_ux_host_test.py
 echo "All WeRead host tests passed cleanly!"

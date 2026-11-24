@@ -190,6 +190,10 @@ int main(void){
     assert(book_toc_toggle(group_hit,&page));
     row=book_toc_row_rect(1);
     assert(book_toc_hit(row.x,row.y,page,4)==0);
+    grouped=false;large_titles=0;borders=0;cards=0;
+    book_toc_render(&fb,"目录",8,1,0,"");
+    book_toc_render_banner(&fb,"本章未缓存且网络不可用，连网后再翻页重试");
+    assert(large_titles==7&&cards==14&&borders==27);
     puts("book_toc: pages, taps, overflow, single-line titles, stable title font path and selected-row backgrounds passed");
     return 0;
 }

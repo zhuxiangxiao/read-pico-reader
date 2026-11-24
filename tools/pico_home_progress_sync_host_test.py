@@ -44,12 +44,13 @@ static void reader_current_chapter(char *out,size_t cap){snprintf(out,cap,"Chapt
 static void book_ticket_note_position(const char *path,const book_progress_t *p,const char *chapter,bool saved){(void)path;(void)chapter;assert(saved&&p->pct==stored.pct);}
 static bool pending_flush(pending_progress_t *p){stored=p->value;p->dirty=false;p->progress_saved=true;return true;}
 static void invalidate_prep(void){}
-typedef struct {char path[288];bool has_progress;book_progress_t progress;} home_book_t;
+typedef struct {char path[288];bool has_progress;bool weread_pending;book_progress_t progress;} home_book_t;
 static home_book_t s_current,s_recent[6];
 static home_book_t *book_at(int index){return index?&s_recent[index-1]:&s_current;}
 static int test_stat(const char *path,struct stat *out){assert(!strcmp(path,s_path));if(stat_error){errno=stat_error;return -1;}memset(out,0,sizeof(*out));out->st_mode=S_IFREG;out->st_size=1000;return 0;}
 #define stat(path,out) test_stat(path,out)
 static bool book_path_is_weread(const char *p){(void)p;return false;}
+static bool dashboard_weread_pending(const char *p){(void)p;return false;}
 static int book_target_stat(const char *p,struct stat *o){return test_stat(p,o);}
 static esp_err_t book_progress_load_checked(const char *path,uint32_t size,book_progress_t *out){assert(!strcmp(path,s_path)&&size==1000);++loads;if(load_error)return load_error;*out=stored;return ESP_OK;}
 static int64_t esp_timer_get_time(void){return 0;}

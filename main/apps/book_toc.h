@@ -44,3 +44,4 @@ EpdRect book_toc_row_rect(int row);
 void book_toc_render(uint8_t *fb, const char *book_title, size_t chapters,
                      size_t current, int page, const char *message);
 void book_toc_render_jump(uint8_t *fb, size_t chapters, int percent);
+void book_toc_render_banner(uint8_t *fb, const char *message);
