@@ -16,12 +16,74 @@ FILE *runtime_test_fopen(const char *path,const char *mode){
 }
 #endif
 static unsigned progress_posts;
-static unsigned progress_reads,note_jobs,report_jobs;
+static unsigned progress_reads,note_jobs,report_jobs,purchase_uid;
 static uint32_t cloud_uid=11,cloud_index=1,cloud_offset,cloud_percent;
+static atomic_bool note_sync_gate,note_sync_entered,note_sync_release;
+static bool clean_guards_shelf;
+static unsigned cache_heal_toc_limit;
+static uint32_t cache_heal_bump_uid1,cache_heal_bump_ver1,cache_heal_bump_uid2,cache_heal_bump_ver2;
+static uint32_t cache_heal_toc_bump_after,cache_heal_toc_bump_ver;
+static esp_err_t counted_download(const char *url,const char *headers,FILE *out,size_t limit,weread_cancel_fn cancel,void *cc,weread_download_info_t *info,void *ctx){
+    const char *p=strstr(url,"chapters=");assert(p);p+=9;if(!strncmp(p,"0,",2))p+=2;
+    unsigned uid=(unsigned)strtoul(p,NULL,10);
+    if(cache_heal_bump_uid1&&uid==cache_heal_bump_uid1&&server_version!=cache_heal_bump_ver1){
+        server_version=cache_heal_bump_ver1;
+        cache_heal_bump_uid1=0;
+    }else if(cache_heal_bump_uid2&&uid==cache_heal_bump_uid2&&server_version!=cache_heal_bump_ver2){
+        server_version=cache_heal_bump_ver2;
+        cache_heal_bump_uid2=0;
+    }
+    if(strstr(url,"bookId=finished_book")){
+        memset(info,0,sizeof(*info));
+        char path[1024];snprintf(path,sizeof(path),"%s/finished-11-v100.zip",fixtures);
+        FILE *f=fopen(path,"rb");assert(f);
+        info->status=200;strcpy(info->encrypt_key,"pDB9WzFl/4YFmRnIZe6L7tJOiLv+dZQ+ZqkP6U6I99g=");
+        char buf[97];size_t n;while((n=fread(buf,1,sizeof(buf),f))){assert(n<=limit-info->bytes&&fwrite(buf,1,n,out)==n);info->bytes+=n;}
+        fclose(f);return ESP_OK;
+    }
+    if(purchase_uid&&uid==purchase_uid){
+        memset(info,0,sizeof(*info));
+        const char *msg="{\"errcode\":-1,\"errmsg\":\"pay\"}";
+        info->status=402;info->bytes=strlen(msg);
+        assert(fwrite(msg,1,info->bytes,out)==info->bytes);
+        return ESP_OK;
+    }
+    return download(url,headers,out,limit,cancel,cc,info,ctx);
+}
 static esp_err_t counted_request(const char *url,const char *method,const char *headers,const char *body,char **out,size_t *len,int *status,void *ctx){
     if(strstr(url,"/shelf/syncbook")){
+        if(atomic_load(&note_sync_gate)){
+            atomic_store(&note_sync_entered,true);
+            while(!atomic_load(&note_sync_release))usleep(1000);
+        }
         ++progress_reads;char text[1024];
-        snprintf(text,sizeof(text),"{\"books\":[{\"bookId\":\"window_book\",\"bookVersion\":%u}],\"bookProgress\":[{\"bookId\":\"window_book\",\"chapterUid\":%u,\"chapterIdx\":%u,\"chapterOffset\":%u,\"progress\":%u}]}",server_version,cloud_uid,cloud_index,cloud_offset,cloud_percent);
+        if(clean_guards_shelf&&body&&strstr(body,"finished_book")){
+            snprintf(text,sizeof(text),"{\"books\":[{\"bookId\":\"window_book\",\"title\":\"Window\",\"format\":\"epub\",\"bookVersion\":%u},{\"bookId\":\"finished_book\",\"title\":\"Finished\",\"format\":\"epub\",\"bookVersion\":%u}],\"bookProgress\":[{\"bookId\":\"window_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100},{\"bookId\":\"finished_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100}]}",server_version,server_version);
+        }else{
+            snprintf(text,sizeof(text),"{\"books\":[{\"bookId\":\"window_book\",\"bookVersion\":%u}],\"bookProgress\":[{\"bookId\":\"window_book\",\"chapterUid\":%u,\"chapterIdx\":%u,\"chapterOffset\":%u,\"progress\":%u}]}",server_version,cloud_uid,cloud_index,cloud_offset,cloud_percent);
+        }
+        *out=strdup(text);assert(*out);*len=strlen(text);*status=200;return ESP_OK;
+    }
+    if(cache_heal_toc_limit&&strstr(url,"chapterInfos")&&(!body||!strstr(body,"finished_book"))){
+        ++toc_requests;
+        if(cache_heal_toc_bump_after&&toc_requests>=cache_heal_toc_bump_after){
+            server_version=cache_heal_toc_bump_ver;
+            cache_heal_toc_bump_after=0;
+        }
+        char text[2048];
+        size_t used=(size_t)snprintf(text,sizeof(text),"{\"data\":[{\"bookId\":\"window_book\",\"bookVersion\":%u,\"synckey\":1,\"clearAll\":1,\"updated\":[",server_version);
+        for(unsigned i=0;i<cache_heal_toc_limit;++i){
+            used+=(size_t)snprintf(text+used,sizeof(text)-used,"%s{\"chapterUid\":%u,\"chapterIdx\":%u,\"title\":\"UID%u-v%u\"}",i?",":"",uids[i],i+1,uids[i],server_version);
+        }
+        snprintf(text+used,sizeof(text)-used,"]}]}");
+        *out=strdup(text);assert(*out);*len=strlen(text);*status=200;return ESP_OK;
+    }
+    if(clean_guards_shelf&&strstr(url,"chapterInfos")&&body&&strstr(body,"finished_book")){
+        const char *text="{\"data\":[{\"bookId\":\"finished_book\",\"bookVersion\":100,\"synckey\":1,\"clearAll\":1,\"updated\":[{\"chapterUid\":11,\"chapterIdx\":1,\"title\":\"F11\"}]}]}";
+        *out=strdup(text);assert(*out);*len=strlen(text);*status=200;return ESP_OK;
+    }
+    if(clean_guards_shelf&&strstr(url,"/shelf/sync")){
+        const char *text="{\"synckey\":2,\"books\":[{\"bookId\":\"window_book\",\"title\":\"Window\",\"format\":\"epub\",\"bookVersion\":100},{\"bookId\":\"finished_book\",\"title\":\"Finished\",\"format\":\"epub\",\"bookVersion\":100}],\"bookProgress\":[{\"bookId\":\"window_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100},{\"bookId\":\"finished_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100}]}";
         *out=strdup(text);assert(*out);*len=strlen(text);*status=200;return ESP_OK;
     }
     if(strstr(url,"/book/read")){
@@ -57,6 +119,8 @@ static void adopt(size_t chapter,html_text_t *text,uint32_t *version){
 }
 static void test_throttle(const char *mode,html_text_t *first){
     if(!strcmp(mode,"throttle-time")){
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        weread_reader_cache_forward_set(false);
         local_navigation(0,4,2000,100);no_report();
         for(uint64_t now=3000;now<61000;now+=1000){
             reading_tick(0,4,now);assert(!weread_runtime_idle(now));no_report();
@@ -64,6 +128,63 @@ static void test_throttle(const char *mode,html_text_t *first){
         reading_tick(0,4,61000);reading_tick(0,4,61001);
         assert(note_jobs==1&&!report_jobs&&progress_posts==1&&progress_reads==1);
         reading_tick(0,4,62000);assert(note_jobs==1&&progress_posts==1);
+    }else if(!strcmp(mode,"throttle-pause-online")){
+        assert(weread_runtime_connect(NULL)==ESP_OK&&weread_runtime_network_active());
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        weread_reader_cache_forward_set(false);
+        local_navigation(0,4,2000,100);no_report();
+        reading_tick(0,4,9999);no_report();
+        reading_tick(0,4,10000);
+        assert(note_jobs==1&&!report_jobs&&progress_posts==1);
+        local_navigation(0,5,11000,100);
+        reading_tick(0,5,19000);
+        assert(note_jobs==1&&progress_posts==1);
+        reading_tick(0,5,25000);
+        assert(note_jobs==2&&!report_jobs&&progress_posts==2);
+    }else if(!strcmp(mode,"throttle-pause-offline")){
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        weread_reader_cache_forward_set(false);
+        local_navigation(0,4,2000,100);no_report();
+        for(uint64_t now=3000;now<60000;now+=1000){
+            reading_tick(0,4,now);no_report();
+        }
+        assert(!weread_runtime_network_active());
+    }else if(!strcmp(mode,"exit-note-online")){
+        assert(weread_runtime_connect(NULL)==ESP_OK);
+        local_navigation(0,4,2000,100);no_report();
+        weread_reader_end(2500);book_weread_close();
+        assert(observe_result()==WR_JOB_NOTE);
+        assert(note_jobs==1&&!report_jobs&&progress_posts==1);
+        weread_progress_t p;assert(weread_progress_load("window_book",&p)==ESP_OK&&!p.dirty&&p.chapter_offset==cloud_offset);
+        weread_runtime_stop();html_text_free(first);
+        printf("PASS actual runtime %s NOTE=%u POST=%u\n",mode,note_jobs,progress_posts);
+        return;
+    }else if(!strcmp(mode,"cloud-turn-rebase")){
+        assert(!weread_runtime_reader_has_turned("weread://window_book"));
+        local_navigation(0,4,2000,100);
+        assert(weread_runtime_reader_has_turned("weread://window_book"));
+        cloud_uid=27;cloud_index=2;cloud_offset=20;cloud_percent=40;
+        assert(weread_runtime_start(WR_JOB_CLOUD_SYNC,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==1);
+        assert(weread_runtime_cloud_jump_rebase("weread://window_book")==ESP_OK);
+        assert(!weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff));
+        weread_progress_t p;assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==11&&
+            p.base_known&&p.base_uid==27&&p.base_index==2&&p.base_offset==20&&p.dirty&&p.position_pending);
+        assert(weread_runtime_start(WR_JOB_NOTE,"window_book",NULL));
+        assert(observe_result()==WR_JOB_NOTE);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&!p.dirty&&p.chapter_uid==11&&cloud_uid==11);
+        cloud_uid=50;cloud_index=3;cloud_offset=10;cloud_percent=60;
+        assert(weread_runtime_start(WR_JOB_CLOUD_SYNC,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==2);
+        assert(weread_runtime_cloud_jump_rebase("weread://window_book")==ESP_OK);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==50&&!p.dirty);
+        weread_reader_end(3000);book_weread_close();weread_runtime_stop();html_text_free(first);
+        printf("PASS actual runtime %s\n",mode);
+        return;
     }else if(!strcmp(mode,"throttle-pages")||!strcmp(mode,"throttle-conflict")){
         for(unsigned page=1;page<=9;++page){
             local_navigation(0,page,1000+page*1000,100);assert(!weread_runtime_idle(1000+page*1000));no_report();
@@ -105,10 +226,334 @@ int main(int argc,char **argv){
     }
     init(argv[1]);
     weread_client_set_transport(counted_request,NULL);
+    weread_client_set_download_transport(counted_download,NULL);
     html_text_t text={0};assert(book_weread_load(0,NULL,NULL,&text)==ESP_OK&&text.len>8);
     size_t chapter=0;uint32_t actual_version=0;assert(book_weread_commit_loaded(&chapter,&actual_version)==ESP_OK&&chapter==0&&actual_version==100);
     uint32_t raw=0;assert(book_weread_map(0,true,4,&raw)==ESP_OK);
-    if(!strncmp(mode,"throttle-",9)){test_throttle(mode,&text);return 0;}
+    if(!strncmp(mode,"throttle-",9)||!strcmp(mode,"exit-note-online")||!strcmp(mode,"cloud-turn-rebase")){test_throttle(mode,&text);return 0;}
+    if(!strcmp(mode,"m2-regressions")){
+        // 1. weread_runtime_cloud_jump_rebase() save failure: no tick spin and s_cloud_jump.rebased == false
+        local_navigation(0,4,2000,100);
+        cloud_uid=27;cloud_index=2;cloud_offset=20;cloud_percent=40;
+        assert(weread_runtime_start(WR_JOB_CLOUD_SYNC,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==1);
+        weread_reader_navigated_version("weread://window_book",0,5,18,"unsaved",100);
+        assert(weread_reader_pending_save());
+        char blk[1024];snprintf(blk,sizeof(blk),"%s/cache/window_book/progress.json.tmp",argv[1]);
+        assert(!mkdir(blk,0700));
+        assert(weread_runtime_cloud_jump_rebase("weread://window_book")!=ESP_OK);
+        assert(!weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff));
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        weread_progress_t p;assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==11);
+        assert(!rmdir(blk));
+        assert(weread_reader_save(3000)==ESP_OK);
+        weread_reader_end(3000);book_weread_close();
+        (void)observe_result();
+        // 2. WR_JOB_CACHE_BOOK mid-job -2063 + 402 recounts actual v101 cached chapters
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",27));
+        server_version=101;
+        purchase_uid=103;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        weread_result_t cr={0};
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==WEREAD_ERR_PURCHASE&&
+               cr.shelf_done==3&&cr.shelf_total==8);
+        weread_runtime_result_free(&cr);
+        purchase_uid=0;
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",900)&&
+               weread_chapter_cached("window_book",50)&&!weread_chapter_cached("window_book",27));
+        weread_shelf_item_t *items=NULL;size_t cnt=0;
+        assert(weread_shelf_snapshot(&items,&cnt)==ESP_OK&&cnt==1&&
+               items[0].cached_chapters==3&&items[0].total_chapters==8);
+        free(items);
+        // 3. choose == true (WR_JOB_CLOUD) post-heal updates s_result.local.book_version
+        cloud_uid=11;cloud_index=1;cloud_offset=0;cloud_percent=0;
+        server_version=100;
+        assert(weread_shelf_refresh_book("window_book")==ESP_OK&&weread_toc_sync_version("window_book",100)==ESP_OK);
+        assert(weread_progress_note("window_book",11,1,0,10,0,1,"pre-open",1700000150)==ESP_OK);
+        assert(weread_chapter_download("window_book",11)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.error==ESP_OK&&cr.open_ready);
+        weread_runtime_result_free(&cr);
+        char mf[512];assert(wr_cache_path("window_book","chapter-11.json",mf,sizeof(mf))==ESP_OK&&!unlink(mf));
+        server_version=101;
+        assert(weread_runtime_start(WR_JOB_CLOUD,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CLOUD&&cr.error==ESP_OK&&cr.open_ready&&
+               cr.local.book_version==101&&!cr.local.sync_conflict);
+        weread_runtime_result_free(&cr);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.book_version==101);
+        weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime m2-regressions");
+        return 0;
+    }
+    if(!strcmp(mode,"shelf-cache-ops")){
+        weread_reader_end(1500);book_weread_close();
+        char gray[512],img[512],prog_p[512];
+        assert(weread_cover_cache_path("window_book","gray",gray,sizeof(gray))==ESP_OK);
+        assert(wr_write_bytes(gray,"GRAY",4)==ESP_OK);
+        assert(weread_cover_cache_path("window_book","img",img,sizeof(img))==ESP_OK);
+        assert(wr_write_bytes(img,"IMG",3)==ESP_OK);
+        const char *probe_ids[]={"window_book","missing_book"};
+        assert(weread_runtime_probe_shelf(probe_ids,2));
+        assert(observe_result()==WR_JOB_PROBE_SHELF);
+        weread_shelf_item_t *items=NULL;size_t cnt=0;
+        assert(weread_shelf_snapshot(&items,&cnt)==ESP_OK&&cnt==1&&items[0].cached_chapters==1&&items[0].total_chapters==8);
+        free(items);
+        // Preemption mid-cache_book retains partial counts
+        atomic_store(&gated,true);atomic_store(&entered,false);
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        uint64_t until=millis()+3000;while(!atomic_load(&entered)){assert(millis()<until);usleep(1000);}
+        weread_shelf_cache_status_t st={0};
+        assert(weread_runtime_shelf_cache_status(&st)&&st.active&&!strcmp(st.book_id,"window_book")&&st.total_chapters==8);
+        weread_runtime_cancel();
+        assert(observe_result()==WR_JOB_CACHE_BOOK);
+        assert(!weread_runtime_shelf_cache_status(&st));
+        atomic_store(&gated,false);
+        // 104 MiB storage guard stops WR_JOB_CACHE_BOOK cleanly with storage_blocked
+        space=10u*1024u*1024u;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        weread_result_t cr={0};assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==WEREAD_ERR_STORAGE);
+        weread_runtime_result_free(&cr);
+        assert(!weread_runtime_shelf_cache_status(&st)&&st.storage_blocked);
+        space=512u*1024u*1024u;
+        // Full WR_JOB_CACHE_BOOK downloads remaining chapters and updates shelf counts
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==ESP_OK&&cr.shelf_done==8&&cr.shelf_total==8);
+        weread_runtime_result_free(&cr);
+        assert(weread_shelf_snapshot(&items,&cnt)==ESP_OK&&cnt==1&&items[0].cached_chapters==8&&items[0].total_chapters==8);
+        free(items);
+        // WR_JOB_CACHE_STATS populates zero-IO stats
+        assert(weread_runtime_start(WR_JOB_CACHE_STATS,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_STATS);
+        weread_runtime_cache_stats_t cstats={0};
+        assert(weread_runtime_cache_stats(&cstats)&&cstats.valid&&cstats.books_with_chapters==1&&cstats.reclaimable_bytes>0);
+        // WR_JOB_CACHE_CLEAN_FINISHED skips <100% progress, cleans >=100% preserving cover-*.gray and progress.json
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_FINISHED);
+        assert(weread_chapter_cached("window_book",11));
+        assert(weread_progress_note("window_book",11,1,4,100,1,1,"done",1700000200)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_FINISHED&&cr.error==ESP_OK&&cr.shelf_done==1);
+        weread_runtime_result_free(&cr);
+        assert(!weread_chapter_cached("window_book",11)&&!access(gray,F_OK)&&access(img,F_OK)!=0);
+        assert(wr_cache_path("window_book","progress.json",prog_p,sizeof(prog_p))==ESP_OK&&!access(prog_p,F_OK));
+        assert(weread_shelf_snapshot(&items,&cnt)==ESP_OK&&cnt==1&&items[0].cached_chapters==0&&items[0].total_chapters==8);
+        free(items);
+        // Re-download one chapter, verify WR_JOB_CLEAR selective cleanup & WR_JOB_CACHE_CLEAN_ALL
+        assert(weread_chapter_download("window_book",11)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CLEAR,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLEAR);
+        assert(!weread_chapter_cached("window_book",11)&&!access(gray,F_OK)&&!access(prog_p,F_OK));
+        assert(weread_chapter_download("window_book",11)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        assert(!weread_chapter_cached("window_book",11)&&!access(gray,F_OK)&&!access(prog_p,F_OK));
+        weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime shelf-cache-ops");
+        return 0;
+    }
+    if(!strcmp(mode,"ux04-rebase-race")){
+        uint32_t raw4=0;assert(book_weread_map(0,true,4,&raw4)==ESP_OK);
+        local_navigation(0,4,2000,100);
+        cloud_uid=27;cloud_index=2;cloud_offset=20;cloud_percent=40;
+        assert(weread_runtime_start(WR_JOB_CLOUD_SYNC,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==1);
+        atomic_store(&note_sync_entered,false);
+        atomic_store(&note_sync_release,false);
+        atomic_store(&note_sync_gate,true);
+        assert(weread_runtime_start(WR_JOB_NOTE,"window_book",NULL));
+        uint64_t until=millis()+3000;
+        while(!atomic_load(&note_sync_entered)){assert(millis()<until);usleep(1000);}
+        assert(weread_runtime_cloud_jump_rebase("weread://window_book")==ESP_OK);
+        atomic_store(&note_sync_release,true);
+        assert(observe_result()==WR_JOB_NOTE);
+        atomic_store(&note_sync_gate,false);
+        weread_progress_t p;
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==11&&
+               p.chapter_offset==raw4&&p.dirty&&p.base_known&&p.base_uid==27&&progress_posts==0);
+        assert(weread_runtime_start(WR_JOB_NOTE,"window_book",NULL));
+        assert(observe_result()==WR_JOB_NOTE);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&!p.dirty&&p.chapter_uid==11&&cloud_uid==11&&progress_posts==1);
+        weread_reader_end(3000);book_weread_close();weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime ux04-rebase-race");
+        return 0;
+    }
+    if(!strcmp(mode,"ux04-auto-undo-note")){
+        assert(!weread_runtime_reader_has_turned("weread://window_book"));
+        cloud_uid=27;cloud_index=2;cloud_offset=20;cloud_percent=40;
+        assert(weread_runtime_start(WR_JOB_CLOUD_SYNC,"window_book",NULL));
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==1);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        weread_progress_t p;
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==27&&!p.dirty);
+        local_navigation(0,4,2500,100);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.chapter_uid==11&&p.base_known&&p.base_uid==27&&p.dirty&&p.position_pending);
+        assert(weread_runtime_start(WR_JOB_NOTE,"window_book",NULL));
+        assert(observe_result()==WR_JOB_NOTE);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&!p.dirty&&p.chapter_uid==11&&cloud_uid==11&&progress_posts==1);
+        weread_reader_end(3000);book_weread_close();weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime ux04-auto-undo-note");
+        return 0;
+    }
+    if(!strcmp(mode,"ux06-end-while-prefetch")){
+        assert(weread_runtime_connect(NULL)==ESP_OK);
+        local_navigation(0,4,2000,100);
+        weread_progress_t p;assert(weread_progress_load("window_book",&p)==ESP_OK&&p.dirty&&p.chapter_uid==11);
+        atomic_store(&gated,true);atomic_store(&entered,false);
+        weread_reader_tick("weread://window_book",0,4,17,"fixture",2400,true);
+        uint64_t until=millis()+3000;while(!atomic_load(&entered)){assert(millis()<until);usleep(1000);}
+        uint64_t t0=millis();
+        weread_reader_end(2500);
+        assert(millis()-t0<500);
+        assert(observe_result()==WR_JOB_PREFETCH);
+        atomic_store(&gated,false);
+        assert(!note_jobs&&!progress_posts);
+        assert(weread_progress_load("window_book",&p)==ESP_OK&&p.dirty&&p.chapter_uid==11);
+        book_weread_close();weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime ux06-end-while-prefetch");
+        return 0;
+    }
+    if(!strcmp(mode,"ux09-clean-guards")){
+        clean_guards_shelf=true;
+        assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("finished_book")==ESP_OK);
+        assert(weread_chapter_download("finished_book",11)==ESP_OK);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("finished_book",11));
+        assert(weread_progress_note("window_book",11,1,4,5,1,1,"reread",1700000200)==ESP_OK);
+        assert(weread_progress_note("finished_book",11,1,4,100,1,1,"done",1700000200)==ESP_OK);
+        assert(book_weread_id_in_use("window_book")&&!book_weread_id_in_use("finished_book"));
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        weread_result_t cr={0};
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_FINISHED&&cr.error==ESP_OK&&cr.shelf_done==1);
+        weread_runtime_result_free(&cr);
+        assert(weread_chapter_cached("window_book",11)&&!weread_chapter_cached("finished_book",11));
+        assert(weread_progress_note("window_book",11,1,4,100,1,1,"open-done",1700000300)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_FINISHED&&cr.error==ESP_OK&&cr.shelf_done==0);
+        weread_runtime_result_free(&cr);
+        assert(weread_chapter_cached("window_book",11));
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_ALL&&cr.error==ESP_OK&&cr.shelf_done==0);
+        weread_runtime_result_free(&cr);
+        assert(weread_chapter_cached("window_book",11));
+        weread_reader_end(3000);book_weread_close();
+        assert(weread_progress_note("window_book",11,1,4,5,1,1,"reread-closed",1700000400)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_FINISHED&&cr.error==ESP_OK&&cr.shelf_done==0);
+        weread_runtime_result_free(&cr);
+        assert(weread_chapter_cached("window_book",11));
+        assert(weread_progress_note("window_book",11,1,4,100,1,1,"done-closed",1700000500)==ESP_OK);
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_FINISHED,NULL,NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_CLEAN_FINISHED&&cr.error==ESP_OK&&cr.shelf_done==1);
+        weread_runtime_result_free(&cr);
+        assert(!weread_chapter_cached("window_book",11));
+        weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime ux09-clean-guards");
+        return 0;
+    }
+    if(!strcmp(mode,"cache-book-2063-heal")){
+        weread_reader_end(1500);book_weread_close();
+        weread_result_t cr={0};
+        weread_shelf_item_t *items=NULL;size_t cnt=0;
+        char toc_p[512];
+
+        // 1. Mid-job -2063 -> ESP_OK heal: ch11 & ch27 cached at v100, ch50 bumps server to v101 ->
+        //    cache_book_job restarts, reloads v101 TOC, and caches all 3 v101 chapters (3/3).
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        cache_heal_toc_limit=3;
+        server_version=100;
+        assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("window_book")==ESP_OK);
+        assert(weread_chapter_download("window_book",11)==ESP_OK&&weread_chapter_download("window_book",27)==ESP_OK);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",27));
+        cache_heal_bump_uid1=50;cache_heal_bump_ver1=101;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==ESP_OK&&cr.shelf_done==3&&cr.shelf_total==3);
+        weread_runtime_result_free(&cr);
+        assert(weread_shelf_book_version("window_book")==101);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",27)&&weread_chapter_cached("window_book",50));
+        assert(weread_shelf_snapshot(&items,&cnt)==ESP_OK&&cnt==1&&items[0].cached_chapters==3&&items[0].total_chapters==3);
+        free(items);
+
+        // 2. Mid-job -2063 -> ESP_OK heal with newly added TOC chapter in v101 (v100 had {11,27}, v101 adds 50)
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        cache_heal_toc_limit=2;
+        server_version=100;
+        assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("window_book")==ESP_OK);
+        assert(weread_chapter_download("window_book",11)==ESP_OK);
+        cache_heal_toc_limit=3;
+        cache_heal_bump_uid1=27;cache_heal_bump_ver1=101;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==ESP_OK&&cr.shelf_done==3&&cr.shelf_total==3);
+        weread_runtime_result_free(&cr);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",27)&&weread_chapter_cached("window_book",50));
+
+        // 3. Pre-loop missing-TOC v100 -> v101 WEREAD_ERR_VERSION single auto-heal to completion
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        cache_heal_toc_limit=3;
+        server_version=100;
+        assert(weread_shelf_sync(true)==ESP_OK);
+        assert(wr_cache_path("window_book","chapters.json",toc_p,sizeof(toc_p))==ESP_OK);
+        (void)unlink(toc_p);
+        server_version=101;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==ESP_OK&&cr.shelf_done==3&&cr.shelf_total==3);
+        weread_runtime_result_free(&cr);
+        assert(weread_shelf_book_version("window_book")==101);
+        assert(weread_chapter_cached("window_book",11)&&weread_chapter_cached("window_book",27)&&weread_chapter_cached("window_book",50));
+
+        // 4a. Bounded abort if pre-loop version keeps changing twice during heal_open_version
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        server_version=100;
+        assert(weread_shelf_sync(true)==ESP_OK);
+        (void)unlink(toc_p);
+        server_version=101;
+        toc_requests=0;cache_heal_toc_bump_after=2;cache_heal_toc_bump_ver=102;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==WEREAD_ERR_VERSION);
+        weread_runtime_result_free(&cr);
+
+        // 4b. Bounded abort if mid-job version bumps a second time after healed == true (v100 -> v101 -> v102)
+        assert(weread_runtime_start(WR_JOB_CACHE_CLEAN_ALL,NULL,NULL));
+        assert(observe_result()==WR_JOB_CACHE_CLEAN_ALL);
+        server_version=100;
+        assert(weread_shelf_sync(true)==ESP_OK&&weread_toc_sync("window_book")==ESP_OK);
+        assert(weread_chapter_download("window_book",11)==ESP_OK&&weread_chapter_download("window_book",27)==ESP_OK);
+        cache_heal_bump_uid1=50;cache_heal_bump_ver1=101;
+        cache_heal_bump_uid2=11;cache_heal_bump_ver2=102;
+        assert(weread_runtime_start(WR_JOB_CACHE_BOOK,"window_book",NULL));
+        while(weread_runtime_busy())usleep(1000);
+        assert(weread_runtime_poll(&cr)&&cr.job==WR_JOB_CACHE_BOOK&&cr.error==WEREAD_ERR_VERSION&&cr.shelf_done==1&&cr.shelf_total==3);
+        weread_runtime_result_free(&cr);
+        assert(weread_shelf_book_version("window_book")==102);
+
+        weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime cache-book-2063-heal");
+        return 0;
+    }
     weread_reader_navigated("weread://window_book",0,4,17,text.utf8+4);
     char block[1024];snprintf(block,sizeof(block),"%s/cache/window_book/progress.json.tmp",argv[1]);
     assert(!mkdir(block,0700));

@@ -22,14 +22,38 @@
 #include <unistd.h>
 
 static unsigned version = 100, downloads;
-static unsigned toc_requests;
+static unsigned toc_requests, http_requests, refresh_requests;
 static unsigned reports, reported_offset, reported_percent, reported_seconds;
 static bool selfheal, moved, corrupt, corrupt_fail, fail_download, bad_offset, bad_index;
+static bool open_toc_heal, double_2063, expired_offline, expired_relogin_drain, mid_open_2013, mid_open_401, mid_open_inject;
+static unsigned syncbook_requests, weblogin_requests, getprogress_requests;
 static esp_err_t request(const char *url, const char *method, const char *headers, const char *body,
     char **out, size_t *len, int *status, void *ctx) {
     (void)method; (void)headers; (void)body; (void)ctx;
+    ++http_requests;
     char text[1024]; *status = 200;
-    if (strstr(url, "/shelf/syncbook") && selfheal && downloads) version = 101;
+    if (expired_relogin_drain && strstr(url, "/weblogin")) {
+        ++weblogin_requests;
+        strcpy(text, "{\"vid\":\"123\",\"accessToken\":\"relogin-token\",\"refreshToken\":\"relogin-refresh\"}");
+        *out = strdup(text); assert(*out); *len = strlen(text); return ESP_OK;
+    }
+    if (mid_open_inject && strstr(url, "/weblogin")) {
+        ++weblogin_requests;
+        *status = 401;
+        strcpy(text, "{\"errcode\":-2013,\"errmsg\":\"revoked\"}");
+        *out = strdup(text); assert(*out); *len = strlen(text); return ESP_OK;
+    }
+    if (strstr(url, "/shelf/syncbook")) {
+        ++refresh_requests;
+        if (mid_open_inject) {
+            ++syncbook_requests;
+            *status = mid_open_401 ? 401 : 200;
+            strcpy(text, "{\"errcode\":-2013,\"errmsg\":\"expired\"}");
+            *out = strdup(text); assert(*out); *len = strlen(text); return ESP_OK;
+        }
+        if (selfheal && downloads) version = 101;
+        if (open_toc_heal && refresh_requests >= 2) version = 101;
+    }
     if(strstr(url,"/book/read")){
         cJSON *o=cJSON_Parse(body);assert(o);++reports;
         reported_offset=(unsigned)cJSON_GetObjectItem(o,"chapterOffset")->valuedouble;
@@ -38,11 +62,29 @@ static esp_err_t request(const char *url, const char *method, const char *header
         cJSON_Delete(o);strcpy(text,"{\"succ\":1}");
     }else if (strstr(url, "/book/chapterInfos")){
         ++toc_requests;
-        snprintf(text, sizeof(text), "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":%u,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"first\"},{\"chapterUid\":2,\"chapterIdx\":%u,\"title\":\"second\"}]}]}", version,moved&&version==101?67u:2u);
+        if ((mid_open_2013 || mid_open_401) && body && strstr(body, "uncached_book_102")) {
+            snprintf(text, sizeof(text), "{\"data\":[{\"bookId\":\"uncached_book_102\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":100,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"uncached-first\"}]}]}");
+        } else if (expired_offline || expired_relogin_drain || mid_open_2013 || mid_open_401) {
+            snprintf(text, sizeof(text), "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":%u,\"updated\":[{\"chapterUid\":2,\"chapterIdx\":1,\"title\":\"first\"},{\"chapterUid\":1,\"chapterIdx\":2,\"title\":\"second\"}]}]}", version);
+        } else {
+            snprintf(text, sizeof(text), "{\"data\":[{\"bookId\":\"test_book_101\",\"synckey\":1,\"clearAll\":1,\"bookVersion\":%u,\"updated\":[{\"chapterUid\":1,\"chapterIdx\":1,\"title\":\"first\"},{\"chapterUid\":2,\"chapterIdx\":%u,\"title\":\"second\"}]}]}", version,moved&&version==101?67u:2u);
+        }
     }
-    else if (strstr(url, "/book/getProgress"))
-        snprintf(text,sizeof(text),"{\"bookId\":\"test_book_101\",\"book\":{\"chapterUid\":2,\"chapterIdx\":%u,\"chapterOffset\":%u,\"progress\":86}}",bad_index?67u:2u,bad_offset?UINT32_MAX:20u);
-    else snprintf(text, sizeof(text), "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"fixture\",\"format\":\"epub\",\"bookVersion\":%u}]}", version);
+    else if (strstr(url, "/book/getProgress")) {
+        if (mid_open_inject) ++getprogress_requests;
+        if (expired_relogin_drain) {
+            snprintf(text,sizeof(text),"{\"bookId\":\"test_book_101\",\"book\":{\"chapterUid\":2,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":0,\"bookVersion\":%u}}",version);
+        } else {
+            snprintf(text,sizeof(text),"{\"bookId\":\"test_book_101\",\"book\":{\"chapterUid\":2,\"chapterIdx\":%u,\"chapterOffset\":%u,\"progress\":86,\"bookVersion\":%u}}",bad_index?67u:2u,bad_offset?UINT32_MAX:20u,open_toc_heal&&refresh_requests<2?100u:version);
+        }
+    }
+    else if (expired_relogin_drain && strstr(url, "/shelf/syncbook")) {
+        snprintf(text, sizeof(text), "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"fixture\",\"format\":\"epub\",\"bookVersion\":%u}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":2,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":0}]}", version);
+    }
+    else if (mid_open_2013 || mid_open_401) {
+        snprintf(text, sizeof(text), "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"fixture\",\"format\":\"epub\",\"bookVersion\":100},{\"bookId\":\"uncached_book_102\",\"title\":\"uncached\",\"format\":\"epub\",\"bookVersion\":100}]}");
+    }
+    else snprintf(text, sizeof(text), "{\"synckey\":1,\"books\":[{\"bookId\":\"test_book_101\",\"title\":\"fixture\",\"format\":\"epub\",\"bookVersion\":%u}]}", (open_toc_heal&&refresh_requests==1)?101u:version);
     *out = strdup(text); assert(*out); *len = strlen(text); return ESP_OK;
 }
 static esp_err_t download(const char *url, const char *headers, FILE *out, size_t limit,
@@ -51,7 +93,7 @@ static esp_err_t download(const char *url, const char *headers, FILE *out, size_
     memset(info, 0, sizeof(*info)); info->status = 200;
     unsigned attempt=downloads++;
     if(fail_download)return ESP_ERR_TIMEOUT;
-    if (!attempt && selfheal) {
+    if (double_2063 || (!attempt && selfheal)) {
         const char *json = "{\"errcode\":-2063}"; info->bytes = strlen(json);
         assert(fwrite(json, 1, info->bytes, out) == info->bytes); return ESP_OK;
     }
@@ -83,6 +125,9 @@ static void complete_map(uint32_t uid) {
 int main(int argc, char **argv) {
     assert(argc == 3); selfheal = !strcmp(argv[2], "selfheal");moved=!strcmp(argv[2],"moved");
     corrupt_fail=!strcmp(argv[2],"corrupt-fail");corrupt=!strcmp(argv[2],"corrupt")||corrupt_fail;bad_offset=!strcmp(argv[2],"bad-offset");bad_index=!strcmp(argv[2],"bad-index");
+    open_toc_heal=!strcmp(argv[2],"open-toc-heal");double_2063=!strcmp(argv[2],"double-2063");expired_offline=!strcmp(argv[2],"expired-offline");
+    expired_relogin_drain=!strcmp(argv[2],"expired-relogin-drain");
+    mid_open_2013=!strcmp(argv[2],"mid-open-2013");mid_open_401=!strcmp(argv[2],"mid-open-401");
     assert(!setenv("WEREAD_STORAGE_ROOT", argv[1], 1));
     assert(weread_auth_init(argv[1]) == ESP_OK);
     weread_auth_session_t session = {0};
@@ -90,7 +135,155 @@ int main(int argc, char **argv) {
     assert(weread_auth_save_session(&session) == ESP_OK && weread_auth_load_session(&session) == ESP_OK);
     weread_client_set_transport(request, NULL); weread_client_set_download_transport(download, NULL);
     assert(weread_shelf_sync(true) == ESP_OK && weread_toc_sync("test_book_101") == ESP_OK);
-    bool invalid_choice=corrupt||bad_offset||bad_index;
+    if (mid_open_2013 || mid_open_401) {
+        assert(weread_toc_sync("uncached_book_102") == ESP_OK);
+        assert(weread_chapter_download("test_book_101", 2) == ESP_OK);
+        syncbook_requests = weblogin_requests = getprogress_requests = downloads = 0;
+        mid_open_inject = true;
+        weread_runtime_init();
+        weread_result_t r = {0};
+        time_t st = time(NULL);
+        assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
+        while (weread_runtime_busy()) { assert(time(NULL) - st < 10); usleep(1000); }
+        assert(weread_runtime_poll(&r) && r.error == ESP_OK && r.open_ready && !r.authenticated && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(syncbook_requests == 1 && weblogin_requests == 1 && getprogress_requests == 0 && downloads == 0);
+        const char *uri = "weread://test_book_101";
+        assert(book_weread_open(uri) == ESP_OK);
+        size_t ch = 99; uint32_t off = 99;
+        assert(weread_reader_resume(uri, &ch, &off) == ESP_OK && ch == 0);
+        book_weread_close();
+        assert(weread_auth_save_session(&session) == ESP_OK && weread_auth_load_session(&session) == ESP_OK);
+        syncbook_requests = weblogin_requests = getprogress_requests = downloads = 0;
+        st = time(NULL);
+        assert(weread_runtime_start(WR_JOB_OPEN, "uncached_book_102", NULL));
+        while (weread_runtime_busy()) { assert(time(NULL) - st < 10); usleep(1000); }
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && !r.open_ready && !r.authenticated && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(syncbook_requests == 1 && weblogin_requests == 1 && getprogress_requests == 0 && downloads == 0);
+        weread_runtime_stop(); weread_shelf_clear();
+        printf("Mid-open %s fallback passed.\n", argv[2]);
+        return 0;
+    }
+    if (expired_relogin_drain) {
+        assert(weread_chapter_download("test_book_101", 2) == ESP_OK);
+        assert(weread_auth_mark_expired() == ESP_OK);
+        http_requests = 0; downloads = 0; reports = 0; weblogin_requests = 0;
+        weread_runtime_init();
+        weread_result_t r = {0};
+        time_t st = time(NULL);
+        assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
+        while (weread_runtime_busy()) { assert(time(NULL) - st < 10); usleep(1000); }
+        assert(weread_runtime_poll(&r) && r.error == ESP_OK && r.open_ready && !r.authenticated && r.auth_expired);
+        weread_runtime_result_free(&r);
+        const char *uri = "weread://test_book_101";
+        assert(book_weread_open(uri) == ESP_OK);
+        size_t ch = 99; uint32_t off = 99;
+        assert(weread_reader_resume(uri, &ch, &off) == ESP_OK && ch == 0);
+        html_text_t text = {0}; uint32_t ver = 0;
+        assert(book_weread_load(0, NULL, NULL, &text) == ESP_OK);
+        assert(book_weread_commit_loaded(&ch, &ver) == ESP_OK);
+        weread_reader_begin(uri, 1000);
+        weread_reader_navigated_version(uri, 0, 4, 20, "offline-relogin", ver);
+        assert(weread_reader_save(2000) == ESP_OK);
+        weread_reader_end(2500);
+        html_text_free(&text);
+        book_weread_close();
+        assert(reports == 0 && http_requests == 0);
+        weread_progress_t saved;
+        assert(weread_progress_load("test_book_101", &saved) == ESP_OK && saved.dirty && saved.position_pending && saved.progress == 20);
+        weread_auth_session_t relogin = {0};
+        assert(weread_auth_exchange_code("RELOGIN_CODE", &relogin) == ESP_OK);
+        assert(weread_auth_is_authenticated() && !weread_auth_is_expired() && weblogin_requests == 1);
+        assert(weread_runtime_idle(3000));
+        st = time(NULL);
+        while (weread_runtime_busy()) { assert(time(NULL) - st < 10); usleep(1000); }
+        assert(weread_runtime_poll(&r) && r.job == WR_JOB_REPORT && r.error == ESP_OK);
+        weread_runtime_result_free(&r);
+        assert(reports == 1 && reported_percent == 20);
+        assert(weread_progress_load("test_book_101", &saved) == ESP_OK && !saved.dirty && !saved.position_pending);
+        weread_runtime_stop(); weread_shelf_clear();
+        puts("Expired offline-write -> exchange_code re-login -> outbox drain passed.");
+        return 0;
+    }
+    if (expired_offline) {
+        assert(weread_chapter_download("test_book_101", 2) == ESP_OK);
+        assert(weread_auth_mark_expired() == ESP_OK);
+        http_requests = 0; downloads = 0;
+        weread_runtime_init();
+        weread_result_t r = {0};
+        time_t st = time(NULL);
+        assert(weread_runtime_start(WR_JOB_INIT, NULL, NULL));
+        while (weread_runtime_busy()) { assert(time(NULL) - st < 10); usleep(1000); }
+        assert(weread_runtime_poll(&r) && !r.authenticated && r.auth_expired && r.count == 1 && r.books != NULL);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_SYNC, NULL, NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && r.auth_expired && r.count == 1);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_SYNC, NULL, "continue"));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && r.auth_expired && r.count == 1);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_REPORT, NULL, NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_NOTE, "test_book_101", NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_CHAPTER, "test_book_101", "1"));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(weread_runtime_start(WR_JOB_COVER, "test_book_101", "remote"));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error != ESP_OK && r.auth_expired);
+        weread_runtime_result_free(&r);
+        // Unread cached book opens offline without progress.json
+        assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_OK && r.open_ready && !r.authenticated && r.auth_expired);
+        weread_runtime_result_free(&r);
+        const char *uri = "weread://test_book_101";
+        assert(book_weread_open(uri) == ESP_OK);
+        size_t ch = 99; uint32_t off = 99;
+        assert(weread_reader_resume(uri, &ch, &off) == ESP_OK && ch == 0);
+        html_text_t text = {0}; uint32_t ver = 0;
+        assert(book_weread_load(0, NULL, NULL, &text) == ESP_OK);
+        assert(book_weread_commit_loaded(&ch, &ver) == ESP_OK);
+        weread_reader_begin(uri, 1000);
+        weread_reader_navigated_version(uri, 0, 4, 20, "offline", ver);
+        assert(weread_reader_save(2000) == ESP_OK);
+        weread_reader_tick(uri, 0, 4, 20, "offline", 12000, true);
+        assert(!weread_runtime_busy());
+        assert(!weread_runtime_idle(13000));
+        weread_reader_end(13000);
+        html_text_free(&text);
+        book_weread_close();
+        // Read cached book (local-fast) also opens offline
+        assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_OK && r.open_ready && r.auth_expired);
+        weread_runtime_result_free(&r);
+        // Uncached chapter fails with ESP_ERR_INVALID_STATE and zero HTTP calls
+        assert(weread_progress_note("test_book_101", 1, 2, 0, 50, 0, 1, "uncached", 1700000200) == ESP_OK);
+        assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_ERR_INVALID_STATE && !r.open_ready && r.auth_expired);
+        weread_runtime_result_free(&r);
+        assert(http_requests == 0 && downloads == 0);
+        // Explicit logout wipes auth_expired & shelf
+        assert(weread_runtime_start(WR_JOB_LOGOUT, NULL, NULL));
+        while (weread_runtime_busy()) usleep(1000);
+        assert(weread_runtime_poll(&r) && r.error == ESP_OK && !r.authenticated && !r.auth_expired && !r.count);
+        weread_runtime_result_free(&r);
+        weread_runtime_stop(); weread_shelf_clear();
+        puts("Expired offline read-only open, local save, zero-HTTP gating and logout passed.");
+        return 0;
+    }
+    bool invalid_choice=corrupt||bad_offset||bad_index||double_2063;
     assert(weread_progress_note("test_book_101", invalid_choice?1:2,invalid_choice?1:2,invalid_choice?0:20,invalid_choice?0:86,invalid_choice?7:0,1,"fixture",1700000100)==ESP_OK);
     if(corrupt){
         assert(weread_chapter_download("test_book_101",2)==ESP_OK);
@@ -98,11 +291,18 @@ int main(int argc, char **argv) {
         strcat(path,"/position.map");assert(!truncate(path,sizeof(weread_position_header_t)));
         assert(downloads==1&&!weread_chapter_cached("test_book_101",2));fail_download=corrupt_fail;
     }
-    if (!selfheal&&!invalid_choice) { version = 101; assert(weread_shelf_refresh_book("test_book_101") == ESP_OK); }
+    if (!selfheal&&!invalid_choice&&!open_toc_heal) { version = 101; assert(weread_shelf_refresh_book("test_book_101") == ESP_OK); }
     weread_runtime_init(); assert(weread_runtime_start(WR_JOB_OPEN, "test_book_101", NULL));
     time_t started = time(NULL);
     while (weread_runtime_busy()) { assert(time(NULL) - started < 10); usleep(1000); }
     weread_result_t result; assert(weread_runtime_poll(&result));
+    if (double_2063) {
+        assert(result.error == WEREAD_ERR_VERSION && !result.open_ready && downloads == 2);
+        weread_progress_t saved; assert(weread_progress_load("test_book_101", &saved) == ESP_OK && saved.chapter_uid == 1 && saved.dirty && saved.reading_time == 7);
+        weread_runtime_result_free(&result); weread_runtime_stop(); weread_shelf_clear();
+        puts("Double -2063 stopped after 1 heal and preserved dirty local progress.");
+        return 0;
+    }
     if(invalid_choice){
         assert(!result.conflict);
         weread_progress_t choice=result.cloud;

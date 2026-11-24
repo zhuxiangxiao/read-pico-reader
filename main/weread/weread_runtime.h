@@ -12,12 +12,14 @@
 typedef enum {
     WR_JOB_INIT, WR_JOB_SYNC, WR_JOB_QR, WR_JOB_POLL, WR_JOB_OPEN,
     WR_JOB_LOCAL, WR_JOB_CLOUD, WR_JOB_COVER, WR_JOB_CLEAR, WR_JOB_LOGOUT,
-    WR_JOB_NOTE, WR_JOB_CHAPTER, WR_JOB_PREFETCH, WR_JOB_CONNECT, WR_JOB_STOP,WR_JOB_TOC,WR_JOB_REPORT,WR_JOB_DISCONNECT,WR_JOB_CLOUD_SYNC
+    WR_JOB_NOTE, WR_JOB_CHAPTER, WR_JOB_PREFETCH, WR_JOB_CONNECT, WR_JOB_STOP,WR_JOB_TOC,WR_JOB_REPORT,WR_JOB_DISCONNECT,WR_JOB_CLOUD_SYNC,
+    WR_JOB_PROBE_SHELF, WR_JOB_CACHE_BOOK, WR_JOB_CACHE_STATS,
+    WR_JOB_CACHE_CLEAN_FINISHED, WR_JOB_CACHE_CLEAN_ALL
 } weread_job_t;
 typedef struct {
     weread_job_t job;
     esp_err_t error;
-    bool authenticated, conflict, open_ready, noted;
+    bool authenticated, auth_expired, conflict, open_ready, noted;
     int qr_state, http_status;
     uint32_t chapter_uid;
     size_t chapter_idx;
@@ -55,6 +57,32 @@ unsigned weread_runtime_cache_epoch(void);
 void weread_runtime_load_local(void);
 esp_err_t weread_runtime_connect(void *ctx);
 
+typedef struct {
+    bool active;
+    bool storage_blocked;
+    char book_id[64];
+    uint16_t cached_chapters;
+    uint16_t total_chapters;
+} weread_shelf_cache_status_t;
+
+typedef struct {
+    bool valid;
+    uint64_t total_bytes;
+    uint64_t reclaimable_bytes;
+    uint64_t free_bytes;
+    uint64_t fs_total_bytes;
+    uint32_t book_dir_count;
+    uint32_t books_with_chapters;
+} weread_runtime_cache_stats_t;
+
+/// 探测可见书架条目的本地缓存章节数（最多 9 本，零联网）。
+/// Probe locally cached chapter counts for visible shelf books (up to 9, zero network).
+bool weread_runtime_probe_shelf(const char *const *book_ids, size_t count);
+/// 零 IO 读取当前整本缓存进度快照。/ Zero-IO snapshot of active shelf whole-book caching.
+bool weread_runtime_shelf_cache_status(weread_shelf_cache_status_t *out);
+/// 零 IO 读取最近一次缓存空间统计快照。/ Zero-IO snapshot of the latest cache storage statistics.
+bool weread_runtime_cache_stats(weread_runtime_cache_stats_t *out);
+
 /// 阅读器加载回调前由worker准备章节，前台只解析完整缓存。/ Let the worker prepare a chapter before foreground parsing.
 esp_err_t weread_reader_prepare(const char *uri, size_t chapter);
 /// 本地缓存快速判定，无网络工作；仅当后台正在下载同一章节或清理整书时返回false。/ Check local readiness without blocking on unrelated background jobs.
@@ -65,6 +93,12 @@ void weread_runtime_prefetch_adopt(uint32_t uid);
 /// 提取后台云端同步确认的超前跳转目标，已读超过或非当前书籍则返回false。/ Consume a pending forward cloud-sync jump if still ahead of the active reader.
 bool weread_reader_poll_cloud_jump(const char *uri,size_t *chapter_out,uint32_t *offset_out);
 void weread_reader_commit_cloud_jump(const char *uri,bool committed);
+/// 查询当前打开会话期间用户是否已主动翻页或跳转（不随 save() 清零）。
+/// Return true if the user has turned/navigated since opening (persists across save()).
+bool weread_runtime_reader_has_turned(const char *book_id);
+/// 用户已翻页时仅将云端待跳进度对齐到本地基线并清除待跳标志，不强行跳页。
+/// Rebase local progress baseline onto a pending cloud jump without moving the reader.
+esp_err_t weread_runtime_cloud_jump_rebase(const char *book_id);
 /// 本地持久化先行；失败不消耗内存中的待保存导航。/ Persist locally without losing a failed navigation sample.
 esp_err_t weread_reader_save(uint64_t now_ms);
 weread_progress_state_t weread_reader_state(void);
