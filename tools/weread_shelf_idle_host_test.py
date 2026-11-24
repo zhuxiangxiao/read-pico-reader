@@ -136,6 +136,38 @@ int main(void){
     complete((weread_result_t){.job=WR_JOB_INIT,.error=ESP_ERR_INVALID_STATE,.authenticated=false});mock_authenticated=true;
     before=nstarts;tick(&ctx);assert(nstarts==before&&s_sync_after_init&&strstr(s_message,"TF 卡"));
     puts("PASS: wake revocation enters QR, stale wake auth does not clear a new session, failed INIT cannot loop or flash QR");
+
+    /* M3 WR-UX-07c: visible-row probe runs once per page without looping and re-arms on page change/clear */
+    reset();mock_probe_enabled=true;initialized(12);ready_page();s_preconnected=true;
+    for(int i=0;i<2;++i){
+        ctx.now_ms+=1100;assert(tick(&ctx)==APP_REDRAW_NONE);
+        assert(starts[nstarts-1].job==WR_JOB_COVER&&!strcmp(starts[nstarts-1].value,"warm-disk"));
+        weread_result_t wr={.job=WR_JOB_COVER,.authenticated=true,.cover=malloc(1)};assert(wr.cover);
+        snprintf(wr.id,sizeof(wr.id),"id_%d",9+i);complete(wr);assert(tick(&ctx)==APP_REDRAW_NONE);
+    }
+    before=nstarts;
+    assert(tick(&ctx)==APP_REDRAW_NONE&&nstarts==before+1&&starts[nstarts-1].job==WR_JOB_PROBE_SHELF);
+    complete((weread_result_t){.job=WR_JOB_PROBE_SHELF,.authenticated=true});
+    assert(tick(&ctx)==APP_REDRAW_NONE);
+    for(int i=0;i<4;++i){ctx.now_ms+=500;assert(tick(&ctx)==APP_REDRAW_NONE&&nstarts==before+1);}
+    assert(shelf_turn_page_to(1)==APP_REDRAW_PAGE);ready_page();ctx.now_ms+=1100;
+    before=nstarts;assert(tick(&ctx)==APP_REDRAW_NONE&&nstarts==before+1&&starts[nstarts-1].job==WR_JOB_PROBE_SHELF);
+    complete((weread_result_t){.job=WR_JOB_PROBE_SHELF,.authenticated=true});assert(tick(&ctx)==APP_REDRAW_NONE);
+    puts("PASS: visible-row WR_JOB_PROBE_SHELF runs once per page without looping");
+
+    /* M3 WR-UX-01c: passive -2013 mid-session expiry keeps offline shelf without WR_JOB_QR and permits local covers */
+    reset();initialized(2);
+    assert(weread_runtime_start(WR_JOB_SYNC,NULL,NULL));
+    complete((weread_result_t){.job=WR_JOB_SYNC,.error=ESP_ERR_INVALID_STATE,.authenticated=false,.auth_expired=true});
+    before=nstarts;assert(tick(&ctx)==APP_REDRAW_PAGE&&!s_auth&&s_auth_expired&&offline_readonly()&&nstarts==before);
+    assert(strstr(s_message,"登录已过期"));
+    ctx.now_ms+=200;assert(tick(&ctx)==APP_REDRAW_NONE&&starts[nstarts-1].job==WR_JOB_COVER&&!starts[nstarts-1].value[0]);
+    complete((weread_result_t){.job=WR_JOB_COVER,.authenticated=false,.auth_expired=true,.error=ESP_ERR_NOT_FOUND});
+    strcpy(mock_result.id,"id_0");assert(tick(&ctx)==APP_REDRAW_NONE&&offline_readonly());
+    ctx.now_ms+=1200;before=nstarts;tick(&ctx);
+    for(int k=before;k<nstarts;++k)assert(!strcmp(starts[k].value,"")||starts[k].job!=WR_JOB_COVER);
+    puts("PASS: mid-session auth_expired retains offline shelf, skips WR_JOB_QR, and skips remote cover fetch");
+
     reset();return 0;
 }
 '''
