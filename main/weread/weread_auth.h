@@ -127,6 +127,17 @@ esp_err_t weread_auth_clear_session(void);
 void weread_auth_forget_session(void);
 
 /**
+ * @brief Transition the active session into expired read-only mode on passive -2013 revocation.
+ *
+ * Scrubs access_token, refresh_token, skey, pending auth, and login cookies,
+ * retains read-only owner metadata (vid, device_id, device_name, user_name, avatar_url, updated_at),
+ * persists auth.json with "expired": true, and removes auth.json.previous.
+ *
+ * @return ESP_OK on success, or error code.
+ */
+esp_err_t weread_auth_mark_expired(void);
+
+/**
  * @brief Check whether an authenticated session is currently loaded and active in memory.
  *
  * @return true if authenticated, false otherwise.
@@ -134,9 +145,26 @@ void weread_auth_forget_session(void);
 bool weread_auth_is_authenticated(void);
 
 /**
- * @brief Get a read-only pointer to the current active session in memory.
+ * @brief Check whether the session is in passive -2013 expired read-only mode.
  *
- * @return const weread_auth_session_t* Pointer to session, or NULL if not authenticated.
+ * @return true if expired read-only owner metadata is loaded, false otherwise.
+ */
+bool weread_auth_is_expired(void);
+
+/**
+ * @brief Retrieve the active or expired read-only owner vid, or NULL when logged out.
+ *
+ * @return const char* Owner vid string, or NULL if no owner exists.
+ */
+const char *weread_auth_owner_vid(void);
+
+/**
+ * @brief Get a read-only pointer to the active session or expired read-only owner session.
+ *
+ * Returns a session with empty tokens when expired read-only mode is active, or NULL if
+ * no owner exists. Network callers must check weread_auth_is_authenticated().
+ *
+ * @return const weread_auth_session_t* Pointer to session, or NULL if no owner exists.
  */
 const weread_auth_session_t *weread_auth_get_current_session(void);
 

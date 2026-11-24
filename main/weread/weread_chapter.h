@@ -18,6 +18,53 @@ esp_err_t weread_chapter_download(const char *book_id, uint32_t uid);
 bool weread_chapter_cached(const char *book_id,uint32_t uid);
 /// 自动补章预留最坏归档/展开/成品空间；已缓存章不受此门限影响。/ Reserve worst-case archive/extraction/body space for automatic prefetch; cached chapters remain readable.
 esp_err_t weread_chapter_prefetch_space(uint64_t *available);
+
+typedef struct {
+    uint64_t chapter_bytes;
+    uint64_t cover_bytes;
+    uint64_t meta_bytes;
+    uint64_t reclaimable_bytes;
+    uint64_t total_bytes;
+    uint32_t chapter_manifest_count;
+} weread_chapter_book_cache_info_t;
+
+typedef struct {
+    uint64_t total_bytes;
+    uint64_t reclaimable_bytes;
+    uint64_t free_bytes;
+    uint64_t fs_total_bytes;
+    uint32_t book_dir_count;
+    uint32_t books_with_chapters;
+} weread_chapter_cache_stats_t;
+
+/// 查询微信读书存储挂载点的可用空间与总容量；不强制 104 MiB 预取门限。
+/// Query free and total filesystem bytes for the WeRead storage root without enforcing the 104 MiB prefetch floor.
+esp_err_t weread_chapter_storage_info(uint64_t *free_bytes, uint64_t *total_bytes);
+
+/// 统计单本书缓存占用，区分可回收章节/临时文件与保留的元数据/成品封面。
+/// Inspect disk usage for one book's cache directory, separating reclaimable chapter/temp artifacts from preserved metadata and .gray covers.
+esp_err_t weread_chapter_inspect_book_cache(const char *book_id, weread_chapter_book_cache_info_t *out,
+    weread_cancel_fn cancel, void *cancel_ctx);
+
+/// 统计全部缓存目录占用与文件系统可用空间。
+/// Inspect aggregate cache usage and storage space across cache/<id>/ directories.
+esp_err_t weread_chapter_inspect_cache_stats(weread_chapter_cache_stats_t *out,
+    weread_cancel_fn cancel, void *cancel_ctx);
+
+/// 选择性清理单本书离线章节与临时封面，严格保留 progress.json*、chapters.json* 与 cover-*.gray/cover.gray。
+/// Selectively remove one book's offline chapters and temp cover artifacts while preserving progress, TOC, and .gray covers.
+esp_err_t weread_chapter_clean_book_cache(const char *book_id, uint64_t *freed_bytes,
+    weread_cancel_fn cancel, void *cancel_ctx);
+
+/// 选择性清理全部书籍离线章节与临时封面，跳过正在阅读的书籍，保留 auth/shelf/progress/chapters/成品封面。
+/// Selectively remove offline chapters and temp cover artifacts across all cached books (skipping any book currently open), preserving auth, shelf, progress, TOC, and .gray covers.
+esp_err_t weread_chapter_clean_all_caches(uint64_t *freed_bytes, uint32_t *cleaned_books,
+    weread_cancel_fn cancel, void *cancel_ctx);
+
+/// 依据本地目录与已校验正文/映射，统计单本书的已缓存章节数与总章节数。
+/// Count locally cached chapters (verified via weread_chapter_cached) against the book's local TOC.
+esp_err_t weread_chapter_count_cached(const char *book_id, uint16_t *cached_chapters,
+    uint16_t *total_chapters, weread_cancel_fn cancel, void *cancel_ctx);
 esp_err_t weread_chapter_download_ex(const char *book_id, uint32_t uid, bool preload);
 /// 已缓存时不联网；输出正文由调用方 free。/ Cached reads stay offline; caller frees returned text.
 esp_err_t weread_chapter_load(const char *book_id, uint32_t uid, char **text, size_t *len);

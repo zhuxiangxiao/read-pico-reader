@@ -34,6 +34,7 @@ esp_err_t book_weread_load(size_t index, const char *anchor, size_t *offset, htm
 esp_err_t book_weread_commit_loaded(size_t *chapter,uint32_t *version);
 void book_weread_discard_loaded(void);
 bool book_weread_directory_in_use(const char *root);
+bool book_weread_id_in_use(const char *id);
 /// 当前与候选的精确映射表常驻字节，不包含正文/目录。/ Resident exact-map bytes across the active and candidate slots, excluding body/TOC storage.
 size_t book_weread_map_cache_bytes(void);
 esp_err_t book_weread_image(size_t index, const char *src, uint8_t **data, size_t *len, bool *png);

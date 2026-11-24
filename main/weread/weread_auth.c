@@ -30,6 +30,7 @@ static char s_device_name[WEREAD_DEVICE_NAME_MAX_LEN] = "KiikoReader";
 
 static WR_EXT_BSS weread_auth_session_t s_current_session;
 static bool s_authenticated = false;
+static bool s_expired = false;
 
 typedef struct {
     char vid[WEREAD_VID_MAX_LEN];
@@ -156,6 +157,7 @@ esp_err_t weread_auth_init(const char *storage_root) { WR_GUARD;
     weread_secure_zero(&s_current_session, sizeof(s_current_session));
     weread_secure_zero(&s_pending_auth, sizeof(s_pending_auth));
     s_authenticated = false;
+    s_expired = false;
 
     // Attempt to load existing credentials
     weread_auth_session_t loaded;
@@ -163,7 +165,9 @@ esp_err_t weread_auth_init(const char *storage_root) { WR_GUARD;
     if (weread_auth_load_session(&loaded) == ESP_OK) {
         memcpy(&s_current_session, &loaded, sizeof(s_current_session));
         s_authenticated = true;
+        s_expired = false;
     }
+    weread_secure_zero(&loaded, sizeof(loaded));
 
     return ESP_OK;
 }
@@ -480,6 +484,7 @@ esp_err_t weread_auth_exchange_code(const char *code, weread_auth_session_t *out
     }
     memcpy(&s_current_session, &candidate, sizeof(candidate));
     s_authenticated = true;
+    s_expired = false;
 
     if (out_session) {
         memcpy(out_session, &candidate, sizeof(weread_auth_session_t));
@@ -563,7 +568,16 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_MEMORY_
         bool revoked = cJSON_IsNumber(code) && code->valuedouble == WEREAD_AUTH_ERRCODE_EXPIRED;
         cJSON_Delete(root);
         weread_secure_zero(&snap, sizeof(snap));
-        if (revoked) { WR_GUARD; weread_auth_clear_session(); return ESP_ERR_INVALID_STATE; }
+        if (revoked) {
+            WR_GUARD;
+            if (session && session != &s_current_session) {
+                weread_secure_zero(session->skey, sizeof(session->skey));
+                weread_secure_zero(session->access_token, sizeof(session->access_token));
+                weread_secure_zero(session->refresh_token, sizeof(session->refresh_token));
+            }
+            (void)weread_auth_mark_expired();
+            return ESP_ERR_INVALID_STATE;
+        }
         return ESP_FAIL;
     }
 
@@ -583,6 +597,7 @@ esp_err_t weread_auth_renew_session(weread_auth_session_t *session) { WR_MEMORY_
         memcpy(target, &snap, sizeof(snap));
         memcpy(&s_current_session, &snap, sizeof(snap));
         s_authenticated = true;
+        s_expired = false;
     }
     weread_secure_zero(&snap, sizeof(snap));
     cJSON_Delete(root); return saved;
@@ -631,15 +646,28 @@ esp_err_t weread_auth_load_session(weread_auth_session_t *out_session) { WR_GUAR
     cJSON *root = NULL;
     esp_err_t err = wr_read_json(path, &root);
     weread_auth_session_t candidate = {0};
-    const char *vid = wr_string(root, "vid"), *token = wr_string(root, "accessToken");
-    if (!token) token = wr_string(root, "skey");
-    const char *refresh = wr_string(root, "refreshToken");
-    if (err == ESP_OK && (!wr_copy(candidate.vid, sizeof(candidate.vid), vid) ||
-        !wr_copy(candidate.access_token, sizeof(candidate.access_token), token) ||
-        !wr_copy(candidate.refresh_token, sizeof(candidate.refresh_token), refresh) ||
-        !credential(candidate.vid, sizeof(candidate.vid), true) ||
-        !credential(candidate.access_token, sizeof(candidate.access_token), true) ||
-        !credential(candidate.refresh_token, sizeof(candidate.refresh_token), true))) err = ESP_ERR_INVALID_RESPONSE;
+    const cJSON *exp = cJSON_GetObjectItemCaseSensitive(root, "expired");
+    if (err == ESP_OK && exp && !cJSON_IsBool(exp)) err = ESP_ERR_INVALID_RESPONSE;
+    bool is_expired = (err == ESP_OK) && cJSON_IsTrue(exp);
+    const char *vid = wr_string(root, "vid");
+    if (is_expired) {
+        if (!wr_copy(candidate.vid, sizeof(candidate.vid), vid) ||
+            !credential(candidate.vid, sizeof(candidate.vid), true)) {
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    } else if (err == ESP_OK) {
+        const char *token = wr_string(root, "accessToken");
+        if (!token) token = wr_string(root, "skey");
+        const char *refresh = wr_string(root, "refreshToken");
+        if (!wr_copy(candidate.vid, sizeof(candidate.vid), vid) ||
+            !wr_copy(candidate.access_token, sizeof(candidate.access_token), token) ||
+            !wr_copy(candidate.refresh_token, sizeof(candidate.refresh_token), refresh) ||
+            !credential(candidate.vid, sizeof(candidate.vid), true) ||
+            !credential(candidate.access_token, sizeof(candidate.access_token), true) ||
+            !credential(candidate.refresh_token, sizeof(candidate.refresh_token), true)) {
+            err = ESP_ERR_INVALID_RESPONSE;
+        }
+    }
     const char *keys[] = {"deviceId", "deviceName", "wxNickName", "wxHeadImg"};
     char *dest[] = {candidate.device_id, candidate.device_name, candidate.user_name, candidate.avatar_url};
     size_t caps[] = {sizeof(candidate.device_id), sizeof(candidate.device_name), sizeof(candidate.user_name), sizeof(candidate.avatar_url)};
@@ -648,14 +676,23 @@ esp_err_t weread_auth_load_session(weread_auth_session_t *out_session) { WR_GUAR
         if (v && !wr_copy(dest[i], caps[i], v)) err = ESP_ERR_INVALID_RESPONSE;
     }
     if (err == ESP_OK && !credential(candidate.device_id, sizeof(candidate.device_id), false)) err = ESP_ERR_INVALID_RESPONSE;
-    uint64_t time = 0; wr_uint(root, "updatedAt", &time); candidate.updated_at = (int64_t)time;
-    if (err == ESP_OK) {
+    uint64_t stamp = 0; wr_uint(root, "updatedAt", &stamp); candidate.updated_at = (int64_t)stamp;
+    if (err == ESP_OK && is_expired) {
+        memcpy(&s_current_session, &candidate, sizeof(candidate));
+        s_authenticated = false;
+        s_expired = true;
+        weread_secure_zero(out_session, sizeof(*out_session));
+        err = ESP_ERR_INVALID_STATE;
+    } else if (err == ESP_OK) {
         snprintf(candidate.skey, sizeof(candidate.skey), "%.*s", (int)sizeof(candidate.skey) - 1, candidate.access_token);
         memcpy(out_session, &candidate, sizeof(candidate));
         memcpy(&s_current_session, &candidate, sizeof(candidate));
         s_authenticated = true;
+        s_expired = false;
     } else {
-        weread_secure_zero(&s_current_session, sizeof(s_current_session)); s_authenticated = false;
+        weread_secure_zero(&s_current_session, sizeof(s_current_session));
+        s_authenticated = false;
+        s_expired = false;
         weread_secure_zero(out_session, sizeof(*out_session));
     }
     weread_secure_zero(&candidate, sizeof(candidate));
@@ -665,7 +702,7 @@ esp_err_t weread_auth_load_session(weread_auth_session_t *out_session) { WR_GUAR
 void weread_auth_forget_session(void) { WR_GUARD;
     weread_secure_zero(&s_current_session,sizeof(s_current_session));
     weread_secure_zero(&s_pending_auth,sizeof(s_pending_auth));
-    weread_client_forget_login_cookies();s_authenticated=false;
+    weread_client_forget_login_cookies();s_authenticated=false;s_expired=false;
 }
 esp_err_t weread_auth_clear_session(void) { WR_GUARD;
     char auth_path[512];
@@ -684,12 +721,68 @@ esp_err_t weread_auth_clear_session(void) { WR_GUARD;
     return removed ? ESP_OK : ESP_FAIL;
 }
 
+esp_err_t weread_auth_mark_expired(void) { WR_GUARD;
+    weread_secure_zero(s_current_session.skey, sizeof(s_current_session.skey));
+    weread_secure_zero(s_current_session.access_token, sizeof(s_current_session.access_token));
+    weread_secure_zero(s_current_session.refresh_token, sizeof(s_current_session.refresh_token));
+    weread_secure_zero(&s_pending_auth, sizeof(s_pending_auth));
+    weread_client_forget_login_cookies();
+    s_authenticated = false;
+
+    if (!credential(s_current_session.vid, sizeof(s_current_session.vid), true) ||
+        !credential(s_current_session.device_id, sizeof(s_current_session.device_id), false) ||
+        !memchr(s_current_session.device_name, 0, sizeof(s_current_session.device_name)) ||
+        !memchr(s_current_session.user_name, 0, sizeof(s_current_session.user_name)) ||
+        !memchr(s_current_session.avatar_url, 0, sizeof(s_current_session.avatar_url))) {
+        weread_auth_forget_session();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_expired = true;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    bool ok = cJSON_AddBoolToObject(root, "expired", true) &&
+        cJSON_AddStringToObject(root, "vid", s_current_session.vid) &&
+        cJSON_AddStringToObject(root, "deviceId", s_current_session.device_id) &&
+        cJSON_AddStringToObject(root, "deviceName", s_current_session.device_name) &&
+        cJSON_AddStringToObject(root, "wxNickName", s_current_session.user_name) &&
+        cJSON_AddStringToObject(root, "wxHeadImg", s_current_session.avatar_url) &&
+        cJSON_AddNumberToObject(root, "updatedAt", (double)s_current_session.updated_at);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", s_storage_root, WEREAD_AUTH_FILE_NAME);
+    esp_err_t err = ok ? wr_write_json(path, root) : ESP_ERR_NO_MEM;
+#if !defined(ESP_PLATFORM)
+    if (err == ESP_OK && chmod(path, 0600)) err = ESP_FAIL;
+#endif
+    cJSON_Delete(root);
+    if (err == ESP_OK) {
+        char previous[512];
+        snprintf(previous, sizeof(previous), "%s/%s.previous", s_storage_root, WEREAD_AUTH_FILE_NAME);
+        if (unlink(previous) && errno != ENOENT) err = ESP_FAIL;
+    }
+    return err;
+}
+
 bool weread_auth_is_authenticated(void) {
-    return s_authenticated && (s_current_session.access_token[0] != '\0');
+    return s_authenticated && !s_expired &&
+        (s_current_session.access_token[0] != '\0') &&
+        (s_current_session.refresh_token[0] != '\0');
+}
+
+bool weread_auth_is_expired(void) {
+    return !s_authenticated && s_expired && (s_current_session.vid[0] != '\0');
+}
+
+const char *weread_auth_owner_vid(void) {
+    return ((s_authenticated || s_expired) && s_current_session.vid[0] != '\0') ? s_current_session.vid : NULL;
 }
 
 const weread_auth_session_t *weread_auth_get_current_session(void) {
-    if (!s_authenticated || s_current_session.access_token[0] == '\0') {
+    if ((!s_authenticated && !s_expired) || s_current_session.vid[0] == '\0') {
+        return NULL;
+    }
+    if (s_authenticated &&
+        (s_current_session.access_token[0] == '\0' || s_current_session.refresh_token[0] == '\0')) {
         return NULL;
     }
     return &s_current_session;

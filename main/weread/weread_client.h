@@ -69,6 +69,10 @@ typedef void (*weread_download_progress_fn)(uint64_t bytes, bool done, void *ctx
 /// 服务空闲时安装长期有效的下载进度回调；NULL清除。回调由worker同步执行。
 /// Install a lifetime-stable download progress callback while idle; NULL clears it. It runs synchronously on the worker.
 void weread_client_set_download_progress(weread_download_progress_fn fn, void *ctx);
+typedef void (*weread_client_activity_fn_t)(void *ctx);
+/// 服务空闲或切换回调时安装线程安全的HTTP活动通知；在真实HTTP收发时于锁外触发，不得在回调内假设持有服务锁。
+/// Install a thread-safe HTTP activity callback; invoked unlocked on real HTTP I/O without holding the service lock.
+void weread_client_set_activity_cb(weread_client_activity_fn_t cb, void *ctx);
 /// 传输实现上报写入字节数；原生ESP路径每4块调用，宿主替身可在写入后显式调用。
 /// Transport implementations report written bytes; the native ESP path calls it every4 chunks.
 void weread_client_report_download_progress(uint64_t bytes, bool done);

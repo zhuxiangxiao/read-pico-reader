@@ -100,6 +100,120 @@ static esp_err_t transport(const char *url, const char *method, const char *head
     } else { assert(false); }
     *len = strlen(*out); return ESP_OK;
 }
+static const weread_shelf_item_t *find_item(const weread_shelf_item_t *items, size_t n, const char *id) {
+    for (size_t i = 0; i < n; ++i) if (!strcmp(items[i].book_id, id)) return &items[i];
+    return NULL;
+}
+static void test_chapter_counts_and_expired_shelf(void) {
+    weread_shelf_item_t *items = NULL; size_t n = 0;
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK && n == 3);
+    const weread_shelf_item_t *a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 0 && a->total_chapters == 0);
+    free(items);
+
+    assert(weread_shelf_set_chapter_counts("A", 3, 10) == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 3 && a->total_chapters == 10);
+    free(items);
+
+    weread_shelf_clear();
+    assert(weread_shelf_load() == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 3 && a->total_chapters == 10);
+    free(items);
+
+    /* Clamping cached > total */
+    assert(weread_shelf_set_chapter_counts("A", 25, 10) == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 10 && a->total_chapters == 10);
+    free(items);
+
+    /* Invalid / missing IDs */
+    assert(weread_shelf_set_chapter_counts("../bad", 1, 2) == ESP_ERR_INVALID_ARG);
+    assert(weread_shelf_set_chapter_counts("missing_book", 1, 2) == ESP_ERR_NOT_FOUND);
+
+    /* No-op short-circuit & write-failure rollback */
+    char shelf_tmp[512];
+    snprintf(shelf_tmp, sizeof(shelf_tmp), "%s/shelf.json.tmp", root);
+    assert(weread_test_mkdir(shelf_tmp, 0700) == 0);
+    assert(weread_shelf_set_chapter_counts("A", 10, 10) == ESP_OK);
+    assert(weread_shelf_set_chapter_counts("A", 2, 10) != ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 10 && a->total_chapters == 10);
+    free(items);
+    assert(rmdir(shelf_tmp) == 0);
+
+    /* Preserved across single-book refresh and full sync when bookVersion unchanged */
+    mode = 0;
+    assert(weread_shelf_refresh_book("A") == ESP_OK);
+    assert(weread_shelf_sync(true) == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 10 && a->total_chapters == 10);
+    free(items);
+
+    /* Cleared to 0/0 when bookVersion bumps via merge_book (shelf_refresh_book) or set_version, while OOM/save failure preserves old counts */
+    mode = 8;
+    assert(weread_shelf_refresh_book("A") == ESP_OK);
+    assert(weread_shelf_book_version("A") == 13);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 0 && a->total_chapters == 0);
+    free(items);
+    assert(weread_shelf_set_chapter_counts("A", 5, 10) == ESP_OK);
+    assert(weread_shelf_set_version("A", 13) == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 5 && a->total_chapters == 10);
+    free(items);
+    assert(weread_test_mkdir(shelf_tmp, 0700) == 0);
+    assert(weread_shelf_set_version("A", 14) != ESP_OK);
+    assert(weread_shelf_book_version("A") == 13);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 5 && a->total_chapters == 10);
+    free(items);
+    assert(rmdir(shelf_tmp) == 0);
+    assert(weread_shelf_set_version("A", 14) == ESP_OK);
+    assert(weread_shelf_book_version("A") == 14);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 0 && a->total_chapters == 0);
+    free(items);
+    weread_shelf_clear();
+    assert(weread_shelf_load() == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 0 && a->total_chapters == 0);
+    free(items);
+    assert(weread_shelf_set_version("A", 12) == ESP_OK);
+    mode = 0;
+
+    /* Reset cached count to 0 while keeping total */
+    assert(weread_shelf_set_chapter_counts("A", 0, 10) == ESP_OK);
+    assert(weread_shelf_snapshot(&items, &n) == ESP_OK);
+    a = find_item(items, n, "A");
+    assert(a && a->cached_chapters == 0 && a->total_chapters == 10);
+    free(items);
+
+    /* WR-UX-01a expired mode: local shelf/TOC/counts work; network sync/refresh blocked */
+    assert(weread_auth_mark_expired() == ESP_OK);
+    assert(weread_auth_is_expired() && !weread_auth_is_authenticated());
+    int calls_before = calls;
+    weread_shelf_clear();
+    assert(weread_shelf_load() == ESP_OK && weread_shelf_count() == 3);
+    assert(weread_shelf_set_chapter_counts("A", 4, 10) == ESP_OK);
+    weread_toc_t toc = {0};
+    assert(weread_toc_load("A", &toc) == ESP_OK && toc.count == 1);
+    weread_toc_free(&toc);
+    assert(weread_shelf_sync(false) == ESP_ERR_INVALID_STATE);
+    assert(weread_shelf_refresh_book("A") == ESP_ERR_INVALID_STATE);
+    assert(calls == calls_before);
+}
 static void account(const char *vid) {
     weread_auth_session_t session = {0};
     strcpy(session.vid, vid); strcpy(session.access_token, "test-only-token");
@@ -223,6 +337,7 @@ int main(void) {
     assert(weread_cover_retry_url("http://cdn.qq.com/s_x", &retry, 65100, url, sizeof(url)) == ESP_OK);
     assert(!strcmp(url, "https://cdn.qq.com/s_x"));
     weread_cover_retry_result(&retry, 200, 65101); assert(!retry.failures && !retry.original);
+    test_chapter_counts_and_expired_shelf();
     weread_shelf_clear(); weread_auth_clear_session(); weread_client_set_transport(NULL, NULL);
     puts("WeRead shelf/TOC: transaction, batching, rollback, offline, isolation and cover tests passed.");
     return 0;

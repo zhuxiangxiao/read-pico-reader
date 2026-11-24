@@ -171,6 +171,140 @@ static void obfuscated_names(void) {
     assert(!weread_resource_path(NULL, "/abs", dir, sizeof(dir)));
     html_text_free(&parsed); book_weread_close(); mode = 0;
 }
+
+static void assert_file_bytes(const char *path, const char *expected) {
+    FILE *f = fopen(path, "rb");
+    assert(f != NULL);
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    assert(feof(f));
+    fclose(f);
+    buf[n] = 0;
+    assert(strcmp(buf, expected) == 0);
+}
+
+static void test_expired_and_cache_cleanup(const char *root) {
+    mode = 0;
+    assert(weread_toc_sync("test_book_101") == ESP_OK);
+
+    const char *keep_names[] = {
+        "progress.json", "progress.json.tmp", "progress.json.previous",
+        "progress.json.123", "chapters.json.previous",
+        "cover-0123456789abcdef.gray", "cover.gray"
+    };
+    const char *keep_vals[] = {
+        "PROGRESS_KEEP", "TMP_KEEP", "PREV_KEEP",
+        "VID_KEEP", "TOC_PREV_KEEP",
+        "GRAY_KEEP", "LEGACY_GRAY_KEEP"
+    };
+    for (size_t i = 0; i < sizeof(keep_names) / sizeof(*keep_names); ++i) {
+        char p[512];
+        assert(wr_cache_path("test_book_101", keep_names[i], p, sizeof(p)) == ESP_OK);
+        assert(wr_write_bytes(p, keep_vals[i], strlen(keep_vals[i])) == ESP_OK);
+    }
+    const char *del_names[] = {
+        "cover-0123456789abcdef.img", "cover-0123456789abcdef.img.part",
+        "cover-0123456789abcdef.failed", "cover.img", "cover.failed",
+        "archive.tar", "chapter_9.html", "chapter-9.html.part", "chapter-9.json.tmp"
+    };
+    for (size_t i = 0; i < sizeof(del_names) / sizeof(*del_names); ++i) {
+        char p[512];
+        assert(wr_cache_path("test_book_101", del_names[i], p, sizeof(p)) == ESP_OK);
+        assert(wr_write_bytes(p, "TEMP_DELETE_ME", 14) == ESP_OK);
+    }
+    char txt_keep[512], txt_del[512];
+    assert(wr_cache_path("txt_book_202", "cover.gray", txt_keep, sizeof(txt_keep)) == ESP_OK);
+    assert(wr_write_bytes(txt_keep, "TXT_GRAY", 8) == ESP_OK);
+    assert(wr_cache_path("txt_book_202", "archive.zip", txt_del, sizeof(txt_del)) == ESP_OK);
+    assert(wr_write_bytes(txt_del, "TXT_ARCHIVE", 11) == ESP_OK);
+
+    /* WR-UX-01a expired read-only open/read/map without network */
+    assert(weread_auth_mark_expired() == ESP_OK);
+    assert(weread_auth_is_expired() && !weread_auth_is_authenticated());
+    int dl_before = downloads, req_before = requests;
+    assert(weread_chapter_cached("test_book_101", 1));
+    char *text = NULL; size_t len = 0;
+    assert(weread_chapter_load("test_book_101", 1, &text, &len) == ESP_OK && len > 0);
+    free(text); text = NULL;
+    assert(weread_chapter_load("test_book_101", 999, &text, &len) == ESP_ERR_INVALID_STATE && !text);
+    assert(book_weread_prepare_open("test_book_101") == ESP_OK);
+    assert(book_weread_open("weread://test_book_101") == ESP_OK);
+    html_text_t parsed = {0};
+    assert(book_weread_load(0, NULL, NULL, &parsed) == ESP_OK);
+    uint32_t mapped = 0;
+    assert(book_weread_map(0, true, 0, &mapped) == ESP_OK);
+    assert(book_weread_map_detached("test_book_101", 1, 100, false, 0, &mapped) == ESP_OK);
+    html_text_free(&parsed);
+    assert(downloads == dl_before && requests == req_before);
+
+    /* WR-UX-09a storage info, inspection, and cached chapter count */
+    uint64_t free_b = 0, total_b = 0;
+    assert(weread_chapter_storage_info(&free_b, &total_b) == ESP_OK && free_b > 0 && total_b > 0);
+    uint16_t cached_c = 0, total_c = 0;
+    assert(weread_chapter_count_cached("test_book_101", &cached_c, &total_c, NULL, NULL) == ESP_OK);
+    assert(cached_c == 1 && total_c == 1);
+
+    weread_chapter_book_cache_info_t binfo = {0};
+    assert(weread_chapter_inspect_book_cache("test_book_101", &binfo, NULL, NULL) == ESP_OK);
+    assert(binfo.chapter_bytes > 0 && binfo.cover_bytes > 0 && binfo.meta_bytes > 0 && binfo.reclaimable_bytes > 0);
+    assert(binfo.total_bytes == binfo.chapter_bytes + binfo.cover_bytes + binfo.meta_bytes);
+    assert(binfo.chapter_manifest_count >= 1);
+
+    weread_chapter_cache_stats_t stats = {0};
+    assert(weread_chapter_inspect_cache_stats(&stats, NULL, NULL) == ESP_OK);
+    assert(stats.book_dir_count >= 2 && stats.books_with_chapters >= 2);
+    assert(stats.reclaimable_bytes >= binfo.reclaimable_bytes && stats.free_bytes > 0);
+
+    /* Active book cannot be cleaned; clean_all_caches skips open book and cleans txt_book_202 */
+    assert(weread_chapter_clean_book_cache("test_book_101", NULL, NULL, NULL) == ESP_ERR_INVALID_STATE);
+    uint64_t freed_all = 0; uint32_t cleaned_books = 0;
+    assert(weread_chapter_clean_all_caches(&freed_all, &cleaned_books, NULL, NULL) == ESP_OK);
+    assert(cleaned_books == 1 && freed_all > 0);
+    assert(access(txt_del, F_OK) != 0);
+    assert_file_bytes(txt_keep, "TXT_GRAY");
+    assert(weread_chapter_cached("test_book_101", 1));
+
+    book_weread_close();
+
+    /* Mid-clean cancellation */
+    stop = true;
+    assert(weread_chapter_clean_book_cache("test_book_101", NULL, cancel, NULL) == ESP_ERR_INVALID_STATE);
+    stop = false;
+
+    /* Selective cleanup of test_book_101 deletes chapters/, res/, manifests, temp covers; keeps progress/TOC/gray */
+    uint64_t freed = 0;
+    assert(weread_chapter_clean_book_cache("test_book_101", &freed, cancel, NULL) == ESP_OK && freed > 0);
+    for (size_t i = 0; i < sizeof(del_names) / sizeof(*del_names); ++i) {
+        char p[512];
+        assert(wr_cache_path("test_book_101", del_names[i], p, sizeof(p)) == ESP_OK);
+        assert(access(p, F_OK) != 0);
+    }
+    char chapters_dir[512], res_dir[512], ch1_json[512], res_json[512];
+    assert(wr_cache_path("test_book_101", "chapters", chapters_dir, sizeof(chapters_dir)) == ESP_OK);
+    assert(wr_cache_path("test_book_101", "res", res_dir, sizeof(res_dir)) == ESP_OK);
+    assert(wr_cache_path("test_book_101", "chapter-1.json", ch1_json, sizeof(ch1_json)) == ESP_OK);
+    assert(wr_cache_path("test_book_101", "resources.json", res_json, sizeof(res_json)) == ESP_OK);
+    assert(access(chapters_dir, F_OK) != 0 && access(res_dir, F_OK) != 0);
+    assert(access(ch1_json, F_OK) != 0 && access(res_json, F_OK) != 0);
+
+    for (size_t i = 0; i < sizeof(keep_names) / sizeof(*keep_names); ++i) {
+        char p[512];
+        assert(wr_cache_path("test_book_101", keep_names[i], p, sizeof(p)) == ESP_OK);
+        assert_file_bytes(p, keep_vals[i]);
+    }
+    char toc_json[512], auth_json[512], shelf_json[512], dev_id[512];
+    assert(wr_cache_path("test_book_101", "chapters.json", toc_json, sizeof(toc_json)) == ESP_OK);
+    snprintf(auth_json, sizeof(auth_json), "%s/auth.json", root);
+    snprintf(shelf_json, sizeof(shelf_json), "%s/shelf.json", root);
+    snprintf(dev_id, sizeof(dev_id), "%s/device_id", root);
+    assert(access(toc_json, F_OK) == 0 && access(auth_json, F_OK) == 0 &&
+           access(shelf_json, F_OK) == 0 && access(dev_id, F_OK) == 0);
+
+    assert(weread_chapter_count_cached("test_book_101", &cached_c, &total_c, NULL, NULL) == ESP_OK);
+    assert(cached_c == 0 && total_c == 1);
+    assert(weread_chapter_inspect_book_cache("test_book_101", &binfo, NULL, NULL) == ESP_OK);
+    assert(binfo.reclaimable_bytes == 0 && binfo.chapter_bytes == 0 && binfo.cover_bytes > 0 && binfo.meta_bytes > 0);
+}
 int main(void) {
     char root[] = "/tmp/kiiko-weread-chapter-XXXXXX"; assert(mkdtemp(root));
     assert(weread_auth_init(root) == ESP_OK);
@@ -240,6 +374,7 @@ int main(void) {
     assert(expanded == 2u * 1024u * 1024u && chunks >= 512);
     large=fopen("build/weread-tests/multichunk.zip","rb");assert(large);
     assert(book_weread_unpack_zip_file(large,NULL,0,random_sink,NULL)==ESP_OK&&random_expanded==300000);fclose(large);
+    test_expired_and_cache_cleanup(root);
     weread_shelf_clear(); weread_auth_clear_session();
     puts("WeRead chapters: encrypted ZIP, TAR, ordered assembly, offline, cancellation, 402/499/-2063 and bounded inflation passed.");
     return 0;

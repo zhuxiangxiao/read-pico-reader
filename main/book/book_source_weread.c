@@ -55,6 +55,9 @@ bool book_weread_directory_in_use(const char *root){WR_GUARD;
     return root&&((s_loaded&&(!strcmp(root,s_loaded->root)||!strcmp(root,s_loaded->resources)))||
         (s_candidate&&(!strcmp(root,s_candidate->root)||!strcmp(root,s_candidate->resources))));
 }
+bool book_weread_id_in_use(const char *id){WR_GUARD;
+    return id&&*id&&s_id[0]&&!strcmp(s_id,id);
+}
 static const char *bound_resource(const char *root){
     if(root&&binding_owned(s_candidate)&&!strcmp(root,s_candidate->root))return s_candidate->resources;
     if(root&&binding_owned(s_loaded)&&!strcmp(root,s_loaded->root))return s_loaded->resources;
@@ -80,16 +83,16 @@ esp_err_t book_weread_prepare_open(const char *id){ WR_MEMORY_SCOPE;
         known = weread_shelf_book_version(id);
         if(book_weread_prepared(id)&&(s_prepared_local||!known||known==s_prepared_toc.book_version))return ESP_OK;
         book_weread_clear_prepared();
-        if(!wr_valid_id(id)||!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
+        if(!wr_valid_id(id)||(!weread_auth_is_authenticated()&&!weread_auth_is_expired()))return ESP_ERR_INVALID_STATE;
     }
     weread_toc_t toc={0};
     esp_err_t err=weread_toc_load(id,&toc);
-    if(err!=ESP_OK){err=weread_toc_sync(id);if(err==ESP_OK)err=weread_toc_load(id,&toc);}
+    if(err!=ESP_OK&&weread_auth_is_authenticated()){err=weread_toc_sync(id);if(err==ESP_OK)err=weread_toc_load(id,&toc);}
     WR_GUARD;
     known=weread_shelf_book_version(id);
     if(err==ESP_OK&&!toc.count)err=ESP_ERR_NOT_FOUND;
     if(err==ESP_OK&&known&&toc.book_version!=known)err=WEREAD_ERR_VERSION;
-    if(err!=ESP_OK||!wr_valid_id(id)||!weread_auth_is_authenticated()){
+    if(err!=ESP_OK||!wr_valid_id(id)||(!weread_auth_is_authenticated()&&!weread_auth_is_expired())){
         weread_toc_free(&toc);book_weread_clear_prepared();
         return err!=ESP_OK?err:ESP_ERR_INVALID_STATE;
     }
@@ -198,7 +201,7 @@ bool book_weread_plain_text(void) { WR_GUARD; return s_id[0] && s_txt; }
 void book_weread_close(void) { WR_GUARD; binding_free(&s_loaded);binding_free(&s_candidate);clear_css();s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
 esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_id)) return ESP_ERR_INVALID_ARG;
-    if (!weread_auth_is_authenticated()) {
+    if (!weread_auth_is_authenticated() && !weread_auth_is_expired()) {
         esp_err_t err = weread_auth_init(NULL); if (err != ESP_OK) return err;
     }
     if (!weread_shelf_count()) (void)weread_shelf_load();
@@ -209,7 +212,7 @@ esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     bool from_local_prepared = false;
     if(book_weread_prepared(uri+9)){from_local_prepared=s_prepared_local;toc=s_prepared_toc;memset(&s_prepared_toc,0,sizeof(s_prepared_toc));s_prepared_id[0]=s_prepared_owner[0]=0;s_prepared_local=false;}
     else err=weread_toc_load(uri+9,&toc);
-    if (err != ESP_OK) {
+    if (err != ESP_OK && weread_auth_is_authenticated()) {
         err = weread_toc_sync(uri + 9);
         if (err == ESP_OK) err = weread_toc_load(uri + 9, &toc);
     }
@@ -517,7 +520,7 @@ static esp_err_t detached_manifest(const char *id,uint32_t uid,uint32_t version,
 esp_err_t book_weread_map_detached(const char *id,uint32_t uid,uint32_t version,bool text_source,
     uint32_t input,uint32_t *output) { WR_GUARD;
     if (!wr_valid_id(id) || !uid || !output) return ESP_ERR_INVALID_ARG;
-    if (!weread_auth_is_authenticated()) return ESP_ERR_INVALID_STATE;
+    if (!weread_auth_is_authenticated() && !weread_auth_is_expired()) return ESP_ERR_INVALID_STATE;
     struct { char root[512],resources[512]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
     if (!paths) return ESP_ERR_NO_MEM;
     cJSON *manifest = NULL;

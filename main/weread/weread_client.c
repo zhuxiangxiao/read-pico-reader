@@ -54,16 +54,17 @@ void weread_client_set_radio_awake(bool awake) {
 void weread_client_set_radio_awake(bool awake) { (void)awake; }
 #endif
 
-#if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
-#include <sys/socket.h>
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #else
 #include <pthread.h>
 #endif
+
+#if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
+#include <sys/socket.h>
 #endif
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
@@ -146,6 +147,43 @@ void weread_client_set_download_progress(weread_download_progress_fn fn, void *c
 }
 void weread_client_report_download_progress(uint64_t bytes, bool done) {
     if (s_download_progress) s_download_progress(bytes, done, s_download_progress_ctx);
+}
+
+static weread_client_activity_fn_t s_activity_cb;
+static void *s_activity_ctx;
+#if defined(ESP_PLATFORM)
+static portMUX_TYPE s_activity_lock = portMUX_INITIALIZER_UNLOCKED;
+#else
+static pthread_mutex_t s_activity_lock = PTHREAD_MUTEX_INITIALIZER;
+#endif
+void weread_client_set_activity_cb(weread_client_activity_fn_t cb, void *ctx) {
+#if defined(ESP_PLATFORM)
+    portENTER_CRITICAL(&s_activity_lock);
+    s_activity_cb = cb;
+    s_activity_ctx = ctx;
+    portEXIT_CRITICAL(&s_activity_lock);
+#else
+    pthread_mutex_lock(&s_activity_lock);
+    s_activity_cb = cb;
+    s_activity_ctx = ctx;
+    pthread_mutex_unlock(&s_activity_lock);
+#endif
+}
+static void client_notify_activity(void) {
+    weread_client_activity_fn_t cb;
+    void *ctx;
+#if defined(ESP_PLATFORM)
+    portENTER_CRITICAL(&s_activity_lock);
+    cb = s_activity_cb;
+    ctx = s_activity_ctx;
+    portEXIT_CRITICAL(&s_activity_lock);
+#else
+    pthread_mutex_lock(&s_activity_lock);
+    cb = s_activity_cb;
+    ctx = s_activity_ctx;
+    pthread_mutex_unlock(&s_activity_lock);
+#endif
+    if (cb) cb(ctx);
 }
 
 esp_err_t weread_client_init(void) {
@@ -645,7 +683,12 @@ static esp_err_t weread_client_dispatch_raw(
     } }
     phase[1]=client_now_ms();
     if (s_transport) {
-        return s_transport(url, method, headers, body, out_resp, out_len, out_status, s_transport_user_ctx);
+        int local_status = 0;
+        if (out_status) *out_status = 0;
+        int *status_ptr = out_status ? out_status : &local_status;
+        esp_err_t err = s_transport(url, method, headers, body, out_resp, out_len, status_ptr, s_transport_user_ctx);
+        if (err == ESP_OK || *status_ptr > 0) client_notify_activity();
+        return err;
     }
 
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
@@ -711,14 +754,19 @@ static esp_err_t weread_client_dispatch_raw(
         if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
         http_active(poll?NULL:client);
         err = weread_client_cancelled() ? ESP_ERR_INVALID_STATE : http_poll_open(client, (int)body_len,poll);
+        if (err == ESP_OK && !reused) client_notify_activity();
         phase[3]=client_now_ms();
         size_t sent = 0;
         while (err == ESP_OK && sent < body_len) {
             int n = http_poll_write(client, body + sent, (int)(body_len - sent),poll);
             if (n <= 0) { err = http_poll_error(poll,ESP_FAIL); break; }
             sent += (size_t)n;
+            client_notify_activity();
         }
-        if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+        if (err == ESP_OK) {
+            if (http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+            else client_notify_activity();
+        }
         phase[4]=client_now_ms();
 #if defined(ESP_PLATFORM)
         if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !weread_client_cancelled()) {
@@ -733,6 +781,7 @@ static esp_err_t weread_client_dispatch_raw(
     char *buffer = err == ESP_OK ? wr_alloc(capacity + 1) : NULL;
     if (err == ESP_OK && !buffer) err = ESP_ERR_NO_MEM;
     if (err == ESP_OK && esp_http_client_get_content_length(client) > (int64_t)limit) err = ESP_ERR_INVALID_SIZE;
+    unsigned body_chunks = 0;
     while (err == ESP_OK) {
         if (weread_client_cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
         char chunk[2048];
@@ -751,8 +800,10 @@ static esp_err_t weread_client_dispatch_raw(
             buffer = larger; capacity = next;
         }
         memcpy(buffer + used, chunk, (size_t)n); used += (size_t)n;
+        if (!(body_chunks++ & 7u)) client_notify_activity();
     }
     if (err == ESP_OK) {
+        client_notify_activity();
         buffer[used] = 0;
         if (out_resp && capacity > used + 4096u) {
             char *shrunk = wr_realloc(buffer, used + 1);
@@ -925,7 +976,7 @@ static esp_err_t weread_client_request_internal(
                 if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED && renew_err == ESP_ERR_INVALID_STATE) {
                     {
                         WR_GUARD;
-                        weread_auth_clear_session();
+                        (void)weread_auth_mark_expired();
                     }
 #if defined(ESP_PLATFORM)
                     http_pool_close();
@@ -936,11 +987,11 @@ static esp_err_t weread_client_request_internal(
                 return renew_err;
             }
         } else {
-            // Already replayed once and still expired -> abort loop, clear session
+            // Already replayed once and still expired -> abort loop, mark expired
             if (!s_background && session_code == WEREAD_AUTH_ERRCODE_EXPIRED) {
                 {
                     WR_GUARD;
-                    weread_auth_clear_session();
+                    (void)weread_auth_mark_expired();
                 }
 #if defined(ESP_PLATFORM)
                 http_pool_close();
@@ -982,14 +1033,14 @@ esp_err_t weread_client_request(
 typedef struct { char headers[4096];weread_client_identity_t identity; } request_snapshot_t;
 static bool identity_matches(const weread_client_identity_t *identity) {
     const weread_auth_session_t *session=weread_auth_get_current_session();
-    return session&&!strcmp(identity->root,weread_auth_get_storage_root())&&!strcmp(identity->vid,session->vid)&&
+    return weread_auth_is_authenticated()&&session&&!strcmp(identity->root,weread_auth_get_storage_root())&&!strcmp(identity->vid,session->vid)&&
         !strcmp(identity->token,session->access_token)&&!strcmp(identity->refresh,session->refresh_token)&&!strcmp(identity->device,session->device_id);
 }
 bool weread_client_identity_get(weread_client_identity_t *out) { WR_GUARD;
     if(!out)return false;
     memset(out,0,sizeof(*out));
     const weread_auth_session_t *s=weread_auth_get_current_session();
-    return s&&wr_copy(out->root,sizeof(out->root),weread_auth_get_storage_root())&&wr_copy(out->vid,sizeof(out->vid),s->vid)&&
+    return weread_auth_is_authenticated()&&s&&wr_copy(out->root,sizeof(out->root),weread_auth_get_storage_root())&&wr_copy(out->vid,sizeof(out->vid),s->vid)&&
         wr_copy(out->token,sizeof(out->token),s->access_token)&&wr_copy(out->refresh,sizeof(out->refresh),s->refresh_token)&&
         wr_copy(out->device,sizeof(out->device),s->device_id);
 }
@@ -1019,25 +1070,57 @@ static esp_err_t request_captured(const char *url, const char *method,
         // 网络只使用拥有的凭据；本地读取和保存不等待后台HTTP。/ Transport owns its credentials so local reads/saves do not wait for background HTTP.
         err = weread_client_dispatch_raw(url, method, snapshot->headers, body, &response, &bytes, &status, true);
         int session_code = err == ESP_OK ? classify_session_code(response, bytes) : 0;
-        if (!attempt && allow_timeout_renew && err == ESP_OK && !weread_client_cancelled() &&
-            !is_weblogin && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT) {
+        bool fg_bound = !s_background && expected != NULL;
+        bool renew_timeout = allow_timeout_renew && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT;
+        bool renew_fg_auth = fg_bound && (session_code == WEREAD_AUTH_ERRCODE_EXPIRED ||
+            (allow_timeout_renew && status == 401));
+        if (err == ESP_OK && !weread_client_cancelled() && !is_weblogin &&
+            (renew_timeout || renew_fg_auth)) {
             {
                 WR_GUARD;
                 if (!identity_matches(&snapshot->identity)) { free(response); return ESP_ERR_INVALID_STATE; }
             }
-            esp_err_t renew_err = weread_auth_renew_session(NULL);
-            if (renew_err != ESP_OK) { free(response); return renew_err; }
-            {
-                WR_GUARD;
-                const weread_auth_session_t *live = weread_auth_get_current_session();
-                if (!live || strcmp(snapshot->identity.root, weread_auth_get_storage_root()) ||
-                    strcmp(snapshot->identity.vid, live->vid) || strcmp(snapshot->identity.device, live->device_id) ||
-                    !weread_client_identity_get(&snapshot->identity)) {
-                    free(response); return ESP_ERR_INVALID_STATE;
+            if (!attempt) {
+                esp_err_t renew_err = weread_auth_renew_session(NULL);
+                if (renew_err != ESP_OK) {
+                    if (fg_bound && session_code == WEREAD_AUTH_ERRCODE_EXPIRED &&
+                        renew_err == ESP_ERR_INVALID_STATE) {
+                        {
+                            WR_GUARD;
+                            (void)weread_auth_mark_expired();
+                        }
+#if defined(ESP_PLATFORM)
+                        http_pool_close();
+#endif
+                    }
+                    free(response);
+                    return renew_err;
                 }
-                if (expected) *expected = snapshot->identity;
+                {
+                    WR_GUARD;
+                    const weread_auth_session_t *live = weread_auth_get_current_session();
+                    if (!live || strcmp(snapshot->identity.root, weread_auth_get_storage_root()) ||
+                        strcmp(snapshot->identity.vid, live->vid) || strcmp(snapshot->identity.device, live->device_id) ||
+                        !weread_client_identity_get(&snapshot->identity)) {
+                        free(response); return ESP_ERR_INVALID_STATE;
+                    }
+                    if (expected) *expected = snapshot->identity;
+                }
+                continue;
             }
-            continue;
+            if (fg_bound) {
+                if (session_code == WEREAD_AUTH_ERRCODE_EXPIRED) {
+                    {
+                        WR_GUARD;
+                        (void)weread_auth_mark_expired();
+                    }
+#if defined(ESP_PLATFORM)
+                    http_pool_close();
+#endif
+                }
+                free(response);
+                return ESP_FAIL;
+            }
         }
         break;
     }
@@ -1132,7 +1215,11 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         if(poll)esp_http_client_set_header(client,"Host",http_poll_host(poll));
         http_active(poll?NULL:client);
         err = cancel && cancel(ctx) ? ESP_ERR_INVALID_STATE : http_poll_open(client,0,poll);
-        if (err == ESP_OK && http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+        if (err == ESP_OK && !reused) client_notify_activity();
+        if (err == ESP_OK) {
+            if (http_poll_headers(client,poll) < 0) err = http_poll_error(poll,ESP_FAIL);
+            else client_notify_activity();
+        }
 #if defined(ESP_PLATFORM)
         if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !(cancel && cancel(ctx))) {
             http_cleanup(client); client = NULL; reused = false; continue;
@@ -1163,8 +1250,12 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
         if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { err = ESP_FAIL; break; }
         info->bytes += (size_t)n;
         // 每4块（32KiB）推进一次跨线程进度，节流避免逐块同步。/ Advance cross-thread progress every4 chunks (32KiB), keeping per-chunk sync cheap.
-        if (!(++chunks & 3u)) weread_client_report_download_progress(info->bytes, false);
+        if (!(++chunks & 3u)) {
+            weread_client_report_download_progress(info->bytes, false);
+            client_notify_activity();
+        }
     }
+    if (err == ESP_OK) client_notify_activity();
 #if defined(ESP_PLATFORM)
     if (err != ESP_OK) {
         int tls=0,flags=0;(void)esp_http_client_get_and_clear_last_tls_error(client,&tls,&flags);
@@ -1197,7 +1288,10 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         if (!headers || !hdr_ok) return ESP_ERR_NO_MEM;
         char *next __attribute__((cleanup(wr_release))) = NULL;
         esp_err_t err;
-        if (s_download_transport) err = s_download_transport(current, headers, file, limit, cancel, ctx, info, s_download_ctx);
+        if (s_download_transport) {
+            err = s_download_transport(current, headers, file, limit, cancel, ctx, info, s_download_ctx);
+            if (err == ESP_OK || info->status > 0 || info->bytes > 0) client_notify_activity();
+        }
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
         else err = download_raw(current, headers, file, limit, cancel, ctx, info, &next);
 #else
@@ -1232,7 +1326,7 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         if (s_background && code != WEREAD_AUTH_ERRCODE_TIMEOUT) return ESP_ERR_INVALID_RESPONSE;
         if (attempt || (cancel && cancel(ctx))) {
             if (attempt && code == -2013 && !s_background) {
-                { WR_GUARD; weread_auth_clear_session(); }
+                { WR_GUARD; (void)weread_auth_mark_expired(); }
 #if defined(ESP_PLATFORM)
                 http_pool_close();
 #endif
@@ -1240,7 +1334,14 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             return ESP_FAIL;
         }
         err = weread_auth_renew_session(NULL);
-        if (err != ESP_OK) return err;
+        if (err != ESP_OK) {
+            if (code == WEREAD_AUTH_ERRCODE_EXPIRED && !s_background && err == ESP_ERR_INVALID_STATE) {
+#if defined(ESP_PLATFORM)
+                http_pool_close();
+#endif
+            }
+            return err;
+        }
         if (ftruncate(fileno(file), 0) || fseek(file, 0, SEEK_SET)) return ESP_FAIL;
         ++attempt;
     }

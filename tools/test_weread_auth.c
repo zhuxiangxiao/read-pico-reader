@@ -13,6 +13,7 @@
 #include "weread_types.h"
 #include "weread_auth.h"
 #include "weread_client.h"
+#include "weread_store.h"
 
 #define MAX_MOCK_RULES 32
 #define MOCK_BODY_CAP  4096
@@ -427,6 +428,8 @@ static void test_corrupted_auth_json_resilience(const char *temp_dir) {
         "{\"foo\": \"bar\"}",                               // Missing required fields
         "{\"vid\": 12345, \"accessToken\": true}",          // Type mismatches
         "{\"vid\": \"\", \"accessToken\": \"\"}",           // Empty strings
+        "{\"vid\": \"12345\", \"expired\": \"yes\"}",       // Non-boolean expired flag
+        "{\"vid\": \"\", \"expired\": true}",               // Expired true with empty vid
     };
 
     for (size_t i = 0; i < sizeof(corrupted_inputs)/sizeof(corrupted_inputs[0]); ++i) {
@@ -444,6 +447,7 @@ static void test_corrupted_auth_json_resilience(const char *temp_dir) {
         // Must fail gracefully without crash, segfault, or UB
         assert(err != ESP_OK);
         assert(!weread_auth_is_authenticated());
+        assert(!weread_auth_is_expired());
     }
 
     unlink(auth_path);
@@ -643,6 +647,167 @@ static void test_storage_failure_and_recovery(const char *dir) {
     puts("  -> Failed-write preservation, FAT recovery and complete logout passed.");
 }
 
+static int s_activity_hits = 0;
+static bool s_activity_clear_self = false;
+static void auth_test_activity_cb(void *ctx) {
+    int *hits = ctx;
+    WR_GUARD;
+    (*hits)++;
+    if (s_activity_clear_self) {
+        weread_client_set_activity_cb(NULL, NULL);
+    }
+}
+static esp_err_t offline_network_cb(void *ctx) {
+    (void)ctx;
+    return ESP_ERR_INVALID_STATE;
+}
+static bool preconnect_cancel_cb(void *ctx) {
+    (void)ctx;
+    return true;
+}
+static esp_err_t mock_dl_cb(const char *url, const char *headers, FILE *file, size_t limit,
+    weread_cancel_fn cancel, void *cancel_ctx, weread_download_info_t *info, void *ctx) {
+    (void)url; (void)headers; (void)limit; (void)cancel; (void)cancel_ctx; (void)ctx;
+    const char *payload = "OK_DL_BYTES";
+    info->status = 200;
+    info->bytes = strlen(payload);
+    assert(fwrite(payload, 1, info->bytes, file) == info->bytes);
+    return ESP_OK;
+}
+
+static void test_expired_readonly_and_activity_cb(const char *dir) {
+    printf("[12/12] Testing WR-UX-01a expired read-only state and WR-UX-06a activity callback...\n");
+    char auth_path[512], prev_path[512];
+    snprintf(auth_path, sizeof(auth_path), "%s/auth.json", dir);
+    snprintf(prev_path, sizeof(prev_path), "%s/auth.json.previous", dir);
+
+    weread_auth_session_t sess = {0};
+    strcpy(sess.vid, "88776655");
+    strcpy(sess.access_token, "tok-active");
+    strcpy(sess.refresh_token, "ref-active");
+    strcpy(sess.device_id, "eink-dev-01");
+    strcpy(sess.device_name, "KiikoReader");
+    strcpy(sess.user_name, "ReaderOne");
+    sess.updated_at = 1700001234;
+    assert(weread_auth_save_session(&sess) == ESP_OK);
+    assert(weread_auth_load_session(&sess) == ESP_OK);
+    /* Simulate pre-existing FAT .previous copy with old tokens */
+    assert(wr_write_bytes(prev_path, "{\"accessToken\":\"stale\"}", 23) == ESP_OK);
+    assert(access(prev_path, F_OK) == 0);
+
+    mock_http_reset();
+    mock_http_add_rule("/shelf/sync", "GET", 200, "{\"errcode\":-2013}", ESP_OK);
+    mock_http_add_rule("/weblogin", "POST", 401, "{\"errcode\":-2013}", ESP_OK);
+    char *resp = NULL; size_t len = 0; int status = 0;
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) != ESP_OK);
+    free(resp);
+
+    assert(!weread_auth_is_authenticated());
+    assert(weread_auth_is_expired());
+    assert(weread_auth_owner_vid() && strcmp(weread_auth_owner_vid(), "88776655") == 0);
+    const weread_auth_session_t *ro = weread_auth_get_current_session();
+    assert(ro != NULL);
+    assert(strcmp(ro->vid, "88776655") == 0);
+    assert(strcmp(ro->device_id, "eink-dev-01") == 0);
+    assert(strcmp(ro->user_name, "ReaderOne") == 0);
+    assert(ro->access_token[0] == '\0' && ro->refresh_token[0] == '\0' && ro->skey[0] == '\0');
+    assert(access(auth_path, F_OK) == 0);
+    assert(access(prev_path, F_OK) != 0);
+
+    /* Verify auth.json content has expired:true and no tokens */
+    cJSON *disk = NULL;
+    assert(wr_read_json_primary(auth_path, &disk) == ESP_OK && disk != NULL);
+    assert(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(disk, "expired")));
+    assert(strcmp(wr_string(disk, "vid"), "88776655") == 0);
+    assert(!cJSON_GetObjectItemCaseSensitive(disk, "accessToken"));
+    assert(!cJSON_GetObjectItemCaseSensitive(disk, "refreshToken"));
+    assert(!cJSON_GetObjectItemCaseSensitive(disk, "skey"));
+    cJSON_Delete(disk);
+
+    /* Owner matching succeeds while network identity capture rejects */
+    weread_client_identity_t cid;
+    assert(!weread_client_identity_get(&cid));
+    cJSON *owned = cJSON_CreateObject();
+    assert(wr_set_owner(owned));
+    assert(wr_owner_matches(owned));
+    cJSON_Delete(owned);
+
+    /* Reboot simulation: weread_auth_init loads expired read-only state; load_session returns INVALID_STATE */
+    weread_auth_forget_session();
+    assert(!weread_auth_is_expired() && !weread_auth_owner_vid() && !weread_auth_get_current_session());
+    assert(weread_auth_init(dir) == ESP_OK);
+    assert(!weread_auth_is_authenticated());
+    assert(weread_auth_is_expired());
+    assert(weread_auth_owner_vid() && strcmp(weread_auth_owner_vid(), "88776655") == 0);
+    assert(weread_auth_get_current_session() != NULL);
+    weread_auth_session_t out_load;
+    assert(weread_auth_load_session(&out_load) == ESP_ERR_INVALID_STATE);
+    assert(out_load.vid[0] == '\0' && out_load.access_token[0] == '\0');
+    assert(weread_auth_is_expired());
+
+    /* Re-login via exchange_code clears expired flag */
+    mock_http_reset();
+    mock_http_add_rule("/weblogin", "POST", 200,
+        "{\"vid\":\"88776655\",\"accessToken\":\"relogin-tok\",\"refreshToken\":\"relogin-ref\"}", ESP_OK);
+    assert(weread_auth_exchange_code("RELOGIN_CODE", &out_load) == ESP_OK);
+    assert(weread_auth_is_authenticated() && !weread_auth_is_expired());
+
+    /* Explicit logout wipes everything including expired state */
+    mock_http_reset();
+    mock_http_add_rule("/shelf/sync", "GET", 200, "{\"errcode\":-2013}", ESP_OK);
+    mock_http_add_rule("/weblogin", "POST", 401, "{\"errcode\":-2013}", ESP_OK);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) != ESP_OK);
+    free(resp);
+    assert(weread_auth_is_expired());
+    assert(weread_auth_clear_session() == ESP_OK);
+    assert(!weread_auth_is_authenticated() && !weread_auth_is_expired());
+    assert(weread_auth_owner_vid() == NULL && weread_auth_get_current_session() == NULL);
+    assert(access(auth_path, F_OK) != 0);
+
+    /* WR-UX-06a: activity callback fires on real HTTP & download, never on offline/cancel */
+    s_activity_hits = 0;
+    s_activity_clear_self = false;
+    weread_client_set_activity_cb(auth_test_activity_cb, &s_activity_hits);
+
+    weread_client_set_network(offline_network_cb, NULL);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) != ESP_OK);
+    assert(s_activity_hits == 0);
+
+    weread_client_set_network(NULL, NULL);
+    weread_client_set_cancel(preconnect_cancel_cb, NULL);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) == ESP_ERR_INVALID_STATE);
+    assert(s_activity_hits == 0);
+    weread_client_set_cancel(NULL, NULL);
+
+    mock_http_reset();
+    mock_http_add_rule("/shelf/sync", "GET", 0, NULL, ESP_ERR_TIMEOUT);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) == ESP_ERR_TIMEOUT);
+    assert(s_activity_hits == 0);
+
+    mock_http_reset();
+    mock_http_add_rule("/shelf/sync", "GET", 200, "{\"synckey\":1}", ESP_OK);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) == ESP_OK);
+    free(resp);
+    assert(s_activity_hits == 1);
+
+    weread_client_set_download_transport(mock_dl_cb, NULL);
+    FILE *dlf = tmpfile(); assert(dlf);
+    weread_download_info_t dinfo = {0};
+    s_activity_clear_self = true;
+    assert(weread_client_download("https://res.weread.qq.com/cover.png", dlf, 4096, NULL, NULL, &dinfo) == ESP_OK);
+    assert(s_activity_hits == 2);
+    /* Self-cleared inside callback -> next request should not increment */
+    mock_http_reset();
+    mock_http_add_rule("/shelf/sync", "GET", 200, "{\"synckey\":2}", ESP_OK);
+    assert(weread_client_request("https://i.weread.qq.com/shelf/sync", "GET", NULL, NULL, &resp, &len, &status) == ESP_OK);
+    free(resp);
+    assert(s_activity_hits == 2);
+    fclose(dlf);
+    weread_client_set_download_transport(NULL, NULL);
+    weread_client_set_activity_cb(NULL, NULL);
+    printf("  -> WR-UX-01a expired read-only & WR-UX-06a activity callback tests passed.\n");
+}
+
 int main(void) {
     printf("========================================================\n");
     printf(" Running WeRead Milestone 2 Auth & Security Client Tests\n");
@@ -667,6 +832,7 @@ int main(void) {
     test_http401_session_classification();
     test_transient_and_untrusted_errors();
     test_storage_failure_and_recovery(temp_dir);
+    test_expired_readonly_and_activity_cb(temp_dir);
 
     // Clean up temporary test files
     char path_buf[512];

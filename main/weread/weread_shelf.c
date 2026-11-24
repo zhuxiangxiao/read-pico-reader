@@ -19,6 +19,10 @@
 #include <strings.h>
 #include <time.h>
 
+_Static_assert(sizeof(weread_shelf_item_t) < 512, "weread_shelf_item_t budget");
+
+static uint16_t clamp_u16(uint64_t v) { return v > UINT16_MAX ? UINT16_MAX : (uint16_t)v; }
+
 static cJSON *s_shelf;
 static uint64_t s_checked_at,s_checked_key;
 static size_t id_slot(const char **seen,const char *id);
@@ -44,6 +48,7 @@ static bool readable(const cJSON *v) {
     const char *f = wr_string(v, "format");
     return !f || !*f || !strcasecmp(f, "epub") || !strcasecmp(f, "txt");
 }
+static uint64_t number(const cJSON *o, const char *key);
 static esp_err_t merge_book(cJSON *array, const cJSON *v) {
     const char *id = item_id(v);
     if (!cJSON_IsObject(v) || !wr_valid_id(id)) return ESP_ERR_INVALID_RESPONSE;
@@ -56,11 +61,17 @@ static esp_err_t merge_book(cJSON *array, const cJSON *v) {
         if (!cJSON_AddItemToArray(array, copy)) { cJSON_Delete(copy); return ESP_ERR_NO_MEM; }
         old=copy;
     }
+    bool version_changed = cJSON_GetObjectItemCaseSensitive(v, "bookVersion") &&
+        number(old, "bookVersion") != number(v, "bookVersion");
     // 缓存阅读实际使用的完整字段，避免复制简介等巨大冗余字段。/ Keep complete reader fields without duplicating large unused introductions.
     const char *fields[]={"bookId","title","author","cover","format","bookVersion","totalWords","readUpdateTime","updateTime","readingProgress"};
     for(unsigned i=0;i<sizeof(fields)/sizeof(*fields);++i){
         cJSON *field=cJSON_GetObjectItemCaseSensitive(v,fields[i]);
         if(field&&!wr_set_copy(old,fields[i],field))return ESP_ERR_NO_MEM;
+    }
+    if (version_changed) {
+        cJSON_DeleteItemFromObjectCaseSensitive(old, "cachedChapters");
+        cJSON_DeleteItemFromObjectCaseSensitive(old, "totalChapters");
     }
     return ESP_OK;
 }
@@ -297,6 +308,9 @@ esp_err_t weread_shelf_snapshot(weread_shelf_item_t **out,size_t *count){WR_GUAR
         item->read_update_time=number(book,"readUpdateTime");item->update_time=number(book,"updateTime");
         item->chapter_index=(uint32_t)number(cJSON_GetObjectItemCaseSensitive(book,"readingProgress"),"chapterIdx");
         item->cover_key=weread_cover_key(id,url);item->progress=(uint32_t)number(cJSON_GetObjectItemCaseSensitive(book,"readingProgress"),"progress");
+        item->cached_chapters=clamp_u16(number(book,"cachedChapters"));
+        item->total_chapters=clamp_u16(number(book,"totalChapters"));
+        if(item->total_chapters>0&&item->cached_chapters>item->total_chapters)item->cached_chapters=item->total_chapters;
     }
     *out=items;return ESP_OK;
 }
@@ -312,11 +326,47 @@ esp_err_t weread_shelf_set_version(const char *id,uint32_t version){WR_GUARD;
     if(!version||number(book,"bookVersion")==version)return ESP_OK;
     cJSON *value=cJSON_CreateNumber(version);if(!value)return ESP_ERR_NO_MEM;
     cJSON *old=cJSON_DetachItemFromObjectCaseSensitive(book,"bookVersion");
+    cJSON *old_c=cJSON_DetachItemFromObjectCaseSensitive(book,"cachedChapters");
+    cJSON *old_t=cJSON_DetachItemFromObjectCaseSensitive(book,"totalChapters");
     cJSON_AddItemToObjectCS(book,"bookVersion",value);
     esp_err_t err=persist(s_shelf);
     // 持续OOM时恢复旧节点也不能分配key。/ Restoring the old node must not allocate a key during persistent OOM.
-    if(err!=ESP_OK){cJSON_DeleteItemFromObject(book,"bookVersion");if(old)cJSON_AddItemToObjectCS(book,"bookVersion",old);}
-    else cJSON_Delete(old);
+    if(err!=ESP_OK){
+        cJSON_DeleteItemFromObject(book,"bookVersion");
+        if(old)cJSON_AddItemToObjectCS(book,"bookVersion",old);
+        if(old_c)cJSON_AddItemToObjectCS(book,"cachedChapters",old_c);
+        if(old_t)cJSON_AddItemToObjectCS(book,"totalChapters",old_t);
+    }else{cJSON_Delete(old);cJSON_Delete(old_c);cJSON_Delete(old_t);}
+    return err;
+}
+esp_err_t weread_shelf_set_chapter_counts(const char *book_id, uint16_t cached, uint16_t total) { WR_GUARD;
+    if (!wr_valid_id(book_id)) return ESP_ERR_INVALID_ARG;
+    if (!wr_owner_matches(s_shelf)) return ESP_ERR_INVALID_STATE;
+    cJSON *book = find(books(s_shelf), book_id);
+    if (!book) return ESP_ERR_NOT_FOUND;
+    if (total > 0 && cached > total) cached = total;
+    if (number(book, "cachedChapters") == cached && number(book, "totalChapters") == total) return ESP_OK;
+    cJSON *nc = cJSON_CreateNumber(cached);
+    cJSON *nt = cJSON_CreateNumber(total);
+    if (!nc || !nt) {
+        cJSON_Delete(nc);
+        cJSON_Delete(nt);
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON *old_c = cJSON_DetachItemFromObjectCaseSensitive(book, "cachedChapters");
+    cJSON *old_t = cJSON_DetachItemFromObjectCaseSensitive(book, "totalChapters");
+    cJSON_AddItemToObjectCS(book, "cachedChapters", nc);
+    cJSON_AddItemToObjectCS(book, "totalChapters", nt);
+    esp_err_t err = persist(s_shelf);
+    if (err != ESP_OK) {
+        cJSON_DeleteItemFromObjectCaseSensitive(book, "cachedChapters");
+        cJSON_DeleteItemFromObjectCaseSensitive(book, "totalChapters");
+        if (old_c) cJSON_AddItemToObjectCS(book, "cachedChapters", old_c);
+        if (old_t) cJSON_AddItemToObjectCS(book, "totalChapters", old_t);
+    } else {
+        cJSON_Delete(old_c);
+        cJSON_Delete(old_t);
+    }
     return err;
 }
 esp_err_t weread_shelf_save(void) { WR_GUARD;
@@ -559,6 +609,7 @@ esp_err_t weread_shelf_refresh_book(const char *id){ WR_MEMORY_SCOPE;
     {
         WR_GUARD;
         if(!wr_valid_id(id)||!wr_owner_matches(s_shelf))return ESP_ERR_INVALID_ARG;
+        if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
         req=cJSON_CreateObject();ids=cJSON_AddArrayToObject(req,"bookIds");
         if(!req||!ids||!cJSON_AddItemToArray(ids,cJSON_CreateString(id))||!cJSON_AddArrayToObject(req,"albumIds")){
             cJSON_Delete(req);return ESP_ERR_NO_MEM;

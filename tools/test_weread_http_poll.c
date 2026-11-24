@@ -19,6 +19,8 @@ esp_err_t actual_open(esp_http_client_handle_t,int);
 int actual_write(esp_http_client_handle_t,const char *,int);
 static atomic_bool cancel_flag;
 static atomic_uint reached;
+static atomic_uint activity_calls;
+static void on_activity(void *ctx){(void)ctx;atomic_fetch_add(&activity_calls,1);}
 static unsigned mode,opens,writes,reads,configured;
 static unsigned header_polls;
 static int (*event_handler)(esp_http_client_event_t*);
@@ -135,25 +137,30 @@ int main(int argc,char **argv){
     weread_auth_session_t session={0};strcpy(session.vid,"123");strcpy(session.access_token,"fixture-token");strcpy(session.refresh_token,"fixture-refresh");
     assert(weread_auth_save_session(&session)==ESP_OK&&weread_auth_load_session(&session)==ESP_OK);
     weread_client_set_cancel(cancelled,NULL);weread_client_set_timeout_budget(budget,NULL);weread_client_set_background(mode<21);weread_client_set_polling(true);
+    weread_client_set_activity_cb(on_activity,NULL);
     if(mode==8){
         const char *bad[]={"https://qq.com/a\r\nX: y","https://qq.com/a b","https://qq.com/a\\b","https://qq.com/\tbad"};
         for(unsigned i=0;i<sizeof(bad)/sizeof(*bad);++i){FILE*f=tmpfile();weread_download_info_t info={0};assert(weread_client_download(bad[i],f,64,cancelled,NULL,&info)==ESP_ERR_INVALID_ARG);fclose(f);}
-        assert(!configured);puts("invalid raw URL rejected before DNS/HTTP");return 0;
+        assert(!configured&&!atomic_load(&activity_calls));puts("invalid raw URL rejected before DNS/HTTP");return 0;
     }
     uint64_t started=millis();pthread_t worker;assert(!pthread_create(&worker,NULL,run,NULL));
     if((mode>=1&&mode<=4)||mode==18){while(atomic_load(&reached)!=mode){assert(millis()-started<2000);usleep(1000);}started=millis();atomic_store(&cancel_flag,true);weread_client_abort_active();}
     assert(!pthread_join(worker,NULL));uint64_t elapsed=millis()-started;
-    if((mode>=1&&mode<=4)||mode==18)assert(result==ESP_ERR_INVALID_STATE&&!response&&elapsed<100);
-    else if(mode==21)assert(result==ESP_OK&&response_status==200&&weread_auth_is_authenticated()&&!strcmp(weread_auth_get_current_session()->access_token,"fresh-token"));
-    else if(mode==22||mode==23)assert(result!=ESP_OK&&response_status==401&&!weread_auth_is_authenticated());
-    else if(mode==24)assert(result==ESP_OK&&weread_auth_is_authenticated()&&elapsed>=16000);
-    else if(mode==7)assert(result==ESP_OK&&response_status==401&&response&&strstr(response,"-2013")&&weread_auth_is_authenticated());
-    else if(mode==9)assert(result==ESP_ERR_NO_MEM&&!configured&&!response);
-    else if(mode==10)assert(result==ESP_ERR_TIMEOUT&&!response&&elapsed>=75&&elapsed<300);
-    else if(mode==11)assert(result==ESP_FAIL&&!response);
+    if((mode>=1&&mode<=4)||mode==18){
+        assert(result==ESP_ERR_INVALID_STATE&&!response&&elapsed<100);
+        if(mode==1||mode==2)assert(atomic_load(&activity_calls)==0);
+    }
+    else if(mode==21)assert(result==ESP_OK&&response_status==200&&weread_auth_is_authenticated()&&!strcmp(weread_auth_get_current_session()->access_token,"fresh-token")&&atomic_load(&activity_calls)>0);
+    else if(mode==22||mode==23)assert(result!=ESP_OK&&response_status==401&&!weread_auth_is_authenticated()&&weread_auth_is_expired()&&weread_auth_owner_vid()&&!strcmp(weread_auth_owner_vid(),"123"));
+    else if(mode==24)assert(result==ESP_OK&&weread_auth_is_authenticated()&&elapsed>=16000&&atomic_load(&activity_calls)>0);
+    else if(mode==7)assert(result==ESP_OK&&response_status==401&&response&&strstr(response,"-2013")&&weread_auth_is_authenticated()&&!weread_auth_is_expired());
+    else if(mode==9)assert(result==ESP_ERR_NO_MEM&&!configured&&!response&&atomic_load(&activity_calls)==0);
+    else if(mode==10)assert(result==ESP_ERR_TIMEOUT&&!response&&elapsed>=75&&elapsed<300&&atomic_load(&activity_calls)==0);
+    else if(mode==11)assert(result==ESP_FAIL&&!response&&atomic_load(&activity_calls)==0);
     else if(mode==14||mode==15)assert(result==ESP_ERR_TIMEOUT&&!response&&elapsed<300);
-    else if(mode==20)assert(result==ESP_FAIL&&!response&&opens==4);
-    else if(mode!=5&&mode!=6&&mode!=16)assert(result==ESP_OK&&response_status==200&&response&&strstr(response,"true"));
+    else if(mode==20)assert(result==ESP_FAIL&&!response&&opens==4&&atomic_load(&activity_calls)==0);
+    else if(mode!=5&&mode!=6&&mode!=16)assert(result==ESP_OK&&response_status==200&&response&&strstr(response,"true")&&atomic_load(&activity_calls)>0);
+    if(mode==5||mode==16)assert(atomic_load(&activity_calls)>0);
     if(mode==12)assert(elapsed>=250);
     if(mode==13||mode==16)assert(elapsed>20);
     if(mode==17)assert(header_polls>=4);

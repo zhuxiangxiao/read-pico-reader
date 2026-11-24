@@ -15,10 +15,18 @@ static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static bool entered, released;
 static atomic_bool cancelled;
 static int response_status, result;
+static int mode10_http_status;
+static bool mode10_weblogin_ok, mode10_replay_ok;
 static char *response;
 static size_t response_bytes;
 static int status;
 static unsigned requests;
+static atomic_uint activity_calls;
+static void on_activity(void *ctx) {
+    (void)ctx;
+    WR_GUARD;
+    atomic_fetch_add(&activity_calls, 1);
+}
 static bool cancel_query(void *ctx) { (void)ctx; return atomic_load(&cancelled); }
 static uint64_t milliseconds(void) {
     struct timespec now; assert(!clock_gettime(CLOCK_MONOTONIC, &now));
@@ -28,6 +36,27 @@ static esp_err_t transport(const char *url, const char *method, const char *head
     const char *body, char **out, size_t *bytes, int *http_status, void *ctx) {
     (void)body; (void)ctx;
     ++requests;
+    if (response_status == 2013) {
+        if (strstr(url, "/weblogin")) {
+            if (mode10_weblogin_ok) {
+                *http_status = 200;
+                *out = strdup("{\"accessToken\":\"fixture-renewed-token\",\"refreshToken\":\"fixture-renewed-refresh\"}");
+            } else {
+                *http_status = 401;
+                *out = strdup("{\"errcode\":-2013}");
+            }
+            assert(*out); *bytes = strlen(*out); return ESP_OK;
+        }
+        assert(strstr(url, "/book/read") && !strcmp(method, "POST"));
+        if (strstr(headers, "fixture-renewed-token") && mode10_replay_ok) {
+            *http_status = 200;
+            *out = strdup("{\"succ\":1}");
+        } else {
+            *http_status = mode10_http_status;
+            *out = strdup("{\"errcode\":-2013}");
+        }
+        assert(*out); *bytes = strlen(*out); return ESP_OK;
+    }
     if (response_status == 2012) {
         if (strstr(url, "/weblogin")) {
             *http_status = 200;
@@ -84,6 +113,62 @@ int main(int argc, char **argv) {
     weread_auth_session_t original = session(), current;
     assert(weread_auth_save_session(&original) == ESP_OK && weread_auth_load_session(&current) == ESP_OK);
     weread_client_set_transport(transport, NULL); weread_client_set_cancel(cancel_query, NULL);
+    weread_client_set_activity_cb(on_activity, NULL);
+    if (mode == 10) {
+        response_status = 2013;
+        weread_client_identity_t bound;
+        // 10a: Background -2013 (200 & 401) must not renew or mark expired.
+        weread_client_set_background(true);
+        assert(weread_client_identity_get(&bound));
+        mode10_http_status = 200; requests = 0;
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_OK && status == 200 && requests == 1 && strstr(response, "-2013") &&
+               weread_auth_is_authenticated() && !weread_auth_is_expired() && !strcmp(bound.token, "fixture-old-token"));
+        free(response); response = NULL;
+        mode10_http_status = 401; requests = 0;
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_OK && status == 401 && requests == 1 && strstr(response, "-2013") &&
+               weread_auth_is_authenticated() && !weread_auth_is_expired() && !strcmp(bound.token, "fixture-old-token"));
+        free(response); response = NULL;
+        weread_client_set_background(false);
+        // 10b: Foreground 200 -2013 + /weblogin 401 -2013 marks expired with status == 0.
+        mode10_http_status = 200; mode10_weblogin_ok = false; mode10_replay_ok = false; requests = 0;
+        assert(weread_client_identity_get(&bound));
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_ERR_INVALID_STATE && status == 0 && !response && !response_bytes &&
+               requests == 2 && !weread_auth_is_authenticated() && weread_auth_is_expired() &&
+               !strcmp(weread_auth_owner_vid(), "123"));
+        // 10c: Foreground 401 -2013 + /weblogin 401 -2013 marks expired with status == 0.
+        assert(weread_auth_save_session(&original) == ESP_OK && weread_auth_load_session(&current) == ESP_OK);
+        mode10_http_status = 401; mode10_weblogin_ok = false; requests = 0;
+        assert(weread_client_identity_get(&bound));
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_ERR_INVALID_STATE && status == 0 && !response && !response_bytes &&
+               requests == 2 && !weread_auth_is_authenticated() && weread_auth_is_expired());
+        // 10d: Foreground 401 -2013 -> /weblogin 200 renew -> replay 200 ok.
+        assert(weread_auth_save_session(&original) == ESP_OK && weread_auth_load_session(&current) == ESP_OK);
+        mode10_http_status = 401; mode10_weblogin_ok = true; mode10_replay_ok = true; requests = 0;
+        assert(weread_client_identity_get(&bound));
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_OK && status == 200 && response && requests == 3 &&
+               !strcmp(bound.token, "fixture-renewed-token") && weread_auth_is_authenticated() && !weread_auth_is_expired());
+        free(response); response = NULL;
+        // 10e: Foreground 401 -2013 -> /weblogin 200 renew -> replay 401 -2013 marks expired with status == 0.
+        assert(weread_auth_save_session(&original) == ESP_OK && weread_auth_load_session(&current) == ESP_OK);
+        mode10_http_status = 401; mode10_weblogin_ok = true; mode10_replay_ok = false; requests = 0;
+        assert(weread_client_identity_get(&bound));
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        assert(result == ESP_FAIL && status == 0 && !response && !response_bytes &&
+               requests == 3 && !weread_auth_is_authenticated() && weread_auth_is_expired());
+        puts("mode10: foreground vs background -2013/401 bound-renew and expiry handling passed");
+        return 0;
+    }
     if (mode == 9) {
         response_status = 2012;
         weread_client_identity_t bound; assert(weread_client_identity_get(&bound));
@@ -102,7 +187,14 @@ int main(int argc, char **argv) {
             tmp, 4096, NULL, NULL, &dinfo);
         weread_client_set_background(false);
         assert(result == ESP_OK && dinfo.status == 200 && requests == 3);
+        assert(atomic_load(&activity_calls) >= 6);
         fclose(tmp);
+        assert(weread_auth_mark_expired() == ESP_OK);
+        assert(!weread_client_identity_get(&bound));
+        atomic_store(&activity_calls, 0);
+        assert(weread_client_request_snapshot("https://i.weread.qq.com/book/read", "POST",
+            NULL, "{}", &response, &response_bytes, &status) == ESP_ERR_INVALID_STATE);
+        assert(atomic_load(&activity_calls) == 0);
         puts("mode9: unified background -2012 HTTP 401 renewal passed for bound and download paths");
         return 0;
     }
@@ -114,7 +206,7 @@ int main(int argc, char **argv) {
             assert(weread_auth_save_session(&current)==ESP_OK&&weread_auth_load_session(&current)==ESP_OK);
         }
         result=weread_client_request_bound("https://i.weread.qq.com/book/read","POST",NULL,"{}",&response,&response_bytes,&status,&expected);
-        assert(result==ESP_ERR_INVALID_STATE&&!requests&&!response&&!response_bytes&&!status);
+        assert(result==ESP_ERR_INVALID_STATE&&!requests&&!response&&!response_bytes&&!status&&!atomic_load(&activity_calls));
         printf("bound mode%u: stale token/account/media identity rejected before any HTTP\n",mode);return 0;
     }
     response_status = mode == 1 ? 401 : 200;
@@ -142,6 +234,7 @@ int main(int argc, char **argv) {
     assert(!pthread_mutex_lock(&gate)); released = true; assert(!pthread_cond_broadcast(&changed));
     assert(!pthread_mutex_unlock(&gate)); assert(!pthread_join(thread, NULL));
     assert(requests == 1);
+    assert(atomic_load(&activity_calls) >= 1);
     if (mode >= 2) assert(result == ESP_ERR_INVALID_STATE && !response && !response_bytes && !status);
     else assert(result == ESP_OK && response && response_bytes && status == response_status);
     if (mode == 2 || mode == 3) {

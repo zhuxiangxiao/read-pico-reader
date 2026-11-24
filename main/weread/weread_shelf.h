@@ -19,6 +19,7 @@ typedef struct {
     uint32_t progress,chapter_index;
     uint64_t read_update_time,update_time;
     bool has_cover;
+    uint16_t cached_chapters,total_chapters;
 } weread_shelf_item_t;
 
 /// 同步成功并落盘后才替换内存；失败保留离线书架。/ Publish only after persistence; retain offline data on errors.
@@ -40,6 +41,9 @@ esp_err_t weread_shelf_snapshot(weread_shelf_item_t **out,size_t *count);
 bool weread_shelf_find(const char *book_id, weread_book_t *out);
 uint32_t weread_shelf_book_version(const char *id);
 esp_err_t weread_shelf_set_version(const char *id,uint32_t version);
+/// 更新已加载书架中单本书的本地缓存章节数与总章节数并原子落盘。
+/// Update local cached/total chapter counts for one book in the loaded shelf and persist atomically.
+esp_err_t weread_shelf_set_chapter_counts(const char *book_id, uint16_t cached, uint16_t total);
 uint64_t weread_shelf_synckey(void);
 bool weread_shelf_cache_fresh(uint64_t now_seconds);
 uint64_t weread_cover_key(const char *book_id,const char *raw_url);

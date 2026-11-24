@@ -33,6 +33,10 @@
 #if defined(ESP_PLATFORM)
 #include "esp_vfs_fat.h"
 #include "esp_timer.h"
+#include "read_pico_sd.h"
+#if defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+#include "read_pico_sd_access.h"
+#endif
 #else
 #include <sys/statvfs.h>
 #endif
@@ -176,22 +180,158 @@ static esp_err_t join(const char *dir, const char *leaf, char *out, size_t cap) 
     int n = snprintf(out, cap, "%s/%s", dir, leaf);
     return n >= 0 && (size_t)n < cap ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
-static void remove_tree(const char *path, unsigned depth) {
-    if(book_weread_directory_in_use(path))return;
-    if (depth > 32) return;
+static esp_err_t join_path(const char *dir, const char *leaf, char *out, size_t cap) {
+    if (!dir || !leaf || !out || !cap) return ESP_ERR_INVALID_ARG;
+    size_t dlen = strlen(dir);
+    size_t llen = strlen(leaf);
+    if (dlen >= cap || llen + 2 > cap - dlen) return ESP_ERR_INVALID_SIZE;
+    memcpy(out, dir, dlen);
+    out[dlen] = '/';
+    memcpy(out + dlen + 1, leaf, llen + 1);
+    return ESP_OK;
+}
+static char *wr_dup_str(const char *s) {
+    if (!s) return NULL;
+    size_t len = strlen(s);
+    char *p = wr_alloc(len + 1);
+    if (p) memcpy(p, s, len + 1);
+    return p;
+}
+#if defined(ESP_PLATFORM)
+static bool sd_path(const char *p) {
+    return p && !strncmp(p, "/sdcard", 7) && (!p[7] || p[7] == '/');
+}
+static bool sd_io_ready_for(const char *p) {
+    return !sd_path(p) || read_pico_sd_io_ready();
+}
+#else
+static bool sd_io_ready_for(const char *p) {
+    (void)p;
+    return true;
+}
+#endif
+typedef struct {
+    char *path;
+    uint16_t depth;
+    bool visited;
+} wr_dir_frame_t;
+static esp_err_t remove_tree_iterative(const char *root_path, uint64_t *freed_bytes,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (!root_path || !*root_path) return ESP_ERR_INVALID_ARG;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
     struct stat st;
-    if (lstat(path, &st)) return;
-    if (!S_ISDIR(st.st_mode)) { unlink(path); return; }
-    DIR *dir = opendir(path);
-    if (!dir) return;
-    char *child __attribute__((cleanup(wr_release)))=wr_alloc(1024);
-    if(!child){closedir(dir);return;}
-    struct dirent *entry;
-    while ((entry = readdir(dir))) {
-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-        if (join(path, entry->d_name, child, 1024) == ESP_OK) remove_tree(child, depth + 1);
+    if (lstat(root_path, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) {
+        if (book_weread_directory_in_use(root_path)) return ESP_ERR_INVALID_STATE;
+        if (unlink(root_path) == 0) {
+            if (freed_bytes && st.st_size > 0) *freed_bytes += (uint64_t)st.st_size;
+            return ESP_OK;
+        }
+        return errno == ENOENT ? ESP_OK : ESP_FAIL;
     }
-    closedir(dir); rmdir(path);
+    if (book_weread_directory_in_use(root_path)) return ESP_ERR_INVALID_STATE;
+    if (!sd_io_ready_for(root_path)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(root_path);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    char *child = wr_alloc(1024);
+    size_t stack_cap = 32, stack_top = 0;
+    wr_dir_frame_t *stack = wr_alloc(stack_cap * sizeof(*stack));
+    if (!child || !stack) {
+        free(child); free(stack);
+        return ESP_ERR_NO_MEM;
+    }
+    stack[0].path = wr_dup_str(root_path);
+    stack[0].depth = 0;
+    stack[0].visited = false;
+    if (!stack[0].path) {
+        free(child); free(stack);
+        return ESP_ERR_NO_MEM;
+    }
+    stack_top = 1;
+    bool had_skipped = false;
+    esp_err_t err = ESP_OK;
+    while (stack_top > 0) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        wr_dir_frame_t *top = &stack[stack_top - 1];
+        if (top->visited) {
+            char *dir_path = top->path;
+            --stack_top;
+            if (rmdir(dir_path) != 0 && errno != ENOENT) {
+                if (!had_skipped || (errno != ENOTEMPTY && errno != EEXIST)) err = ESP_FAIL;
+            }
+            free(dir_path);
+            continue;
+        }
+        if (book_weread_directory_in_use(top->path)) {
+            had_skipped = true;
+            free(top->path);
+            --stack_top;
+            continue;
+        }
+        top->visited = true;
+        uint16_t cur_depth = top->depth;
+        size_t parent_idx = stack_top - 1;
+        DIR *dir = opendir(top->path);
+        if (!dir) {
+            if (errno != ENOENT) err = ESP_FAIL;
+            free(top->path);
+            --stack_top;
+            continue;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            if (join_path(stack[parent_idx].path, entry->d_name, child, 1024) != ESP_OK) {
+                err = ESP_ERR_INVALID_SIZE;
+                continue;
+            }
+            struct stat cst;
+            if (lstat(child, &cst)) {
+                if (errno != ENOENT) err = ESP_FAIL;
+                continue;
+            }
+            if (!S_ISDIR(cst.st_mode)) {
+                if (unlink(child) == 0) {
+                    if (freed_bytes && cst.st_size > 0) *freed_bytes += (uint64_t)cst.st_size;
+                } else if (errno != ENOENT) {
+                    err = ESP_FAIL;
+                }
+            } else if (book_weread_directory_in_use(child)) {
+                had_skipped = true;
+            } else if (cur_depth >= 32) {
+                had_skipped = true;
+            } else {
+                if (stack_top == stack_cap) {
+                    if (stack_cap >= 4096) { err = ESP_ERR_INVALID_SIZE; break; }
+                    size_t next_cap = stack_cap * 2;
+                    wr_dir_frame_t *bigger = wr_realloc(stack, next_cap * sizeof(*stack));
+                    if (!bigger) { err = ESP_ERR_NO_MEM; break; }
+                    stack = bigger;
+                    stack_cap = next_cap;
+                }
+                char *sub = wr_dup_str(child);
+                if (!sub) { err = ESP_ERR_NO_MEM; break; }
+                stack[stack_top].path = sub;
+                stack[stack_top].depth = (uint16_t)(cur_depth + 1);
+                stack[stack_top].visited = false;
+                ++stack_top;
+            }
+        }
+        closedir(dir);
+        if (err != ESP_OK && err != ESP_FAIL) break;
+    }
+    while (stack_top > 0) free(stack[--stack_top].path);
+    free(stack);
+    free(child);
+    return err;
+}
+static void remove_tree(const char *path, unsigned depth) {
+    (void)depth;
+    (void)remove_tree_iterative(path, NULL, NULL, NULL);
 }
 static uint32_t version(const char *id) {
     uint32_t v = weread_shelf_book_version(id);
@@ -617,22 +757,41 @@ bool weread_chapter_cached(const char *id,uint32_t uid){WR_GUARD;
     }
     return false;
 }
-esp_err_t weread_chapter_prefetch_space(uint64_t *available){WR_GUARD;
-    if(available)*available=0;
-    uint64_t free_bytes=0;
+esp_err_t weread_chapter_storage_info(uint64_t *free_bytes, uint64_t *total_bytes){WR_GUARD;
+    if(free_bytes)*free_bytes=0;
+    if(total_bytes)*total_bytes=0;
+    const char *root=weread_auth_get_storage_root();
 #if defined(ESP_PLATFORM)
-    const char *root=weread_auth_get_storage_root(),*end=strchr(root+1,'/');
+    if(!root||root[0]!='/')return ESP_ERR_INVALID_ARG;
+    if(!sd_io_ready_for(root))return ESP_ERR_INVALID_STATE;
+    const char *end=strchr(root+1,'/');
     char mount[32];size_t n=end?(size_t)(end-root):strlen(root);
     if(!n||n>=sizeof(mount))return ESP_ERR_INVALID_ARG;
     memcpy(mount,root,n);mount[n]=0;
-    uint64_t total=0;esp_err_t err=esp_vfs_fat_info(mount,&total,&free_bytes);
+    uint64_t total=0,avail=0;esp_err_t err=esp_vfs_fat_info(mount,&total,&avail);
     if(err!=ESP_OK)return err;
+    if(free_bytes)*free_bytes=avail;
+    if(total_bytes)*total_bytes=total;
+    return ESP_OK;
 #else
-    struct statvfs info;
-    if(statvfs(weread_auth_get_storage_root(),&info))return ESP_FAIL;
-    if(info.f_frsize&&info.f_bavail>UINT64_MAX/info.f_frsize)free_bytes=UINT64_MAX;
-    else free_bytes=(uint64_t)info.f_bavail*info.f_frsize;
+    if(!root||!*root)return ESP_ERR_INVALID_ARG;
+    struct statvfs info;memset(&info,0,sizeof(info));
+    if(statvfs(root,&info))return ESP_FAIL;
+    uint64_t avail=0,total=0;
+    if(info.f_frsize&&info.f_bavail>UINT64_MAX/info.f_frsize)avail=UINT64_MAX;
+    else avail=(uint64_t)info.f_bavail*info.f_frsize;
+    if(info.f_frsize&&info.f_blocks>UINT64_MAX/info.f_frsize)total=UINT64_MAX;
+    else total=(uint64_t)info.f_blocks*info.f_frsize;
+    if(free_bytes)*free_bytes=avail;
+    if(total_bytes)*total_bytes=total;
+    return ESP_OK;
 #endif
+}
+esp_err_t weread_chapter_prefetch_space(uint64_t *available){WR_GUARD;
+    if(available)*available=0;
+    uint64_t free_bytes=0;
+    esp_err_t err=weread_chapter_storage_info(&free_bytes,NULL);
+    if(err!=ESP_OK)return err;
     if(available)*available=free_bytes;
     // 32MiB归档和64MiB展开同时存在，另留4MiB正文、映射及事务余量。/ Archive32MiB and expanded64MiB coexist; retain body4MiB plus map/transaction slack.
     return free_bytes>=104u*1024u*1024u?ESP_OK:WEREAD_ERR_STORAGE;
@@ -640,6 +799,7 @@ esp_err_t weread_chapter_prefetch_space(uint64_t *available){WR_GUARD;
 esp_err_t weread_chapter_download_ex(const char *id, uint32_t uid, bool preload) { WR_MEMORY_SCOPE;
     if (!wr_valid_id(id) || !uid) return ESP_ERR_INVALID_ARG;
     if(weread_chapter_cached(id,uid))return ESP_OK;
+    if(!weread_auth_is_authenticated())return ESP_ERR_INVALID_STATE;
     if(preload){esp_err_t space=weread_chapter_prefetch_space(NULL);if(space!=ESP_OK)return space;}
     char existing[512];
     chapter_download_work_t *w __attribute__((cleanup(release_chapter_work)))=wr_alloc(sizeof(*w));
@@ -783,4 +943,517 @@ esp_err_t weread_chapter_load_cached(const char *id,uint32_t uid,char **text,siz
     esp_err_t err = weread_chapter_directory(id, uid, path, 1024);
     if(err==ESP_OK)strcat(path,"/body.html");
     return err == ESP_OK ? read_file(path, text, len) : err;
+}
+
+typedef enum {
+    CACHE_KEEP = 0,
+    CACHE_DEL_CHAPTER_DIR,
+    CACHE_DEL_CHAPTER_FILE,
+    CACHE_DEL_COVER_TEMP,
+} cache_entry_kind_t;
+
+static bool has_prefix_dot_or_end(const char *s, const char *base) {
+    size_t len = strlen(base);
+    return !strncmp(s, base, len) && (s[len] == '\0' || s[len] == '.');
+}
+
+static bool is_digits_followed_by(const char *p, const char *ext) {
+    if (!p || !isdigit((unsigned char)*p)) return false;
+    while (isdigit((unsigned char)*p)) ++p;
+    return has_prefix_dot_or_end(p, ext);
+}
+
+static bool parse_chapter_manifest_uid(const char *name, uint32_t *out_uid) {
+    if (!name || strncmp(name, "chapter-", 8) != 0) return false;
+    const char *p = name + 8;
+    if (!isdigit((unsigned char)*p)) return false;
+    uint64_t val = 0;
+    while (isdigit((unsigned char)*p)) {
+        val = val * 10u + (uint64_t)(*p - '0');
+        if (val > UINT32_MAX) return false;
+        ++p;
+    }
+    if (strcmp(p, ".json") != 0 || val == 0) return false;
+    *out_uid = (uint32_t)val;
+    return true;
+}
+
+static cache_entry_kind_t classify_cache_entry(const char *name, bool is_dir) {
+    if (!name || !*name) return CACHE_KEEP;
+    if (is_dir) {
+        if (!strcmp(name, "chapters") || !strcmp(name, "res")) return CACHE_DEL_CHAPTER_DIR;
+        return CACHE_KEEP;
+    }
+    if (!strncmp(name, "chapter-", 8)) {
+        if (is_digits_followed_by(name + 8, ".json")) return CACHE_DEL_CHAPTER_FILE;
+        const char *dot = strrchr(name + 8, '.');
+        if (dot && (!strcmp(dot, ".html") || !strcmp(dot, ".xhtml") || !strcmp(dot, ".part"))) {
+            return CACHE_DEL_CHAPTER_FILE;
+        }
+        const char *h = strstr(name + 8, ".html");
+        if (h && (h[5] == '\0' || h[5] == '.')) return CACHE_DEL_CHAPTER_FILE;
+        const char *xh = strstr(name + 8, ".xhtml");
+        if (xh && (xh[6] == '\0' || xh[6] == '.')) return CACHE_DEL_CHAPTER_FILE;
+        const char *pt = strstr(name + 8, ".part");
+        if (pt && (pt[5] == '\0' || pt[5] == '.')) return CACHE_DEL_CHAPTER_FILE;
+        return CACHE_KEEP;
+    }
+    if (has_prefix_dot_or_end(name, "resources.json") ||
+        !strncmp(name, "archive.", 8) ||
+        !strncmp(name, "chapter_", 8)) {
+        return CACHE_DEL_CHAPTER_FILE;
+    }
+    if (!strncmp(name, "cover-", 6)) {
+        const char *dot = strchr(name + 6, '.');
+        if (dot && (has_prefix_dot_or_end(dot, ".img") || has_prefix_dot_or_end(dot, ".failed"))) {
+            return CACHE_DEL_COVER_TEMP;
+        }
+        return CACHE_KEEP;
+    }
+    if (has_prefix_dot_or_end(name, "cover.img") || has_prefix_dot_or_end(name, "cover.failed")) {
+        return CACHE_DEL_COVER_TEMP;
+    }
+    return CACHE_KEEP;
+}
+
+static bool is_preserved_cover_file(const char *name) {
+    if (!name || !*name) return false;
+    if (!strcmp(name, "cover.gray")) return true;
+    if (!strncmp(name, "cover-", 6)) {
+        const char *dot = strchr(name + 6, '.');
+        return dot && has_prefix_dot_or_end(dot, ".gray");
+    }
+    return false;
+}
+
+static esp_err_t stat_tree_iterative(const char *root_path, uint64_t *bytes_out,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (!root_path || !*root_path || !bytes_out) return ESP_ERR_INVALID_ARG;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    struct stat st;
+    if (lstat(root_path, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) {
+        if (st.st_size > 0) *bytes_out += (uint64_t)st.st_size;
+        return ESP_OK;
+    }
+    char *child = wr_alloc(1024);
+    size_t stack_cap = 32, stack_top = 0;
+    wr_dir_frame_t *stack = wr_alloc(stack_cap * sizeof(*stack));
+    if (!child || !stack) {
+        free(child); free(stack);
+        return ESP_ERR_NO_MEM;
+    }
+    stack[0].path = wr_dup_str(root_path);
+    stack[0].depth = 0;
+    stack[0].visited = false;
+    if (!stack[0].path) {
+        free(child); free(stack);
+        return ESP_ERR_NO_MEM;
+    }
+    stack_top = 1;
+    esp_err_t err = ESP_OK;
+    while (stack_top > 0) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        wr_dir_frame_t frame = stack[--stack_top];
+        DIR *dir = opendir(frame.path);
+        if (!dir) {
+            if (errno != ENOENT) err = ESP_FAIL;
+            free(frame.path);
+            continue;
+        }
+        struct dirent *entry;
+        while ((entry = readdir(dir))) {
+            if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+            if (join_path(frame.path, entry->d_name, child, 1024) != ESP_OK) {
+                err = ESP_ERR_INVALID_SIZE;
+                continue;
+            }
+            struct stat cst;
+            if (lstat(child, &cst)) {
+                if (errno != ENOENT) err = ESP_FAIL;
+                continue;
+            }
+            if (!S_ISDIR(cst.st_mode)) {
+                if (cst.st_size > 0) *bytes_out += (uint64_t)cst.st_size;
+            } else if (frame.depth < 32) {
+                if (stack_top == stack_cap) {
+                    if (stack_cap >= 4096) { err = ESP_ERR_INVALID_SIZE; break; }
+                    size_t next_cap = stack_cap * 2;
+                    wr_dir_frame_t *bigger = wr_realloc(stack, next_cap * sizeof(*stack));
+                    if (!bigger) { err = ESP_ERR_NO_MEM; break; }
+                    stack = bigger;
+                    stack_cap = next_cap;
+                }
+                char *sub = wr_dup_str(child);
+                if (!sub) { err = ESP_ERR_NO_MEM; break; }
+                stack[stack_top].path = sub;
+                stack[stack_top].depth = (uint16_t)(frame.depth + 1);
+                stack[stack_top].visited = false;
+                ++stack_top;
+            }
+        }
+        closedir(dir);
+        free(frame.path);
+        if (err != ESP_OK && err != ESP_FAIL) break;
+    }
+    while (stack_top > 0) free(stack[--stack_top].path);
+    free(stack);
+    free(child);
+    return err;
+}
+
+typedef struct {
+    char *path;
+    bool chapter_dir;
+} wr_subdir_item_t;
+
+esp_err_t weread_chapter_inspect_book_cache(const char *book_id, weread_chapter_book_cache_info_t *out,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (!wr_valid_id(book_id) || !out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    char *dir __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    char *child __attribute__((cleanup(wr_release))) = wr_alloc(1024);
+    if (!dir || !child) return ESP_ERR_NO_MEM;
+    esp_err_t err = wr_cache_book_dir(book_id, dir, 512);
+    if (err != ESP_OK) return err;
+    if (!sd_io_ready_for(dir)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(dir);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    struct stat st;
+    if (stat(dir, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    size_t sub_count = 0, sub_cap = 0;
+    wr_subdir_item_t *subs = NULL;
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (join_path(dir, entry->d_name, child, 1024) != ESP_OK) { err = ESP_ERR_INVALID_SIZE; continue; }
+        struct stat cst;
+        if (lstat(child, &cst)) { if (errno != ENOENT) err = ESP_FAIL; continue; }
+        bool is_dir = S_ISDIR(cst.st_mode);
+        cache_entry_kind_t kind = classify_cache_entry(entry->d_name, is_dir);
+        if (is_dir) {
+            if (sub_count == sub_cap) {
+                size_t next = sub_cap ? sub_cap * 2 : 4;
+                wr_subdir_item_t *bigger = wr_realloc(subs, next * sizeof(*subs));
+                if (!bigger) { err = ESP_ERR_NO_MEM; break; }
+                subs = bigger;
+                sub_cap = next;
+            }
+            char *p = wr_dup_str(child);
+            if (!p) { err = ESP_ERR_NO_MEM; break; }
+            subs[sub_count].path = p;
+            subs[sub_count].chapter_dir = (kind == CACHE_DEL_CHAPTER_DIR);
+            ++sub_count;
+            continue;
+        }
+        uint64_t sz = cst.st_size > 0 ? (uint64_t)cst.st_size : 0;
+        if (kind == CACHE_DEL_CHAPTER_FILE) {
+            out->chapter_bytes += sz;
+            out->reclaimable_bytes += sz;
+            uint32_t uid = 0;
+            if (parse_chapter_manifest_uid(entry->d_name, &uid)) ++out->chapter_manifest_count;
+        } else if (kind == CACHE_DEL_COVER_TEMP) {
+            out->cover_bytes += sz;
+            out->reclaimable_bytes += sz;
+        } else if (is_preserved_cover_file(entry->d_name)) {
+            out->cover_bytes += sz;
+        } else {
+            out->meta_bytes += sz;
+        }
+    }
+    closedir(d);
+    for (size_t i = 0; i < sub_count; ++i) {
+        if (err == ESP_OK) {
+            uint64_t sub_bytes = 0;
+            esp_err_t serr = stat_tree_iterative(subs[i].path, &sub_bytes, cancel_fn, cancel_ctx);
+            if (serr != ESP_OK) err = serr;
+            else if (subs[i].chapter_dir) {
+                out->chapter_bytes += sub_bytes;
+                out->reclaimable_bytes += sub_bytes;
+            } else {
+                out->meta_bytes += sub_bytes;
+            }
+        }
+        free(subs[i].path);
+    }
+    free(subs);
+    out->total_bytes = out->chapter_bytes + out->cover_bytes + out->meta_bytes;
+    return err;
+}
+
+static esp_err_t collect_cache_book_ids(const char *cache_root, char (**ids_out)[WEREAD_BOOK_ID_CAP],
+    size_t *count_out, weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    *ids_out = NULL;
+    *count_out = 0;
+    struct stat st;
+    if (stat(cache_root, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+    char *child __attribute__((cleanup(wr_release))) = wr_alloc(1024);
+    if (!child) return ESP_ERR_NO_MEM;
+    DIR *d = opendir(cache_root);
+    if (!d) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    size_t cap = 0, count = 0;
+    char (*ids)[WEREAD_BOOK_ID_CAP] = NULL;
+    esp_err_t err = ESP_OK;
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (!wr_valid_id(entry->d_name)) continue;
+        if (join_path(cache_root, entry->d_name, child, 1024) != ESP_OK) continue;
+        struct stat cst;
+        if (stat(child, &cst) || !S_ISDIR(cst.st_mode)) continue;
+        if (count == cap) {
+            if (cap >= WEREAD_SHELF_LIMIT * 2u) { err = ESP_ERR_INVALID_SIZE; break; }
+            size_t next = cap ? cap * 2 : 16;
+            char (*bigger)[WEREAD_BOOK_ID_CAP] = wr_realloc(ids, next * sizeof(*ids));
+            if (!bigger) { err = ESP_ERR_NO_MEM; break; }
+            ids = bigger;
+            cap = next;
+        }
+        memcpy(ids[count], entry->d_name, strlen(entry->d_name) + 1);
+        ++count;
+    }
+    closedir(d);
+    if (err != ESP_OK) {
+        free(ids);
+        return err;
+    }
+    *ids_out = ids;
+    *count_out = count;
+    return ESP_OK;
+}
+
+esp_err_t weread_chapter_inspect_cache_stats(weread_chapter_cache_stats_t *out,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (!out) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = weread_chapter_storage_info(&out->free_bytes, &out->fs_total_bytes);
+    if (err != ESP_OK) return err;
+    char *root __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    if (!root) return ESP_ERR_NO_MEM;
+    err = wr_cache_root(root, 512);
+    if (err != ESP_OK) return err;
+    if (!sd_io_ready_for(root)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(root);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    char (*ids)[WEREAD_BOOK_ID_CAP] = NULL;
+    size_t count = 0;
+    err = collect_cache_book_ids(root, &ids, &count, cancel_fn, cancel_ctx);
+    if (err != ESP_OK) return err;
+    for (size_t i = 0; i < count; ++i) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        weread_chapter_book_cache_info_t info;
+        esp_err_t berr = weread_chapter_inspect_book_cache(ids[i], &info, cancel_fn, cancel_ctx);
+        if (berr != ESP_OK) { err = berr; break; }
+        out->total_bytes += info.total_bytes;
+        out->reclaimable_bytes += info.reclaimable_bytes;
+        ++out->book_dir_count;
+        if (info.chapter_manifest_count > 0 || info.chapter_bytes > 0) ++out->books_with_chapters;
+    }
+    free(ids);
+    return err;
+}
+
+esp_err_t weread_chapter_clean_book_cache(const char *book_id, uint64_t *freed_bytes,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (freed_bytes) *freed_bytes = 0;
+    if (!wr_valid_id(book_id)) return ESP_ERR_INVALID_ARG;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    if (book_weread_id_in_use(book_id)) return ESP_ERR_INVALID_STATE;
+    char *dir __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    char *child __attribute__((cleanup(wr_release))) = wr_alloc(1024);
+    if (!dir || !child) return ESP_ERR_NO_MEM;
+    esp_err_t err = wr_cache_book_dir(book_id, dir, 512);
+    if (err != ESP_OK) return err;
+    if (!sd_io_ready_for(dir)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(dir);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    struct stat st;
+    if (stat(dir, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+    uint64_t freed = 0;
+    /* Pass 1: unlink chapter manifests, resources.json, temp cover artifacts, and legacy chapter files. */
+    DIR *d = opendir(dir);
+    if (!d) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        if (join_path(dir, entry->d_name, child, 1024) != ESP_OK) { err = ESP_ERR_INVALID_SIZE; continue; }
+        struct stat cst;
+        if (lstat(child, &cst)) { if (errno != ENOENT) err = ESP_FAIL; continue; }
+        if (S_ISDIR(cst.st_mode)) continue;
+        cache_entry_kind_t kind = classify_cache_entry(entry->d_name, false);
+        if (kind == CACHE_DEL_CHAPTER_FILE || kind == CACHE_DEL_COVER_TEMP) {
+            if (unlink(child) == 0) {
+                if (cst.st_size > 0) freed += (uint64_t)cst.st_size;
+            } else if (errno != ENOENT) {
+                err = ESP_FAIL;
+            }
+        }
+    }
+    closedir(d);
+    /* Pass 2: iteratively remove chapters/ and res/ directories after manifests are gone. */
+    if (err == ESP_OK) {
+        static const char *const k_dirs[2] = {"chapters", "res"};
+        for (size_t i = 0; i < 2; ++i) {
+            if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+            if (book_weread_id_in_use(book_id)) { err = ESP_ERR_INVALID_STATE; break; }
+            if (join_path(dir, k_dirs[i], child, 1024) != ESP_OK) { err = ESP_ERR_INVALID_SIZE; break; }
+            esp_err_t rerr = remove_tree_iterative(child, &freed, cancel_fn, cancel_ctx);
+            if (rerr != ESP_OK) { err = rerr; break; }
+        }
+    }
+    if (freed_bytes) *freed_bytes = freed;
+    return err;
+}
+
+esp_err_t weread_chapter_clean_all_caches(uint64_t *freed_bytes, uint32_t *cleaned_books,
+    weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (freed_bytes) *freed_bytes = 0;
+    if (cleaned_books) *cleaned_books = 0;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    char *root __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    if (!root) return ESP_ERR_NO_MEM;
+    esp_err_t err = wr_cache_root(root, 512);
+    if (err != ESP_OK) return err;
+    if (!sd_io_ready_for(root)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(root);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    char (*ids)[WEREAD_BOOK_ID_CAP] = NULL;
+    size_t count = 0;
+    err = collect_cache_book_ids(root, &ids, &count, cancel_fn, cancel_ctx);
+    if (err != ESP_OK) return err;
+    uint64_t total_freed = 0;
+    uint32_t cleaned = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (book_weread_id_in_use(ids[i])) continue;
+        uint64_t book_freed = 0;
+        esp_err_t berr = weread_chapter_clean_book_cache(ids[i], &book_freed, cancel_fn, cancel_ctx);
+        total_freed += book_freed;
+        if (berr != ESP_OK) { err = berr; break; }
+        if (book_freed > 0) ++cleaned;
+    }
+    free(ids);
+    if (freed_bytes) *freed_bytes = total_freed;
+    if (cleaned_books) *cleaned_books = cleaned;
+    return err;
+}
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t va = *(const uint32_t *)a, vb = *(const uint32_t *)b;
+    return va < vb ? -1 : (va > vb ? 1 : 0);
+}
+
+esp_err_t weread_chapter_count_cached(const char *book_id, uint16_t *cached_chapters,
+    uint16_t *total_chapters, weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (cached_chapters) *cached_chapters = 0;
+    if (total_chapters) *total_chapters = 0;
+    if (!wr_valid_id(book_id)) return ESP_ERR_INVALID_ARG;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    weread_toc_t toc = {0};
+    esp_err_t err = weread_toc_load(book_id, &toc);
+    if (err != ESP_OK) return err;
+    size_t toc_count = toc.count;
+    uint16_t total_u16 = toc_count > UINT16_MAX ? UINT16_MAX : (uint16_t)toc_count;
+    if (!toc_count) {
+        weread_toc_free(&toc);
+        return ESP_OK;
+    }
+    uint32_t *uids = wr_alloc(toc_count * sizeof(uint32_t));
+    if (!uids) {
+        weread_toc_free(&toc);
+        return ESP_ERR_NO_MEM;
+    }
+    for (size_t i = 0; i < toc_count; ++i) uids[i] = toc.chapters[i].uid;
+    weread_toc_free(&toc);
+    qsort(uids, toc_count, sizeof(uint32_t), cmp_u32);
+    char *dir __attribute__((cleanup(wr_release))) = wr_alloc(512);
+    if (!dir) { free(uids); return ESP_ERR_NO_MEM; }
+    err = wr_cache_book_dir(book_id, dir, 512);
+    if (err != ESP_OK) { free(uids); return err; }
+    if (!sd_io_ready_for(dir)) { free(uids); return ESP_ERR_INVALID_STATE; }
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(dir);
+    if (!sd_access.allowed) { free(uids); return ESP_ERR_INVALID_STATE; }
+#endif
+    struct stat st;
+    if (stat(dir, &st)) {
+        free(uids);
+        if (errno == ENOENT) {
+            if (total_chapters) *total_chapters = total_u16;
+            return ESP_OK;
+        }
+        return ESP_FAIL;
+    }
+    if (!S_ISDIR(st.st_mode)) { free(uids); return ESP_FAIL; }
+    DIR *d = opendir(dir);
+    if (!d) {
+        free(uids);
+        if (errno == ENOENT) {
+            if (total_chapters) *total_chapters = total_u16;
+            return ESP_OK;
+        }
+        return ESP_FAIL;
+    }
+    uint8_t *seen = wr_alloc((toc_count + 7u) / 8u);
+    uint32_t *cands = NULL;
+    size_t cand_count = 0, cand_cap = 0;
+    if (!seen) { closedir(d); free(uids); return ESP_ERR_NO_MEM; }
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        uint32_t uid = 0;
+        if (!parse_chapter_manifest_uid(entry->d_name, &uid)) continue;
+        uint32_t *found = bsearch(&uid, uids, toc_count, sizeof(uint32_t), cmp_u32);
+        if (!found) continue;
+        size_t idx = (size_t)(found - uids);
+        if (seen[idx >> 3u] & (uint8_t)(1u << (idx & 7u))) continue;
+        seen[idx >> 3u] |= (uint8_t)(1u << (idx & 7u));
+        if (cand_count == cand_cap) {
+            size_t next = cand_cap ? cand_cap * 2 : 16;
+            uint32_t *bigger = wr_realloc(cands, next * sizeof(uint32_t));
+            if (!bigger) { err = ESP_ERR_NO_MEM; break; }
+            cands = bigger;
+            cand_cap = next;
+        }
+        cands[cand_count++] = uid;
+    }
+    closedir(d);
+    free(seen);
+    free(uids);
+    uint32_t cached = 0;
+    for (size_t i = 0; err == ESP_OK && i < cand_count; ++i) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (weread_chapter_cached(book_id, cands[i])) ++cached;
+    }
+    free(cands);
+    if (err == ESP_OK) {
+        uint16_t cached_u16 = cached > total_u16 ? total_u16 : (uint16_t)cached;
+        if (cached_chapters) *cached_chapters = cached_u16;
+        if (total_chapters) *total_chapters = total_u16;
+    }
+    return err;
 }

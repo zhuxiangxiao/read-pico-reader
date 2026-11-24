@@ -167,6 +167,18 @@ esp_err_t wr_mkdirs(const char *path) {
     }
 }
 
+esp_err_t wr_cache_root(char *out, size_t cap) {
+    if (!out || !cap) return ESP_ERR_INVALID_ARG;
+    int n = snprintf(out, cap, "%s/cache", weread_auth_get_storage_root());
+    return n >= 0 && (size_t)n < cap ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+esp_err_t wr_cache_book_dir(const char *id, char *out, size_t cap) {
+    if (!out || !cap || !wr_valid_id(id)) return ESP_ERR_INVALID_ARG;
+    int n = snprintf(out, cap, "%s/cache/%s", weread_auth_get_storage_root(), id);
+    return n >= 0 && (size_t)n < cap ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
 esp_err_t wr_cache_path(const char *id, const char *leaf, char *out, size_t cap) {
     if (!out || !cap || !wr_valid_id(id) || !leaf || !*leaf || strstr(leaf, "..") || *leaf == '/' ||
         strchr(leaf, '\\')) return ESP_ERR_INVALID_ARG;
@@ -313,16 +325,16 @@ esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out) 
 }
 
 bool wr_owner_matches(const cJSON *json) {
-    const weread_auth_session_t *s = weread_auth_get_current_session();
+    const char *owner = weread_auth_owner_vid();
     const char *vid = wr_string(json, "vid");
-    return s && vid && !strcmp(s->vid, vid);
+    return owner && owner[0] && vid && !strcmp(owner, vid);
 }
 
 bool wr_set_owner(cJSON *json) {
-    const weread_auth_session_t *s = weread_auth_get_current_session();
-    if (!s) return false;
+    const char *owner = weread_auth_owner_vid();
+    if (!owner || !owner[0]) return false;
     cJSON_DeleteItemFromObject(json, "vid");
-    return cJSON_AddStringToObject(json, "vid", s->vid) != NULL;
+    return cJSON_AddStringToObject(json, "vid", owner) != NULL;
 }
 
 bool wr_set_copy(cJSON *o, const char *key, const cJSON *value) {
