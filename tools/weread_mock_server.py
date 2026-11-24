@@ -13,14 +13,17 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import signal
 import struct
 import sys
+import tarfile
 import threading
 import time
 import urllib.parse
+import zlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -151,9 +154,115 @@ def encrypt_encrypt_key(password: bytes | str, secret: str) -> str:
     return base64.b64encode(cipher).decode("ascii")
 
 
+def _zipcrypto_encrypt(data: bytes, pwd: bytes, crc: int) -> bytes:
+    """Traditional PKWARE ZipCrypto encryption matching generate_fixtures.py."""
+    table = []
+    for n in range(256):
+        c = n
+        for _ in range(8):
+            c = (0xEDB88320 ^ (c >> 1)) if (c & 1) else (c >> 1)
+        table.append(c)
+
+    k0, k1, k2 = 0x12345678, 0x23456789, 0x34567890
+
+    def update(b: int) -> None:
+        nonlocal k0, k1, k2
+        k0 = ((k0 >> 8) ^ table[(k0 ^ b) & 0xFF]) & 0xFFFFFFFF
+        k1 = ((k1 + (k0 & 0xFF)) * 134775813 + 1) & 0xFFFFFFFF
+        k2 = ((k2 >> 8) ^ table[(k2 ^ (k1 >> 24)) & 0xFF]) & 0xFFFFFFFF
+
+    def key_byte() -> int:
+        t = (k2 | 2) & 0xFFFF
+        return ((t * (t ^ 1)) >> 8) & 0xFF
+
+    for ch in pwd:
+        update(ch)
+
+    hdr = bytes([0] * 10 + [(crc >> 16) & 0xFF, (crc >> 24) & 0xFF])
+    out = bytearray()
+    for b in hdr + data:
+        kb = key_byte()
+        update(b)
+        out.append(b ^ kb)
+    return bytes(out)
+
+
+def _make_zipcrypto_zip(entries: dict[str, bytes], pwd: bytes) -> bytes:
+    """Create a valid ZIP buffer with ZipCrypto encryption."""
+    local_parts = bytearray()
+    central_parts = bytearray()
+    offset = 0
+
+    for name, plain in entries.items():
+        name_b = name.encode("utf-8")
+        crc = zlib.crc32(plain) & 0xFFFFFFFF
+        enc = _zipcrypto_encrypt(plain, pwd, crc)
+        flag_bits = 0x0001
+
+        lh = struct.pack(
+            "<IHHHHHIIIHH",
+            0x04034B50,
+            20,
+            flag_bits,
+            0,
+            0,
+            0,
+            crc,
+            len(enc),
+            len(plain),
+            len(name_b),
+            0,
+        ) + name_b
+
+        cd = struct.pack(
+            "<IHHHHHHIIIHHHHHII",
+            0x02014B50,
+            20,
+            20,
+            flag_bits,
+            0,
+            0,
+            0,
+            crc,
+            len(enc),
+            len(plain),
+            len(name_b),
+            0, 0, 0, 0, 0,
+            offset,
+        ) + name_b
+
+        offset += len(lh) + len(enc)
+        local_parts.extend(lh)
+        local_parts.extend(enc)
+        central_parts.extend(cd)
+
+    eocd = struct.pack(
+        "<IHHHHIIH",
+        0x06054B50,
+        0, 0,
+        len(entries), len(entries),
+        len(central_parts),
+        offset,
+        0,
+    )
+    return bytes(local_parts) + bytes(central_parts) + eocd
+
+
+_MINIMAL_JPEG = (
+    b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00"
+    b"\xFF\xDB\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\x09\x09\x08\x0A\x0C\x14\x0D\x0C\x0B\x0B\x0C\x19\x12\x13\x0F"
+    b"\x14\x1D\x1A\x1F\x1E\x1D\x1A\x1C\x1C $.' \",#\x1C\x1C(7),01444\x1F'9=82<.342"
+    b"\xFF\xC0\x00\x0B\x08\x00\x01\x00\x01\x01\x01\x11\x00"
+    b"\xFF\xC4\x00\x14\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\xFF\xC4\x00\x14\x10\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    b"\xFF\xDA\x00\x08\x01\x01\x00\x00?\x00\x3F\xFF\xD9"
+)
+
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
 
 class MockServerState:
@@ -179,6 +288,19 @@ class MockServerState:
             self.clear_all_toc: bool = False
             self.book_version: int = 100
             self.synckey: int = 1000
+            # WR-UX non-breaking extensions (default to legacy-safe behavior)
+            self.dynamic_uid: bool = False
+            self.uid_counter: int = 0
+            self.qr_sequence: list[str] = []
+            self.qr_status_by_uid: dict[str, str] = {}
+            self.renew_error: dict | None = None
+            self.endpoint_delays: dict[str, float] = {}
+            self.endpoint_sequences: dict[str, list[dict]] = {}
+            self.update_progress_on_read: bool = True
+            self.chapter_errors: dict[str, dict] = {}
+            self.enforce_book_version: bool = False
+            self.book_versions: dict[str, int] = {}
+            self.cover_errors: dict[str, int] = {}
             self.progress_data: dict[str, dict] = {
                 "test_book_101": {
                     "chapterUid": 1,
@@ -355,31 +477,92 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    @staticmethod
+    def _effective_book_version_from(book: dict, book_versions: dict, default_ver: int) -> int:
+        bid = book.get("bookId", "")
+        if bid in book_versions:
+            return int(book_versions[bid])
+        if bid == "test_book_101" and default_ver != 100:
+            return int(default_ver)
+        return int(book.get("bookVersion", default_ver))
+
+    def _effective_book_version(self, book: dict) -> int:
+        with GLOBAL_STATE.lock:
+            return self._effective_book_version_from(
+                book, dict(GLOBAL_STATE.book_versions), int(GLOBAL_STATE.book_version)
+            )
+
+    def _books_with_versions(
+        self, books: list[dict], book_versions: dict | None = None, default_ver: int | None = None
+    ) -> list[dict]:
+        if book_versions is None or default_ver is None:
+            with GLOBAL_STATE.lock:
+                book_versions = dict(GLOBAL_STATE.book_versions)
+                default_ver = int(GLOBAL_STATE.book_version)
+        out = []
+        for b in books:
+            bc = dict(b)
+            bc["bookVersion"] = self._effective_book_version_from(bc, book_versions, default_ver)
+            out.append(bc)
+        return out
+
     def _handle_forced_errors(self, path: str) -> bool:
         """Check if global force_error or endpoint_errors should intercept this request."""
-        if GLOBAL_STATE.latency > 0:
-            time.sleep(GLOBAL_STATE.latency)
+        # Control endpoints bypass latency/disconnect/force_error so test harnesses stay responsive
+        if path.startswith("/mock/control"):
+            return False
 
-        if GLOBAL_STATE.disconnect:
+        with GLOBAL_STATE.lock:
+            latency = GLOBAL_STATE.latency
+            disconnect = GLOBAL_STATE.disconnect
+            ep_delay = GLOBAL_STATE.endpoint_delays.get(path, 0)
+            seq_list = GLOBAL_STATE.endpoint_sequences.get(path)
+            seq_item = dict(seq_list.pop(0)) if seq_list else None
+            ep_err = dict(GLOBAL_STATE.endpoint_errors[path]) if path in GLOBAL_STATE.endpoint_errors else None
+            force_err = dict(GLOBAL_STATE.force_error) if GLOBAL_STATE.force_error else None
+
+        if latency > 0:
+            time.sleep(latency)
+
+        if disconnect:
             # Abruptly close connection
             self.close_connection = True
             return True
 
-        # Check endpoint-specific error
-        if path in GLOBAL_STATE.endpoint_errors:
-            err = GLOBAL_STATE.endpoint_errors[path]
-            status = err.get("status", 500)
-            body = err.get("body", {"errcode": -1, "errmsg": "injected error"})
-            headers = err.get("headers")
-            self._send_json(status, body, headers)
-            return True
+        # Per-endpoint delay
+        if ep_delay and ep_delay > 0:
+            time.sleep(float(ep_delay))
 
-        # Check global force_error (ignores control paths)
-        if not path.startswith("/mock/control") and GLOBAL_STATE.force_error:
-            err = GLOBAL_STATE.force_error
-            status = err.get("status", 401)
-            body = err.get("body", {"errcode": -2013, "errmsg": "session expired"})
-            headers = err.get("headers")
+        # Per-endpoint sequence (one-shot / transient retries)
+        if seq_item is not None:
+            if seq_item.get("delay", 0) > 0:
+                time.sleep(float(seq_item["delay"]))
+            if seq_item.get("disconnect"):
+                self.close_connection = True
+                return True
+            if not seq_item.get("pass_through", False):
+                status = seq_item.get("status", 500)
+                body = seq_item.get("body", {"errcode": -1, "errmsg": "injected sequence error"})
+                headers = seq_item.get("headers")
+                self._send_json(status, body, headers)
+                return True
+
+        # Check endpoint-specific error
+        if ep_err is not None:
+            if ep_err.get("delay", 0) > 0:
+                time.sleep(float(ep_err["delay"]))
+            if not ep_err.get("pass_through", False):
+                status = ep_err.get("status", 500)
+                body = ep_err.get("body", {"errcode": -1, "errmsg": "injected error"})
+                headers = ep_err.get("headers")
+                self._send_json(status, body, headers)
+                return True
+
+        # Check global force_error
+        if force_err is not None:
+            status = force_err.get("status", 401)
+            body = force_err.get("body", {"errcode": -2013, "errmsg": "session expired"})
+            headers = force_err.get("headers")
             self._send_json(status, body, headers)
             return True
 
@@ -405,18 +588,27 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "running": True})
             return
         if path == "/mock/control/history":
+            with GLOBAL_STATE.lock:
+                history_snap = list(GLOBAL_STATE.history)
+                violations_snap = list(GLOBAL_STATE.security_violations)
             self._send_json(200, {
                 "status": "ok",
-                "count": len(GLOBAL_STATE.get_history()),
-                "history": GLOBAL_STATE.get_history(),
-                "violations": list(GLOBAL_STATE.security_violations),
+                "count": len(history_snap),
+                "history": history_snap,
+                "violations": violations_snap,
             })
             return
 
         # WeRead endpoints
         if path == "/web/getuid":
             # Returns QR login session UID
-            self._send_json(200, {"data": {"uid": "mock_uid_1234567890abcdef"}})
+            with GLOBAL_STATE.lock:
+                if GLOBAL_STATE.dynamic_uid:
+                    GLOBAL_STATE.uid_counter += 1
+                    uid = f"mock_uid_{GLOBAL_STATE.uid_counter:04d}"
+                else:
+                    uid = "mock_uid_1234567890abcdef"
+            self._send_json(200, {"data": {"uid": uid}})
             return
 
         if path == "/shelf/sync":
@@ -424,33 +616,42 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             synckey_req = int(query.get("synckey", ["0"])[0])
             only_book_id = query.get("onlyBookid", ["0"])[0] == "1"
 
+            with GLOBAL_STATE.lock:
+                books_snap = [dict(b) for b in GLOBAL_STATE.books]
+                progress_snap = {bid: dict(p) for bid, p in GLOBAL_STATE.progress_data.items()}
+                lecture_snap = [dict(b) for b in GLOBAL_STATE.lecture_books]
+                synckey_snap = int(GLOBAL_STATE.synckey)
+                book_versions_snap = dict(GLOBAL_STATE.book_versions)
+                default_ver_snap = int(GLOBAL_STATE.book_version)
+
             if only_book_id and synckey_req > 0:
                 # Incremental sync
-                book_ids = [{"bookId": b["bookId"], "type": 0} for b in GLOBAL_STATE.books]
+                book_ids = [{"bookId": b["bookId"], "type": 0} for b in books_snap]
                 progress_list = [
                     {"bookId": bid, "chapterUid": p.get("chapterUid", 1), "progress": p.get("progress", 0), "updateTime": p.get("updateTime", 1700000000)}
-                    for bid, p in GLOBAL_STATE.progress_data.items()
+                    for bid, p in progress_snap.items()
                 ]
                 self._send_json(200, {
                     "bookIds": book_ids,
                     "bookProgress": progress_list,
                     "removed": [],
-                    "synckey": GLOBAL_STATE.synckey + 1,
+                    "synckey": synckey_snap + 1,
                 })
             else:
                 # Full sync: includes lectureBooks to test filtering
-                book_ids = [b["bookId"] for b in GLOBAL_STATE.books]
+                books_out = self._books_with_versions(books_snap, book_versions_snap, default_ver_snap)
+                book_ids = [b["bookId"] for b in books_out]
                 progress_list = [
                     {"bookId": bid, "chapterUid": p.get("chapterUid", 1), "progress": p.get("progress", 0), "updateTime": p.get("updateTime", 1700000000)}
-                    for bid, p in GLOBAL_STATE.progress_data.items()
+                    for bid, p in progress_snap.items()
                 ]
                 self._send_json(200, {
-                    "books": GLOBAL_STATE.books,
+                    "books": books_out,
                     "bookIds": book_ids,
                     "bookProgress": progress_list,
-                    "lectureBooks": GLOBAL_STATE.lecture_books,
+                    "lectureBooks": lecture_snap,
                     "removed": [],
-                    "synckey": GLOBAL_STATE.synckey,
+                    "synckey": synckey_snap,
                 })
             return
 
@@ -460,18 +661,35 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
 
         if path in ("/book/getProgress", "/web/book/getProgress"):
             book_id = query.get("bookId", ["test_book_101"])[0]
-            prog = GLOBAL_STATE.progress_data.get(book_id, {
-                "chapterUid": 1,
-                "chapterIdx": 1,
-                "chapterOffset": 0,
-                "pageOffset": 0,
-                "bookVersion": 100,
-                "progress": 0,
-                "readingTime": 0,
-                "updateTime": int(time.time()),
-                "summary": "第一章",
-            })
+            with GLOBAL_STATE.lock:
+                raw_prog = GLOBAL_STATE.progress_data.get(book_id)
+                prog = dict(raw_prog) if raw_prog is not None else None
+            if prog is None:
+                prog = {
+                    "chapterUid": 1,
+                    "chapterIdx": 1,
+                    "chapterOffset": 0,
+                    "pageOffset": 0,
+                    "bookVersion": 100,
+                    "progress": 0,
+                    "readingTime": 0,
+                    "updateTime": int(time.time()),
+                    "summary": "第一章",
+                }
             self._send_json(200, {"bookId": book_id, "book": prog})
+            return
+
+        if path.startswith("/covers/"):
+            with GLOBAL_STATE.lock:
+                err_status = GLOBAL_STATE.cover_errors.get(path)
+            if err_status:
+                self._send_json(int(err_status), {"errcode": -err_status, "errmsg": "cover error"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(_MINIMAL_JPEG)))
+            self.end_headers()
+            self.wfile.write(_MINIMAL_JPEG)
             return
 
         if path.startswith("/untrusted") or path.startswith("/thirdparty"):
@@ -499,6 +717,13 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "message": "Mock server state reset successfully"})
             return
 
+        if path == "/mock/control/clear_history":
+            with GLOBAL_STATE.lock:
+                GLOBAL_STATE.history = []
+                GLOBAL_STATE.security_violations = []
+            self._send_json(200, {"status": "ok", "message": "History cleared"})
+            return
+
         if path == "/mock/control/set_state":
             try:
                 updates = json.loads(body.decode("utf-8")) if body else {}
@@ -511,19 +736,41 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
         # WeRead Auth endpoints
         if path == "/web/getlogininfo":
             # Polling QR confirmation status
-            qr = GLOBAL_STATE.qr_status
-            if qr == "WAITING_CONFIRM":
+            req_uid = ""
+            try:
+                b_json = json.loads(body.decode("utf-8")) if body else {}
+                req_uid = b_json.get("uid", "")
+            except Exception:
+                pass
+            with GLOBAL_STATE.lock:
+                if req_uid and req_uid in GLOBAL_STATE.qr_status_by_uid:
+                    val = GLOBAL_STATE.qr_status_by_uid[req_uid]
+                    if isinstance(val, list) and val:
+                        qr = val.pop(0) if len(val) > 1 else val[0]
+                    else:
+                        qr = str(val)
+                elif GLOBAL_STATE.qr_sequence:
+                    qr = GLOBAL_STATE.qr_sequence.pop(0)
+                else:
+                    qr = GLOBAL_STATE.qr_status
+                vid_snap = GLOBAL_STATE.current_vid
+                skey_snap = GLOBAL_STATE.current_skey
+            if qr == "WAITING_SCAN":
+                self._send_json(200, {"data": {"succeed": False, "logicCode": "WAITING_SCAN"}})
+            elif qr == "WAITING_CONFIRM":
                 self._send_json(200, {"data": {"succeed": False}})
             elif qr == "NEED_OTP":
                 self._send_json(200, {"data": {"succeed": False, "logicCode": "NEED_OTP"}})
-            elif qr == "LOGIN_TIMEOUT":
-                self._send_json(200, {"data": {"succeed": False, "logicCode": "LOGIN_TIMEOUT"}})
+            elif qr in ("LOGIN_TIMEOUT", "EXPIRED"):
+                self._send_json(200, {"data": {"succeed": False, "logicCode": qr}})
             elif qr == "LOGIN_CANCELLED":
                 self._send_json(200, {"data": {"succeed": False, "logicCode": "LOGIN_CANCELLED"}})
+            elif qr == "LOGIN_FAILED":
+                self._send_json(200, {"data": {"succeed": False, "logicCode": "LOGIN_FAILED"}})
             else:  # CONFIRMED
                 self._send_json(200, {
-                    "vid": GLOBAL_STATE.current_vid,
-                    "skey": GLOBAL_STATE.current_skey,
+                    "vid": vid_snap,
+                    "skey": skey_snap,
                     "code": "mock_qr_code_xyz123",
                     "redirect_uri": "https://weread.qq.com",
                     "pf": "2",
@@ -543,8 +790,21 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            if dt_q == "7" or dt_body == 7:
-                # Renewal
+            with GLOBAL_STATE.lock:
+                rerr_snap = dict(GLOBAL_STATE.renew_error) if GLOBAL_STATE.renew_error else None
+                vid_snap = GLOBAL_STATE.current_vid
+                access_snap = GLOBAL_STATE.access_token
+                refresh_snap = GLOBAL_STATE.refresh_token
+
+            if dt_q == "7" or str(dt_body) == "7":
+                # Renewal (deviceType=7 only error injection leaves deviceType=4 re-login unblocked)
+                if rerr_snap:
+                    self._send_json(
+                        rerr_snap.get("status", 401),
+                        rerr_snap.get("body", {"errcode": -2013, "errmsg": "refresh token expired"}),
+                        rerr_snap.get("headers"),
+                    )
+                    return
                 self._send_json(200, {
                     "accessToken": "mock_renewed_access_token",
                     "refreshToken": "mock_renewed_refresh_token",
@@ -552,14 +812,14 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             else:
                 # Initial device login (deviceType=4)
                 extra = {
-                    "Set-Cookie": f"wr_vid={GLOBAL_STATE.current_vid}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly, "
-                                  f"wr_skey={GLOBAL_STATE.access_token}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly, "
-                                  f"wr_rt={GLOBAL_STATE.refresh_token}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly"
+                    "Set-Cookie": f"wr_vid={vid_snap}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly, "
+                                  f"wr_skey={access_snap}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly, "
+                                  f"wr_rt={refresh_snap}; Path=/; Domain=.weread.qq.com; Secure; HttpOnly"
                 }
                 self._send_json(200, {
-                    "webLoginVid": str(GLOBAL_STATE.current_vid),
-                    "accessToken": GLOBAL_STATE.access_token,
-                    "refreshToken": GLOBAL_STATE.refresh_token,
+                    "webLoginVid": str(vid_snap),
+                    "accessToken": access_snap,
+                    "refreshToken": refresh_snap,
                 }, extra_headers=extra)
             return
 
@@ -571,13 +831,27 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 req_bids = set()
 
-            matched = [b for b in GLOBAL_STATE.books if b["bookId"] in req_bids] if req_bids else GLOBAL_STATE.books
+            with GLOBAL_STATE.lock:
+                books_snap = [dict(b) for b in GLOBAL_STATE.books]
+                progress_snap = {bid: dict(p) for bid, p in GLOBAL_STATE.progress_data.items()}
+                book_versions_snap = dict(GLOBAL_STATE.book_versions)
+                default_ver_snap = int(GLOBAL_STATE.book_version)
+
+            matched = [b for b in books_snap if b["bookId"] in req_bids] if req_bids else books_snap
+            matched = self._books_with_versions(matched, book_versions_snap, default_ver_snap)
+            book_progress = []
+            for b in matched:
+                bid = b["bookId"]
+                if bid in progress_snap:
+                    p = dict(progress_snap[bid])
+                    if p:
+                        p["bookId"] = bid
+                        book_progress.append(p)
+                else:
+                    book_progress.append({"bookId": bid, "progress": 15, "chapterUid": 1})
             self._send_json(200, {
                 "books": matched,
-                "bookProgress": [
-                    {"bookId": b["bookId"], "progress": 15, "chapterUid": 1}
-                    for b in matched
-                ]
+                "bookProgress": book_progress,
             })
             return
 
@@ -588,13 +862,18 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             except Exception:
                 req_bids = ["test_book_101"]
 
+            with GLOBAL_STATE.lock:
+                chapters_snap = {bid: [dict(c) for c in chs] for bid, chs in GLOBAL_STATE.chapters.items()}
+                synckey_snap = int(GLOBAL_STATE.synckey)
+                clear_all_snap = bool(GLOBAL_STATE.clear_all_toc)
+
             out_data = []
             for bid in req_bids:
-                ch_list = GLOBAL_STATE.chapters.get(bid, [])
+                ch_list = chapters_snap.get(bid, [])
                 out_data.append({
                     "bookId": bid,
-                    "synckey": GLOBAL_STATE.synckey,
-                    "clearAll": 1 if GLOBAL_STATE.clear_all_toc else 0,
+                    "synckey": synckey_snap,
+                    "clearAll": 1 if clear_all_snap else 0,
                     "updated": ch_list,
                     "removed": [],
                 })
@@ -603,27 +882,90 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
 
         if path in ("/book/read", "/web/book/read"):
             # Reading progress report
+            b_json = {}
+            try:
+                b_json = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                b_json = {}
+
             if path == "/web/book/read":
-                # Verify signed fallback parameters
-                try:
-                    b_json = json.loads(body.decode("utf-8")) if body else {}
-                    if "s" not in b_json or "b" not in b_json:
-                        # Direct unauthenticated body on web endpoint returns empty 200 (silent drop)
-                        self._send_json(200, {})
-                        return
-                except Exception:
-                    pass
-            self._send_json(200, {"succ": 1, "synckey": GLOBAL_STATE.synckey + 5})
+                if "s" not in b_json or "b" not in b_json:
+                    # Direct unauthenticated body on web endpoint returns empty 200 (silent drop)
+                    self._send_json(200, {})
+                    return
+
+            with GLOBAL_STATE.lock:
+                if GLOBAL_STATE.update_progress_on_read and isinstance(b_json, dict) and b_json.get("bookId"):
+                    bid = b_json["bookId"]
+                    old = dict(GLOBAL_STATE.progress_data.get(bid, {}))
+                    for k in ("chapterUid", "chapterIdx", "chapterOffset", "pageOffset", "bookVersion", "progress", "readingTime", "summary", "updateTime"):
+                        if k in b_json:
+                            old[k] = b_json[k]
+                    GLOBAL_STATE.progress_data[bid] = old
+                synckey_snap = int(GLOBAL_STATE.synckey)
+
+            self._send_json(200, {"succ": 1, "synckey": synckey_snap + 5})
             return
 
         self._send_json(404, {"errcode": -404, "errmsg": f"Endpoint not found: {path}"})
 
     def _handle_chapter_download(self, query: dict) -> None:
         """Serve authentic encrypted chapter payloads or injected errors."""
+        book_id = query.get("bookId", ["test_book_101"])[0]
         book_type = query.get("bookType", ["epub"])[0].lower()
+        chapters_param = query.get("chapters", ["1"])[0]
+        uid_parts = [p for p in chapters_param.split(",") if p and p != "0"]
+        primary_uid_str = uid_parts[-1] if uid_parts else "1"
+        try:
+            primary_uid = int(primary_uid_str)
+        except ValueError:
+            primary_uid = 1
+
+        with GLOBAL_STATE.lock:
+            chapter_errors_snap = dict(GLOBAL_STATE.chapter_errors)
+            books_snap = [dict(b) for b in GLOBAL_STATE.books]
+            book_versions_snap = dict(GLOBAL_STATE.book_versions)
+            default_ver_snap = int(GLOBAL_STATE.book_version)
+            enforce_ver_snap = bool(GLOBAL_STATE.enforce_book_version)
+            vid_snap = GLOBAL_STATE.current_vid
+            chapters_for_book = [dict(c) for c in GLOBAL_STATE.chapters.get(book_id, [])]
+
+        # Check chapter-scoped error rules (e.g. 402 paywall per chapter)
+        for check_uid in (uid_parts or [primary_uid_str]):
+            for key in (f"{book_id}:{check_uid}", f"{book_id}:*", f"*:{check_uid}"):
+                if key in chapter_errors_snap:
+                    cerr = chapter_errors_snap[key]
+                    self._send_json(
+                        cerr.get("status", 402),
+                        cerr.get("body", {"errcode": -2001, "errmsg": "Purchase required"}),
+                        cerr.get("headers"),
+                    )
+                    return
+
+        # Find book & expected version
+        matched_book = next((b for b in books_snap if b.get("bookId") == book_id), None)
+        expected_ver = (
+            self._effective_book_version_from(matched_book, book_versions_snap, default_ver_snap)
+            if matched_book
+            else int(book_versions_snap.get(book_id, default_ver_snap))
+        )
+        req_ver_str = query.get("bookVersion", [None])[0]
+        req_ver: int | None = None
+        if req_ver_str is not None:
+            try:
+                req_ver = int(req_ver_str)
+            except ValueError:
+                self._send_json(400, {"errcode": -400, "errmsg": "Invalid bookVersion"})
+                return
+        if enforce_ver_snap and req_ver is not None:
+            if req_ver != expected_ver:
+                self._send_json(499, {"errcode": -2063, "errmsg": "Book version expired"})
+                return
+
         fix_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "weread")
 
-        if book_type == "txt":
+        # Legacy static fixture parity for test_book_101 ch1 v100 and txt_book_202 ch1 v1
+        if book_type == "txt" and book_id == "txt_book_202" and primary_uid == 1 and (req_ver is None or req_ver == 1):
             tar_path = os.path.join(fix_dir, "sample_txt_chapter1.tar")
             if not os.path.exists(tar_path):
                 self._send_json(500, {"errcode": -500, "errmsg": "Missing sample_txt_chapter1.tar fixture"})
@@ -637,19 +979,103 @@ class WeReadMockRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        # Default EPUB download with authentic encryptkey header
-        zip_path = os.path.join(fix_dir, "sample_epub_chapter0_and_1.zip")
-        if not os.path.exists(zip_path):
-            self._send_json(500, {"errcode": -500, "errmsg": "Missing sample_epub_chapter0_and_1.zip fixture"})
+        if book_type != "txt" and book_id == "test_book_101" and primary_uid == 1 and (req_ver is None or req_ver == 100):
+            zip_path = os.path.join(fix_dir, "sample_epub_chapter0_and_1.zip")
+            if not os.path.exists(zip_path):
+                self._send_json(500, {"errcode": -500, "errmsg": "Missing sample_epub_chapter0_and_1.zip fixture"})
+                return
+            with open(zip_path, "rb") as f:
+                content = f.read()
+            secret = str(vid_snap)
+            enc_key_hdr = encrypt_encrypt_key("test_password_123", secret)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("encryptkey", enc_key_hdr)
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
             return
 
-        with open(zip_path, "rb") as f:
-            content = f.read()
+        # Dynamic multi-chapter / multi-book synthesis matching weread_chapter.c:assemble()
+        ch_meta = next(
+            (c for c in chapters_for_book if int(c.get("chapterUid", 0)) == primary_uid),
+            None,
+        )
+        ch_idx = int(ch_meta.get("chapterIdx", primary_uid)) if ch_meta else primary_uid
+        ch_title = ch_meta.get("title", f"第{primary_uid}章") if ch_meta else f"第{primary_uid}章"
+        eff_ver = req_ver if req_ver is not None else expected_ver
 
-        # Generate encryptkey header using user's vid (or skey)
-        secret = str(GLOBAL_STATE.current_vid)
+        if book_type == "txt":
+            suffix = f"_{primary_uid}_o"
+            max_bid_bytes = max(1, 100 - len(suffix.encode("utf-8")))
+            bid_safe = book_id.encode("utf-8")[:max_bid_bytes].decode("utf-8", errors="ignore")
+            leaf_name = f"{bid_safe}{suffix}"
+            info_json = {
+                "bookId": book_id,
+                "bookVersion": eff_ver,
+                "chapters": [
+                    {
+                        "chapterUid": primary_uid,
+                        "chapterIdx": ch_idx,
+                        "title": ch_title,
+                        "files": [leaf_name],
+                    }
+                ],
+            }
+            info_bytes = json.dumps(info_json, ensure_ascii=False, indent=2).encode("utf-8")
+            text_bytes = (
+                f"{ch_title}\n"
+                f"这是书籍 {book_id} 第 {primary_uid} 章（版本 {eff_ver}）的动态文本正文。\n"
+                f"第一段用于验证多章缓存与离线阅读。\n"
+                f"第二段用于验证位置映射与跨章跳转。\n"
+            ).encode("utf-8")
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tf:
+                ti_info = tarfile.TarInfo(name="info.txt")
+                ti_info.size = len(info_bytes)
+                tf.addfile(ti_info, io.BytesIO(info_bytes))
+                ti_txt = tarfile.TarInfo(name=leaf_name)
+                ti_txt.size = len(text_bytes)
+                tf.addfile(ti_txt, io.BytesIO(text_bytes))
+            content = buf.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-tar")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+            return
+
+        # Dynamic EPUB ZipCrypto archive
+        part_name = f"Text/chapter_{primary_uid}.xhtml"
+        info_json = {
+            "bookId": book_id,
+            "bookVersion": eff_ver,
+            "chapters": [
+                {
+                    "chapterUid": primary_uid,
+                    "chapterIdx": ch_idx,
+                    "title": ch_title,
+                    "files": [part_name],
+                }
+            ],
+        }
+        entries = {
+            "info.txt": json.dumps(info_json, ensure_ascii=False, indent=2).encode("utf-8"),
+            "Styles/main.css": b"body { font-size: 16px; line-height: 1.6; }\np { text-indent: 2em; }",
+            part_name: (
+                f"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                f"<!DOCTYPE html>\n"
+                f"<html xmlns=\"http://www.w3.org/1999/xhtml\">\n"
+                f"<head><title>{ch_title}</title><link rel=\"stylesheet\" href=\"../Styles/main.css\"/></head>\n"
+                f"<body>\n<h1>{ch_title}</h1>\n"
+                f"<p>这是书籍 {book_id} 第 {primary_uid} 章（版本 {eff_ver}）的动态 EPUB 正文。</p>\n"
+                f"<p>支持全书离线缓存、章节跳转与跨章撤回。</p>\n"
+                f"</body>\n</html>"
+            ).encode("utf-8"),
+        }
+        content = _make_zipcrypto_zip(entries, b"test_password_123")
+        secret = str(vid_snap)
         enc_key_hdr = encrypt_encrypt_key("test_password_123", secret)
-
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("encryptkey", enc_key_hdr)

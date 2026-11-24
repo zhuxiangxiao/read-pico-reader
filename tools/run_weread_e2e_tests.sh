@@ -12,6 +12,7 @@ WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PORT="${WEREAD_MOCK_PORT:-8989}"
 TIER="${TIER:-all}"
+UX_MODE="${WEREAD_UX_MODE:-strict}"
 VERBOSE="${VERBOSE:-0}"
 SMOKE_ONLY="${SMOKE_ONLY:-0}"
 
@@ -25,6 +26,14 @@ while [[ $# -gt 0 ]]; do
             TIER="$2"
             shift 2
             ;;
+        --ux-mode)
+            UX_MODE="$2"
+            if [[ "$UX_MODE" != "strict" && "$UX_MODE" != "baseline" ]]; then
+                echo "Invalid --ux-mode: $UX_MODE (expected strict|baseline)" >&2
+                exit 1
+            fi
+            shift 2
+            ;;
         --verbose)
             VERBOSE=1
             shift
@@ -35,7 +44,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1" >&2
-            echo "Usage: $0 [--tier 1|2|3|4|all] [--smoke-only] [--verbose] [--port <int>]" >&2
+            echo "Usage: $0 [--tier 1|2|3|4|ux|all] [--ux-mode strict|baseline] [--smoke-only] [--verbose] [--port <int>]" >&2
             exit 1
             ;;
     esac
@@ -137,6 +146,9 @@ if [ "$SMOKE_ONLY" -eq 0 ]; then
             4|tier4)
                 TIER_DIRS=("${TESTS_DIR}/tier4_scenarios")
                 ;;
+            ux)
+                TIER_DIRS=()
+                ;;
             all|*)
                 TIER_DIRS=(
                     "${TESTS_DIR}/tier1_features"
@@ -147,20 +159,32 @@ if [ "$SMOKE_ONLY" -eq 0 ]; then
                 ;;
         esac
 
-        for tdir in "${TIER_DIRS[@]}"; do
-            if [ -d "$tdir" ]; then
-                for test_file in "$tdir"/test_*.py; do
-                    if [ -f "$test_file" ]; then
-                        run_test_cmd "$(basename "$test_file")" python3 "$test_file"
-                    fi
-                done
-                for test_file in "$tdir"/test_*.sh; do
-                    if [ -f "$test_file" ]; then
-                        run_test_cmd "$(basename "$test_file")" bash "$test_file"
-                    fi
-                done
+        if [ ${#TIER_DIRS[@]} -gt 0 ]; then
+            for tdir in "${TIER_DIRS[@]}"; do
+                if [ -d "$tdir" ]; then
+                    for test_file in "$tdir"/test_*.py; do
+                        if [ -f "$test_file" ]; then
+                            run_test_cmd "$(basename "$test_file")" python3 "$test_file"
+                        fi
+                    done
+                    for test_file in "$tdir"/test_*.sh; do
+                        if [ -f "$test_file" ]; then
+                            run_test_cmd "$(basename "$test_file")" bash "$test_file"
+                        fi
+                    done
+                fi
+            done
+        fi
+    fi
+
+    if [ "$TIER" = "all" ] || [ "$TIER" = "ux" ]; then
+        if [ -f "${SCRIPT_DIR}/test_weread_ux_e2e.py" ]; then
+            UX_ARGS=(--port "$PORT" --mode "$UX_MODE")
+            if [ "$VERBOSE" -eq 1 ]; then
+                UX_ARGS+=(--verbose)
             fi
-        done
+            run_test_cmd "WeRead UX E2E & Native Contracts (WR-UX-01..09, mode=${UX_MODE})" python3 "${SCRIPT_DIR}/test_weread_ux_e2e.py" "${UX_ARGS[@]}"
+        fi
     fi
 fi
 

@@ -10,6 +10,7 @@
 #include "weread_toc.h"
 #include "weread_chapter.h"
 #include "weread_progress.h"
+#include "weread_store.h"
 #include "book_source_weread.h"
 #include "weread_runtime.h"
 #ifdef WEREAD_TEST_MEMORY
@@ -284,6 +285,21 @@ int main(int argc, char **argv) {
     if(weread_runtime_idle(active_base+65000)){result=completion();assert(result.job==WR_JOB_REPORT);weread_runtime_result_free(&result);}
     assert(weread_runtime_idle(active_base+605000));result=completion();
     assert(result.job==WR_JOB_DISCONNECT&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    // HTTP activity refreshes s_network_active so idle disconnect waits 600000ms from last HTTP activity.
+    assert(weread_runtime_connect(NULL)==ESP_OK&&weread_runtime_network_active());
+    uint64_t connect_ms=milliseconds();
+    usleep(60000);
+    assert(weread_progress_note("test_book_101",local.chapter_uid,local.chapter_index,local.chapter_offset,local.progress,1,1,"keepalive",1700000250)==ESP_OK);
+    assert(weread_runtime_start(WR_JOB_NOTE,"test_book_101",NULL));result=completion();
+    assert(result.job==WR_JOB_NOTE&&result.error==ESP_OK);weread_runtime_result_free(&result);
+    uint64_t http_ms=milliseconds();
+    assert(http_ms>connect_ms+40);
+    if(weread_runtime_idle(connect_ms+600000)){result=completion();assert(result.job!=WR_JOB_DISCONNECT);weread_runtime_result_free(&result);}
+    assert(weread_runtime_network_active());
+    if(weread_runtime_idle(http_ms+599000)){result=completion();assert(result.job!=WR_JOB_DISCONNECT);weread_runtime_result_free(&result);}
+    assert(weread_runtime_network_active());
+    assert(weread_runtime_idle(http_ms+601000));result=completion();
+    assert(result.job==WR_JOB_DISCONNECT&&result.error==ESP_OK);weread_runtime_result_free(&result);
     puts("PASS: local persistence, cached chapter preparation and text input remain below100ms during delayed HTTP; ACK preserves newer revisions; closed-book idle drains the durable outbox");
     // shutdown中断阻塞响应；取消后可重新创建任务。/ Shutdown interrupts blocked responses and permits worker restart.
     control("{\"latency\":1.5}");
@@ -313,7 +329,53 @@ int main(int argc, char **argv) {
     assert(weread_auth_save_session(&account)==ESP_OK&&weread_auth_load_session(&account)==ESP_OK);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK&&local.dirty&&local.position_pending);
     assert(weread_progress_load("test_book_101",&local)==ESP_OK);
-    assert(weread_runtime_start(WR_JOB_LOGOUT,NULL,NULL));result=completion();assert(result.error==ESP_OK&&!result.authenticated&&!result.count);weread_runtime_result_free(&result);
+    // Re-cache test_book_101 chapters 1 & 2 while keeping txt_book_202 uncached, then trigger terminal -2013.
+    assert(weread_chapter_download("test_book_101",1)==ESP_OK);
+    assert(weread_chapter_download("test_book_101",2)==ESP_OK);
+    // WR-UX-01b: terminal -2013 transitions to expired read-only mode retaining s_books, allowing cached open & blocking uncached with 0 HTTP calls.
+    control("{\"endpoint_errors\":{\"/shelf/sync\":{\"status\":401,\"body\":{\"errcode\":-2013}},\"/weblogin\":{\"status\":401,\"body\":{\"errcode\":-2013}}}}");
+    assert(weread_runtime_start(WR_JOB_SYNC,NULL,NULL));result=completion();
+    assert(result.error!=ESP_OK&&!result.authenticated&&result.auth_expired&&result.count==2&&result.books!=NULL);weread_runtime_result_free(&result);
+    assert(weread_runtime_start(WR_JOB_INIT,NULL,NULL));result=completion();
+    assert(result.error==ESP_OK&&!result.authenticated&&result.auth_expired&&result.count==2&&result.books!=NULL);weread_runtime_result_free(&result);
+    weread_client_set_download_transport(offline,NULL);unsigned before_offline_dl=offline_downloads;
+    assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready&&!result.authenticated&&result.auth_expired&&offline_downloads==before_offline_dl);weread_runtime_result_free(&result);
+    assert(weread_runtime_start(WR_JOB_OPEN,"txt_book_202",NULL));result=completion();
+    assert(result.error==ESP_ERR_INVALID_STATE&&!result.open_ready&&result.auth_expired&&offline_downloads==before_offline_dl);weread_runtime_result_free(&result);
+    weread_client_set_download_transport(NULL,NULL);
+    control("{\"endpoint_errors\":{}}");
+    // WR-UX-01b mid-open -2013/401 on unread cached test_book_101 & unread uncached txt_book_202.
+    assert(weread_auth_save_session(&account)==ESP_OK&&weread_auth_load_session(&account)==ESP_OK);
+    {
+        char prog_path[512],prev_path[560],owner_leaf[64];
+        snprintf(owner_leaf,sizeof(owner_leaf),"progress.json.%s",account.vid);
+        assert(wr_cache_path("test_book_101","progress.json",prog_path,sizeof(prog_path))==ESP_OK);
+        snprintf(prev_path,sizeof(prev_path),"%s.previous",prog_path);
+        unlink(prog_path);unlink(prev_path);
+        assert(wr_cache_path("test_book_101",owner_leaf,prog_path,sizeof(prog_path))==ESP_OK);
+        snprintf(prev_path,sizeof(prev_path),"%s.previous",prog_path);
+        unlink(prog_path);unlink(prev_path);
+        assert(wr_cache_path("txt_book_202","progress.json",prog_path,sizeof(prog_path))==ESP_OK);
+        snprintf(prev_path,sizeof(prev_path),"%s.previous",prog_path);
+        unlink(prog_path);unlink(prev_path);
+        assert(wr_cache_path("txt_book_202",owner_leaf,prog_path,sizeof(prog_path))==ESP_OK);
+        snprintf(prev_path,sizeof(prev_path),"%s.previous",prog_path);
+        unlink(prog_path);unlink(prev_path);
+        assert(weread_progress_load("test_book_101",&local)==ESP_ERR_NOT_FOUND);
+        assert(weread_progress_load("txt_book_202",&local)==ESP_ERR_NOT_FOUND);
+    }
+    weread_client_set_download_transport(offline,NULL);before_offline_dl=offline_downloads;
+    control("{\"endpoint_errors\":{\"/shelf/syncbook\":{\"status\":401,\"body\":{\"errcode\":-2013}},\"/weblogin\":{\"status\":401,\"body\":{\"errcode\":-2013}}}}");
+    assert(weread_runtime_start(WR_JOB_OPEN,"test_book_101",NULL));result=completion();
+    assert(result.error==ESP_OK&&result.open_ready&&!result.authenticated&&result.auth_expired&&offline_downloads==before_offline_dl);weread_runtime_result_free(&result);
+    assert(weread_auth_save_session(&account)==ESP_OK&&weread_auth_load_session(&account)==ESP_OK);
+    control("{\"endpoint_errors\":{\"/shelf/syncbook\":{\"status\":200,\"body\":{\"errcode\":-2013}},\"/weblogin\":{\"status\":401,\"body\":{\"errcode\":-2013}}}}");
+    assert(weread_runtime_start(WR_JOB_OPEN,"txt_book_202",NULL));result=completion();
+    assert(result.error==ESP_ERR_INVALID_STATE&&!result.open_ready&&!result.authenticated&&result.auth_expired&&offline_downloads==before_offline_dl);weread_runtime_result_free(&result);
+    weread_client_set_download_transport(NULL,NULL);
+    control("{\"endpoint_errors\":{}}");
+    assert(weread_runtime_start(WR_JOB_LOGOUT,NULL,NULL));result=completion();assert(result.error==ESP_OK&&!result.authenticated&&!result.auth_expired&&!result.count);weread_runtime_result_free(&result);
     // 65秒扫码等待也必须被退页/锁屏立即打断。/ Exit/lock must also interrupt the65s QR wait immediately.
     assert(weread_runtime_start(WR_JOB_QR,NULL,NULL));result=completion();assert(result.error==ESP_OK);
     strcpy(uid,result.uid);weread_runtime_result_free(&result);

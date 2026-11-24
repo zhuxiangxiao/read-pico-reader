@@ -5,7 +5,7 @@ Covers:
 - Category 1: Token Expiration During Streaming (streaming 401/-2013, buffer cleanup, download replay, encryptkey refresh, background prefetch renew)
 - Category 2: Token Expiration During Shelf Sync (full sync renewal, incremental synckey preservation, syncbook batch renewal, cover 401, shelf consistency)
 - Category 3: Token Expiration During Progress Upload (periodic report renewal, exit report renewal, web fallback renewal, refresh fail dirty mark, synckey update)
-- Category 4: Renewal Returning -2013 / Refresh Token Expired (dead refresh token detection, auth.json wipe, UI login transition, cache preservation, prefetch cancel)
+- Category 4: Renewal Returning -2013 / Refresh Token Expired (WR-UX-01: passive expired: true + read-only vid/deviceId, explicit WR_JOB_LOGOUT wipe, offline readonly shelf when s_count > 0, cache preservation, prefetch cancel)
 - Category 5: Renewal Without Replacement Refresh Token (missing refresh token retained, empty string retained, timestamp update, new accessToken used, atomic save)
 - Category 6: Concurrent Renewals & Stampede Prevention (single inflight renewal, lock queuing, dual replay, dual failure propagation, lock release on exception)
 - Category 7: Stale Session Responses & Clock Skew (older updateTime ignored, clock skew clamping, rapid 2013 capped to 1 replay, replay counter reset, stale QR timeout)
@@ -27,10 +27,14 @@ import urllib.request
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 WORKSPACE_ROOT = os.path.abspath(os.path.join(TOOLS_DIR, ".."))
+COMMON_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "common")
+if COMMON_DIR not in sys.path:
+    sys.path.insert(0, COMMON_DIR)
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
 import weread_mock_server
+from weread_client_sim import WereadClient, WereadShelfModel, WereadStorage
 
 
 PORT = int(os.environ.get("WEREAD_MOCK_PORT", "8989"))
@@ -285,27 +289,67 @@ def test_renewal_itself_fails_with_2013():
     assert json.loads(body.decode("utf-8"))["errcode"] == -2013
 
 
-def test_full_expiry_wipes_auth_json():
-    """Verify dead refresh token causes auth.json to be deleted."""
+def test_passive_expiry_retains_readonly_owner_identity():
+    """WR-UX-01: Passive -2013 clears tokens, sets expired: true, and retains read-only vid/deviceId."""
+    reset_mock_state()
+    set_mock_state({"renew_error": {"status": 401, "body": {"errcode": -2013, "errmsg": "refresh token expired"}}})
+    set_mock_state({"endpoint_errors": {"/shelf/sync": {"status": 401, "body": {"errcode": -2013}}}})
     with tempfile.TemporaryDirectory() as storage_root:
-        auth_file = os.path.join(storage_root, "auth.json")
-        with open(auth_file, "w") as f:
-            f.write('{"accessToken": "dead"}')
-        assert os.path.exists(auth_file)
+        storage = WereadStorage(storage_root)
+        client = WereadClient(PORT, storage)
+        client.mark_expired_on_2013 = True
+        storage.save_auth({
+            "vid": "12345678",
+            "skey": "dead_skey",
+            "accessToken": "dead_acc",
+            "refreshToken": "dead_ref",
+            "deviceId": "eink-dev-ux01",
+            "deviceName": "KiikoReader",
+            "updatedAt": 1700000000,
+        })
+        status, _, _ = client.request("GET", "/shelf/sync?synckey=0")
+        assert status == 401
+        auth = storage.load_auth()
+        assert auth is not None
+        assert auth.get("expired") is True
+        assert "accessToken" not in auth and "refreshToken" not in auth and "skey" not in auth
+        assert auth.get("vid") == "12345678"
+        assert auth.get("deviceId") == "eink-dev-ux01"
+        assert storage.is_auth_expired() is True
+        assert storage.owner_matches("12345678") is True
+        assert client.is_authenticated is False
 
-        # Full expiry wipe
-        if os.path.exists(auth_file):
-            os.remove(auth_file)
-        assert not os.path.exists(auth_file)
+
+def test_explicit_logout_wipes_auth_json():
+    """WR-UX-01: Explicit WR_JOB_LOGOUT deletes auth.json completely and clears expired flag."""
+    with tempfile.TemporaryDirectory() as storage_root:
+        storage = WereadStorage(storage_root)
+        client = WereadClient(PORT, storage)
+        storage.save_auth({"vid": "12345678", "deviceId": "eink-dev-1", "expired": True})
+        assert os.path.exists(storage.auth_file)
+        client.logout()
+        assert not os.path.exists(storage.auth_file)
+        assert storage.is_auth_expired() is False
+        assert storage.owner_matches("12345678") is False
 
 
-def test_full_expiry_transitions_ui_to_login():
-    """Verify dead session transitions UI state to QR_LOGIN_PROMPT."""
-    app_state = "READING"
-    session_valid = False
-    if not session_valid:
-        app_state = "QR_LOGIN_PROMPT"
-    assert app_state == "QR_LOGIN_PROMPT"
+def test_passive_expiry_with_books_enters_offline_readonly_shelf():
+    """WR-UX-01: Passive expiry with s_count > 0 enters OFFLINE_READONLY_SHELF instead of kicking to QR."""
+    with tempfile.TemporaryDirectory() as storage_root:
+        storage = WereadStorage(storage_root)
+        shelf = WereadShelfModel(storage)
+        books = [
+            {"bookId": "cached_1", "title": "已缓存书", "cachedChapters": 2, "totalChapters": 2},
+            {"bookId": "uncached_2", "title": "未缓存书", "cachedChapters": 0, "totalChapters": 5},
+        ]
+        shelf.load_snapshot(books, authenticated=False, expired=True)
+        ui = shelf.render()
+        assert ui["screen"] == "SHELF"
+        assert shelf.offline_readonly is True
+        assert "登录已过期" in ui["bottomMessage"]
+        assert shelf.preempt_for_open("cached_1") == "WR_JOB_OPEN"
+        assert shelf.preempt_for_open("uncached_2") == "QR_LOGIN_PROMPT"
+        assert shelf.render()["backToShelf"] is True
 
 
 def test_full_expiry_preserves_cached_books():
@@ -569,8 +613,9 @@ ALL_TESTS = [
     test_progress_replay_updates_local_synckey,
     # Category 4
     test_renewal_itself_fails_with_2013,
-    test_full_expiry_wipes_auth_json,
-    test_full_expiry_transitions_ui_to_login,
+    test_passive_expiry_retains_readonly_owner_identity,
+    test_explicit_logout_wipes_auth_json,
+    test_passive_expiry_with_books_enters_offline_readonly_shelf,
     test_full_expiry_preserves_cached_books,
     test_full_expiry_aborts_background_tasks,
     # Category 5
