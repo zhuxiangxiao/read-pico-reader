@@ -109,6 +109,8 @@ typedef struct { bool dirty; } pending_progress_t;
 static int s_view = READING, s_reader_panel = READER_PANEL_NONE, s_mode, s_reader_slider;
 static bool s_clear_confirm, s_toolbar, s_reader_footer_pending, s_reader_text_frame = true, s_reader_fullscreen;
 static bool s_water_turn_pending, s_reader_turn_pending, s_reader_image_refresh_pending, s_reader_cleanup;
+static bool s_reader_dc_recover __attribute__((unused));
+static uint8_t s_dc_recover_pages __attribute__((unused));
 static bool s_reader_image_frame __attribute__((unused)), s_reader_image_exit_pending __attribute__((unused));
 static bool s_rc_auto_turning, s_part_more, s_save_failed, s_toc_jump_open;
 static bool s_reader_rule_pending, s_txt_opening, s_ticket_cover_started __attribute__((unused)), s_ticket_cover_done __attribute__((unused));
@@ -264,6 +266,7 @@ static size_t book_chapter_count(void) { return 20; }
 static void ticket_count_turn(void) {}
 static uint8_t app_settings_reader_full_pages(void) { return 0; }
 static int app_settings_reader_turn_effect(void) { return 0; }
+static bool __attribute__((unused)) app_settings_low_ghost(void) { return false; }
 static const char *app_settings_book_background_path(void) { return ""; }
 static app_redraw_t paint_reading(app_ctx_t *c, int m) { (void)c; s_mode = m; s_area = (EpdRect){0, 176, 684, 872}; return APP_REDRAW_AREA; }
 

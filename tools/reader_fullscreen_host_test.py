@@ -61,6 +61,8 @@ static int s_px=48,s_reader_panel=READER_PANEL_NONE,s_reader_slider=-1,s_view=RE
 #define s_toolbar (s_reader_panel!=READER_PANEL_NONE)
 static bool s_reader_fullscreen,s_clear_confirm,s_reader_text_frame,s_reader_turn_pending;
 static bool s_water_turn_pending,s_reader_cleanup,draw_locked,load_failed;
+static bool s_reader_dc_recover __attribute__((unused));
+static uint8_t s_dc_recover_pages __attribute__((unused));
 static int s_water_turn_dir;
 static unsigned s_stats_pending_turns,s_session_turns,s_turns,s_unsaved;
 static int64_t s_last_turn_ms,s_stats_activity_ms;
@@ -124,6 +126,7 @@ static int book_toc_open(size_t current){assert(current==s_chapter);return (int)
 static void toc_cached_markers_prepare(int page){(void)page;}
 static void skip_hidden_image_pages(app_ctx_t *ctx,int dir){(void)ctx;(void)dir;}
 static uint8_t app_settings_reader_full_pages(void){return full_pages;}
+static bool __attribute__((unused)) app_settings_low_ghost(void){return false;}
 static int effect=1;
 static int app_settings_reader_turn_effect(void){return effect;}
 static int test_images;
