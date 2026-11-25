@@ -10738,6 +10738,9 @@ static void before_lock(app_ctx_t* ctx) {
     if (s_text && s_path[0]) book_progress_set_last_path(s_path);
     flush_ticket_stats();
 }
+static void after_lock(app_ctx_t* ctx) {
+    if (s_text && book_path_is_weread(s_path)) weread_reader_wake((uint64_t)ctx->now_ms);
+}
 static EpdRect area_hint(app_ctx_t* ctx) { (void)ctx; return s_area; }
 static bool main_page_visible(app_ctx_t* ctx) {
     (void)ctx;
@@ -10755,7 +10758,7 @@ const app_desc_t app_book = {
     .main_page_visible = main_page_visible,
     .render = render, .present = present, .on_enter = on_enter, .on_exit = book_on_exit,
     .on_media_lost = book_on_media_lost, .on_media_ready = book_on_media_ready,
-    .on_before_lock = before_lock, .on_main_key = shelf_main_key,
+    .on_before_lock = before_lock, .on_after_lock = after_lock, .on_main_key = shelf_main_key,
     .on_gesture = gesture_event, .on_key = on_key, .on_key_long = on_key_long,
     .wants_pinch = wants_pinch, .on_pinch = on_pinch,
     .on_power_short = on_power_short,

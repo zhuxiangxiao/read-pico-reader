@@ -1434,6 +1434,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         last_input_ms = ctx.now_ms;
                         poll_media(&ctx, current, &media_mounted, &media_invalidated);
                         last_media_poll_ms = ctx.now_ms;
+                        if (current->on_after_lock) current->on_after_lock(&ctx);
                         ctx.pressed = false;
                         ctx.released = false;
                         app_present(&ctx, current, APP_REDRAW_PAGE);
@@ -1640,6 +1641,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         last_input_ms = ctx.now_ms;
                         const bool media_redraw = poll_media(&ctx, current, &media_mounted, &media_invalidated);
                         last_media_poll_ms = ctx.now_ms;
+                        if (current->on_after_lock) current->on_after_lock(&ctx);
                         ctx.consumed = true;
                         ctx.pressed = false;
                         ctx.released = false;
@@ -1690,6 +1692,7 @@ void app_loop_run(const app_loop_config_t* config) {
                         last_input_ms = ctx.now_ms;
                         const bool media_redraw = poll_media(&ctx, current, &media_mounted, &media_invalidated);
                         last_media_poll_ms = ctx.now_ms;
+                        if (current->on_after_lock) current->on_after_lock(&ctx);
                         ctx.consumed = true;
                         ctx.pressed = false;
                         ctx.released = false;
@@ -1865,6 +1868,7 @@ void app_loop_run(const app_loop_config_t* config) {
             last_input_ms = ctx.now_ms;
             const bool media_redraw = poll_media(&ctx, current, &media_mounted, &media_invalidated);
             last_media_poll_ms = ctx.now_ms;
+            if (current->on_after_lock) current->on_after_lock(&ctx);
             ctx.pressed = ctx.released = false;
 #if KIIKO_BOARD_METALIO47
             wake_page_pending = !media_redraw && app_sleep_media_pending();

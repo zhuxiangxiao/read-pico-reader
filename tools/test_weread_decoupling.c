@@ -331,6 +331,8 @@ int main(int argc, char **argv) {
         drain_worker();
         weread_reader_tick(uri, 7, 0, 99, "last", sim + 1250, true);
         drain_worker();
+        weread_reader_tick(uri, 7, 0, 99, "last", sim + 1300, true);
+        drain_worker();
         weread_reader_cached_progress(&cached, &total);
         assert(cached == 8 && total == 8);
         assert(atomic_load(&s_downloads) == downloads_done);

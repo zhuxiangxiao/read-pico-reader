@@ -65,7 +65,7 @@ static int long_keys;
 static uint8_t idle_minutes;
 static bool download_session;
 bool app_download_active(void) { return download_session; }
-static int idle_locks, before_locks, lock_feedback_calls, lock_badges, wake_clean_requests;
+static int idle_locks, before_locks, after_locks, lock_feedback_calls, lock_badges, wake_clean_requests;
 static bool feedback_enabled;
 static bool online_busy;
 static bool ble_enabled, saved_wifi, upload_busy, click_enabled, click_active;
@@ -387,7 +387,7 @@ static void reset(void) {
     transfer_status=(read_pico_transfer_status_t){0};
     recent_cancels=status_draws=status_partial_draws=0;
     recent_requests=quick_draws=quick_opens=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
-    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
+    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=after_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
     media_test=sd_font=saved_sd_font=false;media_lost=media_ready=builtin_opens=font_opens=probes=0;loss_step=-1;
@@ -414,6 +414,7 @@ static void home_case(void) {
 }
 static bool product_menu_disabled(app_ctx_t *ctx) {(void)ctx;return false;}
 static void before_lock(app_ctx_t *ctx) {(void)ctx;if(check_clean_action)assert(frame[0]==0x11&&panel_marker==0x11);++before_locks;}
+static void after_lock(app_ctx_t *ctx) {(void)ctx;++after_locks;}
 static bool main_first(app_ctx_t* ctx) {(void)ctx;return main_source_visible;}
 static bool main_second(app_ctx_t* ctx) {(void)ctx;return main_target_visible;}
 static void enter_subview(app_ctx_t* ctx) {enter(ctx);main_target_visible=false;}
@@ -619,9 +620,9 @@ int main(void) {
     reset();media_test=sd_font=saved_sd_font=true;mounted_steps[0]=mounted_steps[2]=true;time_step=4000000;first.on_media_lost=lost;
     add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);add(0,0,0,0);run();
     assert(media_lost==2&&builtin_opens==2&&!probes&&font_opens==1);
-    reset();idle_minutes=1;time_step=60000000;first.on_before_lock=before_lock;
+    reset();idle_minutes=1;time_step=60000000;first.on_before_lock=before_lock;first.on_after_lock=after_lock;
     add(0,0,0,0);add(0,0,0,0);run();
-    assert(idle_locks==1&&before_locks==1&&wake_clean_requests==1); // Real scheduler flushes before automatic lock.
+    assert(idle_locks==1&&before_locks==1&&after_locks==1&&wake_clean_requests==1); // Real scheduler flushes before automatic lock.
     reset();idle_minutes=1;time_step=60000000;shake_activity=true;
     add(0,0,0,0);run();assert(!idle_locks);
     reset();idle_minutes=1;time_step=60000000;shake_activity=true;

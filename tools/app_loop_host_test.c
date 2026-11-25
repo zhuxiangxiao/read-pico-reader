@@ -56,7 +56,7 @@ static int sample_count, step, ticks, enters, exits, touch_calls, keys[3], event
 static int menus, highlights, restores, fulls, mode, tick_consumed[32];
 static int long_keys;
 static uint8_t idle_minutes;
-static int idle_locks, before_locks, lock_feedback_calls, lock_badges, wake_clean_requests;
+static int idle_locks, before_locks, after_locks, lock_feedback_calls, lock_badges, wake_clean_requests;
 static bool feedback_enabled;
 static int wake_present_before, network_resumes;
 static bool resume_test, fresh_key_sent, resume_drain_blocked;
@@ -298,7 +298,7 @@ static void reset(void) {
     ble_enabled=saved_wifi=upload_busy=click_enabled=click_active=false;
     transfer_status=(read_pico_transfer_status_t){0};
     quick_draws=quick_gl=quick_du=wifi_starts=wifi_stops=ble_resets=click_presses=click_restores=0;
-    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
+    main_fast=main_water=false;shelf_exit_arms=0;idle_minutes=0;idle_locks=before_locks=after_locks=lock_feedback_calls=lock_badges=wake_clean_requests=0;feedback_enabled=false;online_busy=false;
     nav_arms=nav_draws=nav_full_arms=nav_area_draws=0;nav_armed=NULL;
     main_source_visible=main_target_visible=true;
     auto_recovery_test=test_usb_active=false;recovery_calls=health_polls=0;recovery_step=-1;covers_busy_until=avatar_busy_until=-1;
@@ -326,6 +326,7 @@ static void home_case(void) {
 }
 static bool product_menu_disabled(app_ctx_t *ctx) {(void)ctx;return false;}
 static void before_lock(app_ctx_t *ctx) {(void)ctx;if(check_clean_action)assert(frame[0]==0x11&&panel_marker==0x11);++before_locks;}
+static void after_lock(app_ctx_t *ctx) {(void)ctx;++after_locks;}
 static bool main_first(app_ctx_t* ctx) {(void)ctx;return main_source_visible;}
 static bool main_second(app_ctx_t* ctx) {(void)ctx;return main_target_visible;}
 static void enter_subview(app_ctx_t* ctx) {enter(ctx);main_target_visible=false;}
@@ -553,9 +554,9 @@ int main(void) {
     }
     puts("PASS: real loop media recovery joins consumers, restores font once, retries with backoff and respects upload/OTA/USB ownership");
 #endif
-    reset();idle_minutes=1;time_step=60000000;first.on_before_lock=before_lock;
+    reset();idle_minutes=1;time_step=60000000;first.on_before_lock=before_lock;first.on_after_lock=after_lock;
     add(0,0,0,0);add(0,0,0,0);run();
-    assert(idle_locks==1&&before_locks==1&&wake_clean_requests==1); // Real scheduler flushes before automatic lock.
+    assert(idle_locks==1&&before_locks==1&&after_locks==1&&wake_clean_requests==1); // Real scheduler flushes before automatic lock.
     reset();idle_minutes=1;time_step=60000000;shake_activity=true;
     add(0,0,0,0);run();assert(!idle_locks);
     reset();idle_minutes=1;time_step=60000000;shake_activity=true;

@@ -123,6 +123,9 @@ esp_err_t weread_reader_resume_chapter(const char *uri, size_t *chapter, uint32_
 void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsigned percent,
     const char *summary, uint64_t now_ms, bool active);
 void weread_reader_flush(uint64_t now_ms, bool stop_network);
+/// 浅睡唤醒后恢复阅读态位图/实时坐标并重新触发云端进度检查（零阻塞、零磁盘 IO）。
+/// Restore reader cache bitmap/live position after light-sleep wake and re-arm cloud progress check (non-blocking, zero disk IO).
+void weread_reader_wake(uint64_t now_ms);
 void weread_reader_end(uint64_t now_ms);
 
 /* ---- 开书/切章阶段与手动缓存 / Open stages and manual caching ---- */

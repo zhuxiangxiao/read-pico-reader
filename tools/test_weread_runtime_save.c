@@ -18,6 +18,8 @@ FILE *runtime_test_fopen(const char *path,const char *mode){
 static unsigned progress_posts;
 static unsigned progress_reads,note_jobs,report_jobs,purchase_uid;
 static uint32_t cloud_uid=11,cloud_index=1,cloud_offset,cloud_percent;
+static unsigned sync_fail_times;
+static esp_err_t sync_fail_err=ESP_FAIL;
 static atomic_bool note_sync_gate,note_sync_entered,note_sync_release;
 static bool clean_guards_shelf;
 static unsigned cache_heal_toc_limit;
@@ -56,7 +58,9 @@ static esp_err_t counted_request(const char *url,const char *method,const char *
             atomic_store(&note_sync_entered,true);
             while(!atomic_load(&note_sync_release))usleep(1000);
         }
-        ++progress_reads;char text[1024];
+        ++progress_reads;
+        if(sync_fail_times){--sync_fail_times;*out=NULL;*len=0;*status=0;return sync_fail_err;}
+        char text[1024];
         if(clean_guards_shelf&&body&&strstr(body,"finished_book")){
             snprintf(text,sizeof(text),"{\"books\":[{\"bookId\":\"window_book\",\"title\":\"Window\",\"format\":\"epub\",\"bookVersion\":%u},{\"bookId\":\"finished_book\",\"title\":\"Finished\",\"format\":\"epub\",\"bookVersion\":%u}],\"bookProgress\":[{\"bookId\":\"window_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100},{\"bookId\":\"finished_book\",\"chapterUid\":11,\"chapterIdx\":1,\"chapterOffset\":0,\"progress\":100}]}",server_version,server_version);
         }else{
@@ -231,6 +235,112 @@ int main(int argc,char **argv){
     size_t chapter=0;uint32_t actual_version=0;assert(book_weread_commit_loaded(&chapter,&actual_version)==ESP_OK&&chapter==0&&actual_version==100);
     uint32_t raw=0;assert(book_weread_map(0,true,4,&raw)==ESP_OK);
     if(!strncmp(mode,"throttle-",9)||!strcmp(mode,"exit-note-online")||!strcmp(mode,"cloud-turn-rebase")){test_throttle(mode,&text);return 0;}
+    if(!strcmp(mode,"cloud-sync-priority-wake")){
+        weread_reader_end(1500);book_weread_close();
+        // 1. Cached chapter open ("open local-fast") runs WR_JOB_CLOUD_SYNC before WR_JOB_PREFETCH("1") and scan.
+        cloud_uid=50;cloud_index=3;cloud_offset=0;cloud_percent=38;
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));
+        assert(observe_result()==WR_JOB_OPEN&&progress_reads==0);
+        assert(book_weread_open("weread://window_book")==ESP_OK);
+        size_t rch=99;uint32_t rso=99;
+        assert(weread_reader_resume_chapter("weread://window_book",&rch,&rso)==ESP_OK&&rch==0);
+        weread_reader_begin("weread://window_book",2000);
+        weread_reader_tick("weread://window_book",0,0,1,"start",2000,true);
+        weread_reader_tick("weread://window_book",0,0,1,"start",2300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC&&progress_reads==1);
+        size_t jch=99;uint32_t joff=99;
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==2);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        weread_reader_tick("weread://window_book",2,0,38,"ch2",2350,false);
+
+        // 2. Transient ESP_ERR_TIMEOUT on WR_JOB_CLOUD_SYNC silently replays once inside perform_job without setting WEREAD_STAGE_RETRY.
+        cloud_uid=103;cloud_index=4;cloud_offset=0;cloud_percent=50;
+        unsigned reads_before=progress_reads;
+        sync_fail_times=1;sync_fail_err=ESP_ERR_TIMEOUT;
+        weread_reader_wake(3000);
+        weread_reader_tick("weread://window_book",2,0,38,"ch2",3300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+2&&sync_fail_times==0);
+        weread_stage_t st=WEREAD_STAGE_RETRY;uint64_t bytes=0;
+        assert(!weread_reader_stage(&st,&bytes)&&st==WEREAD_STAGE_NONE);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==3);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",3350,false);
+
+        // 3. Bounded backoff retry (+5s, +10s, +15s, max 3 retries) and clean stop offline.
+        cloud_uid=404;cloud_index=5;cloud_offset=0;cloud_percent=63;
+        reads_before=progress_reads;sync_fail_times=2;sync_fail_err=ESP_FAIL;
+        weread_reader_wake(10000);
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",10300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+1);
+        assert(!weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff));
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",15200,true);
+        assert(observe_result()!=WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+1);
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",15300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+2);
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",25200,true);
+        assert(observe_result()!=WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+2);
+        weread_reader_tick("weread://window_book",3,0,50,"ch3",25300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+3);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==4);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",25350,false);
+
+        cloud_uid=777;cloud_index=6;cloud_offset=0;cloud_percent=75;
+        reads_before=progress_reads;sync_fail_times=10;sync_fail_err=ESP_FAIL;
+        weread_reader_wake(30000);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",30300,true);assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",35300,true);assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",45300,true);assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",60300,true);assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        assert(progress_reads==reads_before+4);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",120000,true);
+        assert(observe_result()!=WR_JOB_CLOUD_SYNC&&progress_reads==reads_before+4);
+        sync_fail_times=0;
+
+        // 4. Cold resume via weread_reader_resume_chapter() (deep-sleep / boot path) triggers WR_JOB_CLOUD_SYNC.
+        weread_reader_end(121000);book_weread_close();weread_runtime_stop();
+        cloud_uid=900;cloud_index=7;cloud_offset=0;cloud_percent=88;
+        assert(weread_reader_prepare_open("weread://window_book")==ESP_OK);
+        assert(book_weread_open("weread://window_book")==ESP_OK);
+        rch=99;rso=99;
+        assert(weread_reader_resume_chapter("weread://window_book",&rch,&rso)==ESP_OK&&rch==4);
+        weread_reader_begin("weread://window_book",122000);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",122000,true);
+        weread_reader_tick("weread://window_book",4,0,63,"ch4",122300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==6);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+
+        // 5. Light-sleep flush(true) + wake(): auto-jumps when idle after wake, or rebases with WR-UX-04 if user turns first.
+        html_text_t c6={0};uint32_t v6=0;adopt(6,&c6,&v6);
+        weread_reader_tick("weread://window_book",6,4,88,c6.utf8+4,129000,false);
+        weread_reader_navigated_version("weread://window_book",6,4,88,c6.utf8+4,v6);
+        assert(weread_runtime_reader_has_turned("weread://window_book"));
+        weread_reader_flush(130000,true);
+        cloud_uid=1201;cloud_index=8;cloud_offset=0;cloud_percent=100;
+        weread_reader_wake(140000);
+        weread_reader_tick("weread://window_book",6,6,89,c6.utf8+6,140050,false);
+        weread_reader_navigated_version("weread://window_book",6,6,89,c6.utf8+6,v6);
+        assert(weread_runtime_reader_has_turned("weread://window_book"));
+        weread_reader_tick("weread://window_book",6,6,89,c6.utf8+6,140400,true);
+        assert(!weread_reader_pending_save());
+        weread_reader_tick("weread://window_book",6,6,89,c6.utf8+6,140450,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==7);
+        assert(weread_runtime_cloud_jump_rebase("weread://window_book")==ESP_OK);
+
+        weread_reader_flush(145000,true);
+        weread_reader_wake(150000);
+        assert(!weread_runtime_reader_has_turned("weread://window_book"));
+        weread_reader_tick("weread://window_book",6,6,89,c6.utf8+6,150300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        assert(weread_reader_poll_cloud_jump("weread://window_book",&jch,&joff)&&jch==7);
+        weread_reader_commit_cloud_jump("weread://window_book",true);
+        html_text_free(&c6);
+        weread_reader_end(160000);book_weread_close();weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime cloud-sync-priority-wake");
+        return 0;
+    }
     if(!strcmp(mode,"m2-regressions")){
         // 1. weread_runtime_cloud_jump_rebase() save failure: no tick spin and s_cloud_jump.rebased == false
         local_navigation(0,4,2000,100);

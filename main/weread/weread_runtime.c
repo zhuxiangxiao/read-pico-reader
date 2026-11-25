@@ -96,8 +96,9 @@ static WR_EXT_BSS struct {
     uint8_t media_id[WEREAD_MEDIA_ID_BYTES];
     uint64_t last_tick, active_ms, last_store, last_move, prefetch_retry;
     uint32_t prefetched;
-    uint64_t report_at, pause_report_at, report_due;
+    uint64_t report_at, pause_report_at, report_due, cloud_sync_retry_at;
     unsigned prefetch_mask, prefetch_failures;
+    uint8_t cloud_sync_failures;
     weread_progress_state_t state;
     bool seen, changed, retry, cover_warmed, anchor, navigation_pending, storage_blocked, pending_coordinate, save_failed;
     bool durable_valid, media_valid, rescued, active, urgent, plain_text, cloud_sync_pending;
@@ -1355,9 +1356,10 @@ static esp_err_t cache_clean_all_job(void) { WR_MEMORY_SCOPE;
     return err;
 }
 static bool retryable_job(weread_job_t job) {
-    // 仅前台开书/本地/云端开书和冷章在瞬时超时后静默重放一次；目录任务由阅读页在UI线程同步等待，重试只会加倍开书冻结，故不重试。
-    // Only foreground open/local/cloud open and cold chapters replay once after a transient timeout; the TOC job joins synchronously on the UI thread, so replaying it would double the open freeze.
-    return job == WR_JOB_OPEN || job == WR_JOB_LOCAL || job == WR_JOB_CLOUD || job == WR_JOB_CHAPTER;
+    // 前台开书/本地/云端开书、冷章和静默云端同步在瞬时超时后静默重放一次；目录任务由阅读页在UI线程同步等待，重试只会加倍开书冻结，故不重试。
+    // Foreground open/local/cloud open, cold chapters and silent cloud sync replay once after a transient timeout; the TOC job joins synchronously on the UI thread, so replaying it would double the open freeze.
+    return job == WR_JOB_OPEN || job == WR_JOB_LOCAL || job == WR_JOB_CLOUD ||
+        job == WR_JOB_CHAPTER || job == WR_JOB_CLOUD_SYNC;
 }
 static esp_err_t job_run(void) {
     esp_err_t err = ESP_OK;
@@ -1460,7 +1462,7 @@ static void perform_job(void) {
         s_connect_timed_out = false;
         memset(&s_result.local, 0, sizeof(s_result.local));
         memset(&s_result.cloud, 0, sizeof(s_result.cloud));
-        if (s_retry_phase) stage_store(WEREAD_STAGE_RETRY, 0);
+        if (s_retry_phase && s_work.job != WR_JOB_CLOUD_SYNC) stage_store(WEREAD_STAGE_RETRY, 0);
         err = job_run();
         if (!retryable || err != ESP_ERR_TIMEOUT || s_retry_blocked || s_connect_timed_out ||
             cancelled(NULL) || attempt) break;
@@ -1528,12 +1530,24 @@ static void consume_reader_result(void) {
             if(s_result.error==ESP_OK){s_reader.rescued=false;s_reader.report_at=0;s_reader.report_due=s_reader.last_tick+60000;}
         }
     }
-    if (s_result.job == WR_JOB_CLOUD_SYNC && !atomic_load(&s_cloud_jump_ready) && s_result.error == ESP_OK) {
-        if (s_reader.durable_valid && s_result.local.chapter_uid &&
-            s_result.local.revision == s_reader.durable.revision) {
-            s_reader.durable = s_result.local;
-            s_reader.state = weread_progress_state(&s_result.local);
-            s_reader.retry = s_result.local.dirty && s_result.local.position_pending && !s_result.local.sync_conflict;
+    if (s_result.job == WR_JOB_CLOUD_SYNC) {
+        if (s_result.error == ESP_OK) {
+            s_reader.cloud_sync_failures = 0;
+            s_reader.cloud_sync_retry_at = 0;
+            if (!atomic_load(&s_cloud_jump_ready) &&
+                s_reader.durable_valid && s_result.local.chapter_uid &&
+                s_result.local.revision == s_reader.durable.revision) {
+                s_reader.durable = s_result.local;
+                s_reader.state = weread_progress_state(&s_result.local);
+                s_reader.retry = s_result.local.dirty && s_result.local.position_pending && !s_result.local.sync_conflict;
+            }
+        } else if (s_reader.active && weread_auth_is_authenticated() && !s_connect_timed_out &&
+                   s_result.error != WEREAD_ERR_PURCHASE && s_result.error != WEREAD_ERR_SOLD_OUT &&
+                   s_result.error != WEREAD_ERR_POSITION && s_result.error != WEREAD_ERR_VERSION &&
+                   s_result.error != ESP_ERR_NOT_FOUND && s_reader.cloud_sync_failures < 3) {
+            ++s_reader.cloud_sync_failures;
+            s_reader.cloud_sync_pending = true;
+            s_reader.cloud_sync_retry_at = s_reader.last_tick + (uint64_t)s_reader.cloud_sync_failures * 5000u;
         }
     }
     if (s_result.job == WR_JOB_CHAPTER && s_result.error == ESP_OK && s_result.chapter_idx != SIZE_MAX) {
@@ -1977,8 +1991,10 @@ void weread_reader_navigated(const char *uri,size_t chapter,uint32_t offset,unsi
 esp_err_t weread_reader_resume_chapter(const char *uri, size_t *chapter, uint32_t *source_offset) {
     s_choice.resume_ready = false;
     if (!book_path_is_weread(uri) || !chapter || !source_offset) return ESP_ERR_INVALID_ARG;
-    if (!s_choice.valid || strcmp(s_choice.id, uri + 9)) {
+    bool cold_resume = !s_choice.valid || strcmp(s_choice.id, uri + 9) != 0;
+    if (cold_resume) {
         s_choice.valid = false;
+        s_choice.pending_cloud_sync = false;
         esp_err_t err = weread_progress_load(uri + 9, &s_choice.progress);
         if (err != ESP_OK) return err == ESP_ERR_NOT_FOUND ? ESP_ERR_INVALID_RESPONSE : err;
     }
@@ -1991,6 +2007,7 @@ esp_err_t weread_reader_resume_chapter(const char *uri, size_t *chapter, uint32_
     *chapter = i;
     *source_offset = s_choice.progress.chapter_offset;
     strcpy(s_choice.id, uri + 9);
+    if (cold_resume) s_choice.pending_cloud_sync = weread_auth_is_authenticated();
     s_choice.resume_ready = true;
     ESP_LOGI("weread", "resume target uid=%u chapter=%u source_off=%u",
         (unsigned)s_choice.progress.chapter_uid, (unsigned)i, (unsigned)*source_offset);
@@ -2227,16 +2244,14 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         (void)weread_reader_save(now);return;
     }
     if(now-s_reader.last_move<300)return;
+    if(s_reader.cloud_sync_pending&&now>=s_reader.cloud_sync_retry_at&&weread_auth_is_authenticated()){
+        if(weread_runtime_start(WR_JOB_CLOUD_SYNC,s_reader.id,NULL)){s_reader.cloud_sync_pending=false;return;}
+    }
     bool bits_ready = book_cache_ready(s_reader.id);
     bool next_ready = bits_ready ? book_cache_bit(s_reader.id, chapter + 1) : ((s_reader.prefetch_mask & 1u) != 0);
     if(!next_ready&&book_weread_uid(chapter+1)&&!s_reader.storage_blocked&&
         s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry&&weread_auth_is_authenticated()){
         (void)weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"1");return;
-    }
-    if(bits_ready&&!book_cache_scanned(s_reader.id)&&s_reader.cloud_sync_pending&&
-        weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"scan"))return;
-    if(s_reader.cloud_sync_pending&&weread_auth_is_authenticated()){
-        if(weread_runtime_start(WR_JOB_CLOUD_SYNC,s_reader.id,NULL)){s_reader.cloud_sync_pending=false;return;}
     }
     bool pause_report = now >= s_reader.last_move && now - s_reader.last_move >= 8000 &&
         now >= s_reader.pause_report_at && network_online_ready() && weread_auth_is_authenticated();
@@ -2284,6 +2299,29 @@ void weread_reader_flush(uint64_t now, bool stop) {
     if(!weread_runtime_busy()&&atomic_exchange(&s_done,false)){consume_reader_result();weread_runtime_result_free(&s_result);}
     (void)weread_reader_save(now);
     if(stop){book_cache_clear();weread_runtime_stop();}
+}
+void weread_reader_wake(uint64_t now) {
+    if (!s_reader.active || !s_reader.id[0]) return;
+    if (!book_cache_ready(s_reader.id)) {
+        book_cache_init(s_reader.id);
+        if (s_reader.seen && s_reader.total_chapters) book_cache_mark(s_reader.id, s_reader.chapter, true);
+        s_reader.prefetch_done = false;
+        s_reader.prefetch_cursor = s_reader.seen ? s_reader.chapter + 1 : 1;
+    }
+    if (s_reader.anchor || s_reader.pending_coordinate) {
+        atomic_store(&s_live_pos, ((uint64_t)s_reader.anchor_index << 32) | s_reader.anchor_offset);
+        atomic_store(&s_live_valid, true);
+    } else if (s_reader.durable_valid && s_reader.durable.chapter_uid) {
+        atomic_store(&s_live_pos, ((uint64_t)s_reader.durable.chapter_index << 32) | s_reader.durable.chapter_offset);
+        atomic_store(&s_live_valid, true);
+    }
+    s_reader.user_turned_since_open = false;
+    s_reader.session_pages = 0;
+    s_reader.cloud_sync_pending = weread_auth_is_authenticated();
+    s_reader.cloud_sync_failures = 0;
+    s_reader.cloud_sync_retry_at = 0;
+    s_reader.last_tick = now;
+    s_reader.last_move = now;
 }
 void weread_reader_end(uint64_t now) {
     s_reader.active=false;
