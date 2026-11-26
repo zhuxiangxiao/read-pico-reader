@@ -103,7 +103,8 @@ typedef enum { SETTINGS_MAIN, SETTINGS_WIFI, SETTINGS_TIME,
                SETTINGS_CONFIG, SETTINGS_UPGRADE, SETTINGS_BOOT, SETTINGS_FACTORY_RESET,
                SETTINGS_POWER_SLEEP, SETTINGS_AUTO_LOCK, SETTINGS_PROFILE, SETTINGS_AVATAR,
                SETTINGS_BLUETOOTH, SETTINGS_BLE_SCAN, SETTINGS_DEVICE_SYNC,
-               SETTINGS_LOCK_PIN, SETTINGS_PIN_ENTRY, SETTINGS_TEXT_EDIT, SETTINGS_LANGUAGE } settings_page_t;
+               SETTINGS_LOCK_PIN, SETTINGS_PIN_ENTRY, SETTINGS_TEXT_EDIT, SETTINGS_LANGUAGE,
+               SETTINGS_DC_BALANCE } settings_page_t;
 static settings_page_t s_page;
 static bool s_shelf_style_requested,s_shelf_style_from_manage;
 void app_device_settings_request_shelf_style(void){s_shelf_style_requested=true;}
@@ -218,6 +219,8 @@ static bool s_config_confirm;
 // tick rather than a touch callback.
 static bool s_panel_repair_pending;
 static bool s_dc_recover_pending;
+// 待执行的 DC 平衡方向：false 正向，true 反向。/ Pending balance direction: false forward, true reverse.
+static bool s_dc_balance_reverse;
 static bool s_boot_pending;
 static bool s_upgrade_confirm, s_upgrade_online, s_local_pending, s_upgrade_restart;
 static pico_ota_info_t s_local_update;
@@ -381,7 +384,7 @@ static int settings_main_row_height(void) {
 
 #define SETTINGS_WIRELESS_ROWS 4
 #define SETTINGS_DISPLAY_ROWS 9
-#define SETTINGS_PERSONAL_ROWS 5
+#define SETTINGS_PERSONAL_ROWS 6
 #define SETTINGS_MAINTENANCE_ROWS 6
 #define SETTINGS_WIRELESS_Y (180 + settings_profile_height() + 77)
 #define SETTINGS_DISPLAY_Y (SETTINGS_WIRELESS_Y + SETTINGS_WIRELESS_ROWS * SETTINGS_ROW_H + 78)
@@ -1000,6 +1003,7 @@ static void setting_icon(uint8_t *fb, int index, int cx, int cy) {
         UI_ICON_LOCK,              // 18 双击解锁 / double-press unlock
         [20] = UI_ICON_CHART_COLUMN, // 20 书籍百分比 / cover progress
         [21] = UI_ICON_REFRESH_CW,  // 21 设备同步 / device sync
+        [22] = UI_ICON_FILE_IMAGE,  // 22 书架封面显示 / shelf covers
     };
     if (index < 0 || index >= (int)(sizeof(icons) / sizeof(icons[0]))) return;
     ui_draw_icon(fb, cx, cy, SETTINGS_ICON_PX, icons[index], SETTINGS_ICON_INK);
@@ -1053,9 +1057,9 @@ static void setting_group(uint8_t *fb, int title_y, const char *title,
             settings_switch(fb, y + row_height / 2, app_settings_low_ghost());
             continue;
         }
-        if(icons[i]==20){
+        if(icons[i]==20||icons[i]==22){
             ui_text_vc(fb,100,y+row_height/2,25,labels[i],EPD_DRAW_ALIGN_LEFT,false);
-            settings_switch(fb,y+row_height/2,app_settings_shelf_progress_badges());continue;
+            settings_switch(fb,y+row_height/2,icons[i]==20?app_settings_shelf_progress_badges():app_settings_shelf_covers());continue;
         }
         if (icons[i] == SETTINGS_UNLOCK_ICON) {
             ui_text_vc(fb, 100, y + row_height / 2, 25, labels[i], EPD_DRAW_ALIGN_LEFT, false);
@@ -1514,6 +1518,24 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
         ui_text(fb, 48, 620, 22, "请用 USB 连接电脑，再打开官网刷机页", EPD_DRAW_ALIGN_LEFT, false);
         settings_navigation(fb); return;
     }
+    if (s_page == SETTINGS_DC_BALANCE) {
+        back_header(fb, "DC 平衡");
+        settings_card(fb, (EpdRect){36, 202, 612, 236}, 22, UI_GRAY_WHITE, 0x70);
+        ui_text(fb, 60, 228, 29, "平衡面板电荷", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 60, 282, 21, "正向：压黑后擦白，净负偏置", EPD_DRAW_ALIGN_LEFT, false);
+        ui_text(fb, 60, 318, 21, "反向：反向推白，一次约为正向的 1/3", EPD_DRAW_ALIGN_LEFT, false);
+        ui_draw_button(fb, (EpdRect){60, 470, 564, 78}, "正向平衡（约 6 秒）", true);
+        ui_draw_button(fb, (EpdRect){60, 566, 564, 78}, "反向平衡（约 2 秒）", false);
+        if (s_notice[0]) ui_text(fb, 48, 660, 21, s_notice, EPD_DRAW_ALIGN_LEFT, false);
+        // 16 级灰阶条：平衡后看渐变是否均匀、有没有残留条纹。
+        // A 16-step gray strip: after a balance run the ramp shows whether the panel settled evenly.
+        ui_text(fb, 48, 700, 21, "16 级灰阶：平衡后看渐变与残影", EPD_DRAW_ALIGN_LEFT, false);
+        for (int i = 0; i < 16; ++i)
+            ui_fill_rect_fast((EpdRect){48 + i * 36, 736, 36, 80}, (uint8_t)(i * 17), fb);
+        ui_text(fb, 48, 828, 20, "左黑 → 右白", EPD_DRAW_ALIGN_LEFT, false);
+        settings_navigation(fb);
+        return;
+    }
     if (s_page == SETTINGS_UPGRADE) {
         back_header(fb, "系统升级");
         settings_card(fb, (EpdRect){36, 202, 612, 120}, 22, UI_GRAY_WHITE, 0x70);
@@ -1738,15 +1760,15 @@ static void render_content(app_ctx_t *ctx, uint8_t *fb) {
         ui_text_vc(fb, 474, 677, 24, "开启", EPD_DRAW_ALIGN_CENTER, true);
     }
     snprintf(signature,sizeof(signature),"%s",app_settings_status_signature()[0]?app_settings_status_signature():"未设置");
-    const char *personal_labels[]={"书架样式","书籍百分比显示","锁屏样式","锁屏密码","状态栏签名"};
-    const char *personal_values[]={app_settings_shelf_style()==5?"列表书架":app_settings_shelf_style()==6?"液态玻璃书架":app_settings_shelf_style()==1?"深色书轨":"亚克力书架","",
+    const char *personal_labels[]={"书架样式","书籍百分比显示","书架封面显示","锁屏样式","锁屏密码","状态栏签名"};
+    const char *personal_values[]={app_settings_shelf_style()==5?"列表书架":app_settings_shelf_style()==6?"液态玻璃书架":app_settings_shelf_style()==1?"深色书轨":"亚克力书架","","",
         app_settings_lock_style()==3?"透明书封":app_settings_lock_style()==2?"书架拼贴":app_settings_lock_style()==1?"壁纸":"阅读票根",
         lock_pin_enabled()?"已开启":"已关闭",signature};
-    const int personal_icons[]={4,20,5,16,10};
+    const int personal_icons[]={4,20,22,5,16,10};
     setting_group(fb,SETTINGS_PERSONAL_Y-49,"个性化功能",SETTINGS_PERSONAL_Y,
                   personal_icons,personal_labels,personal_values,SETTINGS_PERSONAL_ROWS);
-    const char *maintenance_labels[]={"系统升级","保存与恢复","屏幕修复","DC 恢复","BOOT 刷机","恢复出厂设置"};
-    const char *maintenance_values[]={"OTA / TF 卡","配置","清除条纹","平衡电荷","电脑刷机","重置系统"};
+    const char *maintenance_labels[]={"系统升级","保存与恢复","屏幕修复","DC 平衡","BOOT 刷机","恢复出厂设置"};
+    const char *maintenance_values[]={"OTA / TF 卡","配置","清除条纹","正向 / 反向","电脑刷机","重置系统"};
     const int maintenance_icons[]={12,8,17,11,13,11};
     setting_group(fb,SETTINGS_MAINTENANCE_Y-49,"升级和恢复",SETTINGS_MAINTENANCE_Y,
                   maintenance_icons,maintenance_labels,maintenance_values,SETTINGS_MAINTENANCE_ROWS);
@@ -2138,6 +2160,7 @@ static void on_enter(app_ctx_t *ctx) {
     s_devsync_state = KIIKO_SYNC_IDLE; s_devsync_done_ms = 0; s_devsync_start_error = ESP_OK;
     s_panel_repair_pending = false;
     s_dc_recover_pending = false;
+    s_dc_balance_reverse = false;
     s_boot_pending = s_local_pending = s_upgrade_restart = false;
     s_upgrade_offer_pending = s_upgrade_confirm = false;
     (void)read_pico_transfer_get_saved_wifi(s_main_wifi,&s_main_wifi_saved);
@@ -2219,11 +2242,18 @@ static app_redraw_t on_tick(app_ctx_t *ctx) {
     }
     if (s_dc_recover_pending) {
         s_dc_recover_pending = false;
-        if (s_page != SETTINGS_MAIN) return APP_REDRAW_NONE;
+        // 在子页发起就留在子页；离开到别的页取消，与屏幕修复一致。
+        // Stay on the DC page when it started there; leaving to another page cancels, as panel repair does.
+        if (s_page != SETTINGS_MAIN && s_page != SETTINGS_DC_BALANCE) return APP_REDRAW_NONE;
         s_scroll_present_pending = false;
-        snprintf(s_notice, sizeof(s_notice), "DC 恢复完成");
+        snprintf(s_notice, sizeof(s_notice), "DC 平衡完成");
         render(ctx, ctx->fb);
-        if (display_dc_recover(ctx->hl) != EPD_DRAW_SUCCESS) {
+        enum EpdDrawError dc_result = s_dc_balance_reverse ? display_dc_recover_reverse(ctx->hl) : display_dc_recover(ctx->hl);
+        // 平衡后再整屏全刷一次：灰阶条按完整波形重新落屏，才看得出正反向的差别。
+        // One full-screen refresh after the balance re-lands the gray strip with the complete waveform,
+        // so forward and reverse results are comparable.
+        if (dc_result == EPD_DRAW_SUCCESS) dc_result = update_display_full(ctx->hl);
+        if (dc_result != EPD_DRAW_SUCCESS) {
             snprintf(s_notice, sizeof(s_notice), "屏幕输出未完成，请稍后重试");
             return APP_REDRAW_FULL;
         }
@@ -2516,6 +2546,20 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         return APP_REDRAW_PAGE;
     }
 
+    if (s_page == SETTINGS_DC_BALANCE) {
+        if (ev->type != UI_GESTURE_TAP || s_dc_recover_pending) return APP_REDRAW_NONE;
+        if (ev->y0 < 190 && ev->x0 < 170) { s_page = SETTINGS_MAIN; s_notice[0] = 0; return APP_REDRAW_PAGE; }
+        if (ui_rect_hit((EpdRect){60, 470, 564, 78}, ev->x0, ev->y0) ||
+            ui_rect_hit((EpdRect){60, 566, 564, 78}, ev->x0, ev->y0)) {
+            s_dc_balance_reverse = ev->y0 >= 566;
+            s_dc_recover_pending = true;
+            snprintf(s_notice, sizeof(s_notice), "DC 平衡中…");
+            return APP_REDRAW_PAGE;
+        }
+        int tab = settings_nav_hit(ev->x0, ev->y0);
+        if (tab >= 0) ui_nav_request(ctx, tab);
+        return APP_REDRAW_NONE;
+    }
     if (s_page == SETTINGS_BOOT) {
         if (ev->type != UI_GESTURE_TAP || s_boot_pending) return APP_REDRAW_NONE;
         if (ev->y0 < 190 && ev->x0 < 170) { s_page = SETTINGS_MAIN; (void)read_pico_transfer_get_saved_wifi(s_main_wifi,&s_main_wifi_saved); settings_prepare_profile(); return APP_REDRAW_PAGE; }
@@ -3054,8 +3098,10 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
         row=(y-SETTINGS_PERSONAL_Y)/SETTINGS_ROW_H;
         if(row==0) {s_page=SETTINGS_SHELF_STYLE;s_style_scroll=0;}
         else if(row==1){if(!app_settings_set_shelf_progress_badges(!app_settings_shelf_progress_badges()))snprintf(s_notice,sizeof(s_notice),"保存失败，请重试");}
-        else if(row==2)s_page=SETTINGS_LOCK_STYLE;
-        else if(row==3){s_page=SETTINGS_LOCK_PIN;s_notice[0]=0;}
+        // 关闭封面后书架只画书名卡，不读取或生成封面。/ With covers off the shelf draws title cards without reading or generating covers.
+        else if(row==2){if(!app_settings_set_shelf_covers(!app_settings_shelf_covers()))snprintf(s_notice,sizeof(s_notice),"保存失败，请重试");}
+        else if(row==3)s_page=SETTINGS_LOCK_STYLE;
+        else if(row==4){s_page=SETTINGS_LOCK_PIN;s_notice[0]=0;}
         else profile_editor_open(true);
         return APP_REDRAW_PAGE;
     }
@@ -3074,11 +3120,7 @@ static app_redraw_t on_gesture(app_ctx_t *ctx, const ui_gesture_event_t *ev) {
             snprintf(s_notice,sizeof(s_notice),"屏幕修复中…");
             return APP_REDRAW_PAGE;
         }
-        else if(row==3){
-            s_dc_recover_pending=true;
-            snprintf(s_notice,sizeof(s_notice),"DC 恢复中…");
-            return APP_REDRAW_PAGE;
-        }
+        else if(row==3){s_page=SETTINGS_DC_BALANCE;s_dc_recover_pending=false;s_dc_balance_reverse=false;s_notice[0]=0;}
         else {s_boot_pending=false;s_page=SETTINGS_BOOT;}
         return APP_REDRAW_PAGE;
     }

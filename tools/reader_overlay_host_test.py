@@ -33,6 +33,7 @@ enum EpdFontFlags {EPD_DRAW_ALIGN_CENTER, EPD_DRAW_ALIGN_LEFT};
 #define UI_ICON_EXPAND 3
 #define READER_IMAGE_ZOOM_MIN 1000
 #define MODE_GL16 1
+#define MODE_DU 2
 #define TAG "overlay"
 static char log_buf[128];
 #define ESP_LOGI(tag,...) ((void)(tag),(void)snprintf(log_buf,sizeof(log_buf),__VA_ARGS__))
@@ -41,7 +42,7 @@ typedef enum {APP_REDRAW_NONE,APP_REDRAW_DONE} app_redraw_t;
 typedef struct {uint8_t *fb;void *hl;int64_t now_ms;} app_ctx_t;
 static bool s_reader_fullscreen,immersive,vertical,s_reader_favorite,s_zoom_active;
 static size_t s_page=1;
-static int s_reader_panel,s_px=48,s_margin=24,s_chapter_lead_height,s_chapter_lead_width;
+static int s_reader_panel,s_px=48,s_margin=24,s_margin_y,s_chapter_lead_height,s_chapter_lead_width;
 static char s_book_title[128]="Title",s_title[128]="Title",s_chapter_heading_title[128],s_chapter_heading_label[128],s_reader_notice[128];
 static app_book_heading_style_t heading_style;
 static app_book_heading_align_t heading_align;
@@ -172,13 +173,20 @@ static void draw_zoomed_image(uint8_t *fb,EpdRect r,int scale,int x,int y,bool b
 static void rails_keepalive(void){}
 static void epd_poweron(void){}
 static void guard_draw_result(void *hl,int err){(void)hl;assert(err==0);}
-static int display_main_gray_waveform(void){return 1;}
-static int update_display_area_diff_with(void *hl,int wave,int mode,EpdRect r){(void)hl;assert(wave==1&&mode==MODE_GL16);pushed=r;return 0;}
+// 拖动帧走跟随DU，内存不足的4bpp回退仍用灰阶GL16。/ Drag frames use follow-DU; the 4bpp OOM fallback keeps gray GL16.
+static const int gray_wave=1,E0470_FOLLOW_WAVEFORM=2;static int pushed_mode;
+static const int *display_main_gray_waveform(void){return &gray_wave;}
+static int update_display_area_diff_with(void *hl,const int *wave,int mode,EpdRect r){(void)hl;
+ assert((wave==&gray_wave&&mode==MODE_GL16)||(wave==&E0470_FOLLOW_WAVEFORM&&mode==MODE_DU));pushed=r;pushed_mode=mode;return 0;}
 static int64_t esp_timer_get_time(void){return 100;}
 static void zoom_bits_build(uint8_t *bits,EpdRect phys,EpdRect band,int iw,int ih,int w,int h,int left,int top){(void)bits;(void)phys;(void)band;(void)iw;(void)ih;(void)left;(void)top;assert(w==body_rect().width*2&&h==body_rect().height*2);}
 static void zoom_blit_bits(uint8_t *fb,const uint8_t *bits,EpdRect r){(void)bits;ui_fill_rect_fast(r,42,fb);}
 '''
-unit += function('zoom_frame', book) + '\n'
+# clang不认GCC的optimize属性。/ clang rejects GCC's optimize attribute.
+# Pico的拖动帧走跟随DU，S31仍用灰阶GL16。/ Pico drag frames use follow-DU; S31 keeps gray GL16.
+zoom_source = function('zoom_frame', book)
+unit += '#define FOLLOW_DRAG %d\n' % ('&E0470_FOLLOW_WAVEFORM' in zoom_source)
+unit += zoom_source.replace('__attribute__((optimize("Os"))) ', '') + '\n'
 unit += r'''
 int main(void){
  static uint8_t fb[684*1216],original[sizeof(fb)],standard[sizeof(fb)];app_ctx_t ctx={.fb=fb};
@@ -377,7 +385,7 @@ int main(void){
   s_reader_panel=READER_PANEL_NONE;draw_reader(fb,s_page);assert(!memcmp(fb,standard,sizeof(fb)));
   for(int memory=0;memory<2;++memory){
    memcpy(fb,standard,sizeof(fb));zoom_memory=memory;
-   assert(zoom_frame(&ctx)==APP_REDRAW_DONE&&pushed.y==176&&pushed.height==872);
+   assert(zoom_frame(&ctx)==APP_REDRAW_DONE&&pushed.y==176&&pushed.height==872&&pushed_mode==(memory&&FOLLOW_DRAG?MODE_DU:MODE_GL16));
    assert(!memcmp(fb,standard,176*684)&&!memcmp(fb+1048*684,standard+1048*684,(1216-1048)*684));
    assert(fb[500*684+300]==42);
   }
@@ -411,6 +419,6 @@ with tempfile.TemporaryDirectory(prefix='reader-overlay-') as temporary:
     (p / 'epdiy.h').write_text('#pragma once\ntypedef struct{int x,y,width,height;}EpdRect;\n')
     (p / 'esp_err.h').write_text('#pragma once\ntypedef int esp_err_t;\n')
     (p / 'test.c').write_text(unit)
-    subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
+    subprocess.run(['cc','-std=c11','-D_DEFAULT_SOURCE','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
                     '-I'+str(p),'-I'+str(root/'main/ui'),'-I'+str(root/'main/book'),str(p/'test.c'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)

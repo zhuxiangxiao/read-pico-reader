@@ -48,14 +48,8 @@ typedef struct {int type,x0,y0,x,y;} ui_gesture_event_t;
 #define EPD_DRAW_ALIGN_CENTER 1
 #define SETTINGS_SCROLL_MAX 1000
 static int s_page=SETTINGS_SHELF_STYLE,s_style_scroll,s_main_scroll,s_ble_scroll,viewport=1088,style=2;
-static bool s_scroll_drag_consumed,s_scroll_present_pending,s_main_wifi_saved;
-static char s_main_wifi[33];
+static bool s_scroll_drag_consumed,s_scroll_present_pending;
 static unsigned glass,acrylic,headers,footers,cards,titles;
-static void *ctx;
-static struct{bool pending,active,tracking;int origin_offset,origin_y;}s_list_drag;
-static char s_notice[96];
-static bool settings_drag_gesture(void*c,const ui_gesture_event_t*e,int*offset,int limit,app_redraw_t*out){(void)c;(void)offset;(void)limit;(void)out;assert(e->type==UI_GESTURE_TAP||e->type==UI_GESTURE_SWIPE_U||e->type==UI_GESTURE_SWIPE_D);return false;}
-static app_redraw_t shelf_style_finish(void*c){(void)c;s_page=SETTINGS_MAIN;return APP_REDRAW_PAGE;}
 static int settings_viewport_end(void){return viewport;}
 static int settings_content_end(void){return viewport;}
 static int app_settings_shelf_style(void){return style;}
@@ -97,6 +91,23 @@ static int ui_content_width(void){return 612;}
 unit+='\n'.join(line for line in (root/'main/ui/ui_book_manage_layout.h').read_text().splitlines() if not line.startswith(('#include','#pragma')))+'\n'
 unit+='static bool s_bulk_grid;\n'
 for helper in ['ui_shelf_rows', 'ui_shelf_entry', 'ui_shelf_cover']:unit+=function(helper,root/'main/ui/ui_shelf.c')+'\n'
+# 书架行布局引用导入候选；设置手势经拖动跟手与完成回调返回。拖动跟手另有测试，这里让它不接管。
+# Shelf rows consult import candidates; settings gestures go through drag tracking and the finish callback.
+# Drag tracking has its own tests, so it declines here.
+unit += r'''
+static bool s_import_candidates;
+typedef struct {bool request_return;} app_ctx_t;
+static app_ctx_t s_ctx_storage;
+static app_ctx_t *const ctx=&s_ctx_storage;
+static bool s_shelf_style_from_manage;
+static char s_notice[64];
+static void app_book_return_from_shelf_style(void){}
+typedef struct {bool tracking;int origin_offset,origin_y;} settings_drag_t;
+static settings_drag_t s_list_drag;
+static bool settings_drag_gesture(app_ctx_t *c,const ui_gesture_event_t *ev,int *offset,int limit,app_redraw_t *motion){
+ (void)c;(void)ev;(void)offset;(void)limit;(void)motion;return false;}
+'''
+unit += function('shelf_style_finish', source) + '\n'
 for name in ('shelf_rows','row_rect','shelf_cover_image'):
     unit += function(name,root/'main/apps/app_book.c')+'\n'
 unit += catalog + '\n' + count + '\n' + function('draw_style_thumbnail', source) + '\n'

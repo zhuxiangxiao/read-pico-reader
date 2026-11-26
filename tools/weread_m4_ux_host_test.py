@@ -101,6 +101,8 @@ def run_reader_panel_and_cloud_undo_tests(board: str, book_path: Path, is_metali
     code = COMMON_HEADER + undo_decl + r'''
 enum { E0470_TURN_LTR = 0, E0470_TURN_RTL = 1 };
 #define ESP_LOGI(...) ((void)0)
+#define TT_SPAN(name, expr) do { expr; } while (0)
+#define TT_STAMP(name) ((void)0)
 typedef struct { int x; } html_note_t;
 typedef struct { int x; } blk_t;
 typedef struct { int x; } html_run_t;
@@ -111,6 +113,9 @@ static bool s_clear_confirm, s_toolbar, s_reader_footer_pending, s_reader_text_f
 static bool s_water_turn_pending, s_reader_turn_pending, s_reader_image_refresh_pending, s_reader_cleanup;
 static bool s_reader_dc_recover __attribute__((unused));
 static uint8_t s_dc_recover_pages __attribute__((unused));
+static unsigned s_back_turns __attribute__((unused));
+static bool s_save_due __attribute__((unused)), s_chapter_display_pending __attribute__((unused));
+static uint8_t s_save_due_turns __attribute__((unused));
 static bool s_reader_image_frame __attribute__((unused)), s_reader_image_exit_pending __attribute__((unused));
 static bool s_rc_auto_turning, s_part_more, s_save_failed, s_toc_jump_open;
 static bool s_reader_rule_pending, s_txt_opening, s_ticket_cover_started __attribute__((unused)), s_ticket_cover_done __attribute__((unused));
@@ -271,6 +276,8 @@ static const char *app_settings_book_background_path(void) { return ""; }
 static app_redraw_t paint_reading(app_ctx_t *c, int m) { (void)c; s_mode = m; s_area = (EpdRect){0, 176, 684, 872}; return APP_REDRAW_AREA; }
 
 static bool load_chapter_at(app_ctx_t *ctx, size_t ch, size_t off, bool last, const char *a, size_t src);
+static bool next_chapter_can_adopt(size_t ch) { (void)ch; return false; }
+static bool commit_next_chapter(app_ctx_t *c, size_t ch) { (void)c; (void)ch; return false; }
 '''
     code += bridge_src + "\n"
     for fn_name in ("book_tool_count", "tool_rect", "reader_tools_visible", "reader_chapter_undo_rect", "reader_chapter_undo_visible", "draw_reader_panel"):
@@ -527,6 +534,7 @@ def run_metalio_cache_and_panel_undo_tests(book_path: Path):
     bridge_src = re.sub(r'#include\s+"weread/weread_store\.h"', "", (ROOT / "main/apps/book_weread_bridge.inc").read_text(encoding="utf-8"))
     undo_decl = book_src[book_src.index("static struct {\n    bool valid;\n    uint8_t mode;"):book_src.index("// 微调长按只更新预览")]
     panel_frame_decl = book_src[book_src.index("static struct {\n    bool valid,fullscreen;"):book_src.index("static void reader_panel_record(")]
+    layout_top_def = next(l for l in book_src.splitlines() if l.startswith("#define READER_LAYOUT_TOP "))
 
     code = r'''
 #include <assert.h>
@@ -571,7 +579,7 @@ typedef struct { uint8_t *front_fb, *back_fb; } epd_hl_t;
 typedef struct { int64_t now_ms; bool request_app; epd_hl_t *hl; uint8_t *fb; } app_ctx_t;
 typedef struct { bool started; uint32_t generation; } prep_cursor_t;
 #define ESP_LOGI(...) ((void)0)
-''' + undo_decl + r'''
+''' + layout_top_def + "\n" + undo_decl + r'''
 static int s_view = READING, s_presented_view = READING, s_reader_panel = READER_PANEL_NONE, s_mode = MODE_GL16, s_reader_slider = -1;
 static bool s_clear_confirm, s_toolbar, s_reader_footer_pending, s_reader_text_frame = true, s_reader_fullscreen, s_toc_jump_open;
 static bool s_water_turn_pending, s_reader_turn_pending, s_reader_cleanup, s_fonts_reload_pending, s_reader_image_refresh_pending, s_reader_image_exit_pending;
@@ -970,6 +978,8 @@ static void clear_selection(void) {}
 static app_redraw_t bulk_finish(app_ctx_t *c) { (void)c; return APP_REDRAW_NONE; }
 static app_redraw_t bulk_action(app_ctx_t *c, uint16_t x, uint16_t y) { (void)c; (void)x; (void)y; return APP_REDRAW_NONE; }
 static bool load_chapter_at(app_ctx_t *ctx, size_t ch, size_t off, bool last, const char *a, size_t src);
+static bool next_chapter_can_adopt(size_t ch) { (void)ch; return false; }
+static bool commit_next_chapter(app_ctx_t *c, size_t ch) { (void)c; (void)ch; return false; }
 '''
     code += bridge_src + "\n" + chapter_src + "\n"
     code += r'''
