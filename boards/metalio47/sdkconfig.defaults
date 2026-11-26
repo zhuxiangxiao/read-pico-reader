@@ -22,8 +22,8 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_API_ENCODING_UTF_8=y
 
-# S31 2.0.66 对照：Wi-Fi/RX/休眠热路径留在Flash（关闭IRAM_OPT），为WeRead与BLE保留内部SRAM；协议栈优先PSRAM，固定TX减少内部堆碎片。
-# S31 2.0.66 comparison: keep Wi-Fi/RX/sleep hot paths out of IRAM to preserve internal SRAM alongside WeRead and BLE, with a PSRAM-preferred stack and bounded static TX.
+# S31 2.0.66 对照：Wi-Fi RX 热路径放 IRAM（~4.7 KiB）消除扫屏期间 Core 0 Flash I-Cache 抖动，TX/休眠仍留 Flash 为 WeRead 与 BLE 保留内部 SRAM；协议栈优先 PSRAM，固定 TX 减少内部堆碎片。
+# S31 2.0.66 comparison: keep Wi-Fi RX hot path in IRAM (~4.7 KiB) to avoid Core 0 Flash I-Cache stalls during EPD scans while TX/sleep stay in Flash to preserve internal SRAM for WeRead and BLE, with a PSRAM-preferred stack and bounded static TX.
 # DMA行缓冲仍在内部SRAM；本地对照窗口和报文队列有界到64KiB。
 # LCD DMA remains internal; use bounded 64KiB TCP/packet queues for the local S31 comparison.
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
@@ -37,7 +37,7 @@ CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM=4
 CONFIG_ESP_WIFI_RX_BA_WIN=12
 CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16
 CONFIG_ESP_WIFI_IRAM_OPT=n
-CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=1024
 

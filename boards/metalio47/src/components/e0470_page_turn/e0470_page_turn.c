@@ -356,7 +356,21 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
     if (assigned != bands) return EPD_DRAW_INVALID_CROP;
 
     if (!build_luts(gl)) return EPD_DRAW_NO_PHASES_AVAILABLE;
+    // 将当拍活跃条带 LUT（最多 8×1 KiB）瞬态缓存在内部 SRAM，消除扫屏时对 PSRAM 的随机查表争用。
+    // Cache active band LUTs (up to 8x1 KiB) transiently in internal SRAM to eliminate PSRAM LUT contention during scans.
+    uint8_t (*iram_lut)[1024] = NULL;
+    const uint8_t* tick_lut_ptr[TURN_PHASE_CAP];
+    (void)tick_lut_ptr;
+#ifdef ESP_PLATFORM
+    if (bands <= 8 &&
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) >= (size_t)bands * 1024u + 16384u) {
+        iram_lut = heap_caps_aligned_alloc(16, (size_t)bands * 1024u, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
     epd_poweron();
+    epd_display_scan_begin();
+#else
+    epd_poweron();
+#endif
 
     const int64_t t_all = esp_timer_get_time();
     const int64_t t_gen = esp_timer_get_time();
@@ -376,6 +390,7 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
         if (line_ph) memset(s_line_phase, -1, (size_t)fb_h);
 
         bool any = false;
+        int iram_slots = 0;
         for (int band = 0; band < bands; band++) {
             const int launch = band > last_launch ? last_launch : band;
             const int phase = tick - launch * launch_step;
@@ -384,6 +399,16 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
             const int b = s_band1[band];
             if (a >= b) continue;
             s_band_phase[band] = (int8_t)phase;
+            if (iram_lut) {
+                bool seen = false;
+                for (int prev = 0; prev < band; prev++) {
+                    if (s_band_phase[prev] == phase) { seen = true; break; }
+                }
+                if (!seen) {
+                    memcpy(iram_lut[iram_slots], s_lut[phase], 1024);
+                    tick_lut_ptr[phase] = iram_lut[iram_slots++];
+                }
+            }
             if (line_ph) {
                 memset(hl->dirty_lines + a, 1, (size_t)(b - a));
                 memset(s_line_phase + a, (int)(int8_t)phase, (size_t)(b - a));
@@ -394,16 +419,17 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
         }
         if (!any) continue;
 
+        const uint8_t* const* luts = iram_lut ? tick_lut_ptr : s_lut_ptr;
         if (line_ph) {
             int xs = phys.x & ~1;
             int xe = (phys.x + phys.width + 1) & ~1;
             if (xe > xs) {
                 memset(hl->dirty_columns + xs / 2, 0xFF, (size_t)((xe - xs) / 2));
             }
-            epd_set_line_phase_luts(s_lut_ptr, s_line_phase);
+            epd_set_line_phase_luts(luts, s_line_phase);
         } else {
             memset(hl->dirty_lines + y0, 1, (size_t)(y1 - y0));
-            epd_set_col_phase_luts(s_lut_ptr, s_band0, s_band1, s_band_phase, bands);
+            epd_set_col_phase_luts(luts, s_band0, s_band1, s_band_phase, bands);
         }
 
         const int64_t t_draw = esp_timer_get_time();
@@ -425,6 +451,10 @@ static enum EpdDrawError page_turn_run(EpdiyHighlevelState* hl, EpdRect area,
             esp_rom_delay_us((uint32_t)(s_tick_us - used));
         }
     }
+#ifdef ESP_PLATFORM
+    epd_display_scan_end();
+    heap_caps_free(iram_lut);
+#endif
 
     // 扫描失败时屏幕可能停在中间相位，保留旧帧基准给调用方恢复。
     // A failed scan may leave intermediate pixels; keep the old baseline for caller recovery.

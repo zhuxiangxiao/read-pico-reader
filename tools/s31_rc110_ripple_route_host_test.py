@@ -13,7 +13,7 @@ typedef struct{int id;}EpdiyHighlevelState;
 typedef struct{int x,y,width,height;}EpdRect;
 typedef struct{int id;}EpdWaveform;
 typedef int e0470_turn_dir_t;
-enum EpdDrawError{EPD_DRAW_SUCCESS,EPD_DRAW_NO_PHASES_AVAILABLE,EPD_DRAW_EMPTY_LINE_QUEUE,EPD_DRAW_OTHER_ERROR};
+enum EpdDrawError{EPD_DRAW_SUCCESS=0,EPD_DRAW_NO_PHASES_AVAILABLE=1,EPD_DRAW_EMPTY_LINE_QUEUE=2,EPD_DRAW_OTHER_ERROR=4};
 enum{DISPLAY_READER_GRAY_PAGE,DISPLAY_READER_GRAY_IMAGE,DISPLAY_READER_GRAY_BACKGROUND,READ_PICO_EPD_SCAN_FAST,MODE_GL16,MODE_GC16,DISPLAY_PCLK_SAFE_MHZ,METALIO_TEXT_RIPPLE_BANDS=8,E0470_TURN_FAST_TICK_US=11090};
 static EpdWaveform E0470_WAVEFORM,E0470_FULL_WAVEFORM,wave;
 static bool s_bulk_io,background,unavailable,prepare_ok=true,disabled;
@@ -55,15 +55,20 @@ int main(void){EpdiyHighlevelState h={0};EpdRect a={12,48,640,1060};
  }
  background=false;unavailable=true;assert(!reader_rc110_ripple_unlocked(&h,a,1,false));assert(profile_seen==DISPLAY_READER_GRAY_PAGE&&prepared==before&&turns==4);
  unavailable=false;prepare_ok=false;assert(!reader_rc110_ripple_unlocked(&h,a,1,false)&&turns==4);prepare_ok=true;
- for(int failure=EPD_DRAW_NO_PHASES_AVAILABLE;failure<=EPD_DRAW_OTHER_ERROR;++failure){
+ static const enum EpdDrawError failures[]={EPD_DRAW_NO_PHASES_AVAILABLE,EPD_DRAW_EMPTY_LINE_QUEUE,EPD_DRAW_OTHER_ERROR};
+ int expected_clears=0;
+ for(unsigned fi=0;fi<3;++fi){
+  enum EpdDrawError failure=failures[fi];
   disabled=false;result=failure;int old=turns,checks=scheduled,gray=gray_calls;
   recovery=EPD_DRAW_SUCCESS;assert(!reader_rc110_ripple_unlocked(&h,a,0,false));
-  assert(disabled&&turns==old+1&&scheduled==checks&&gray_calls==gray+(failure==EPD_DRAW_NO_PHASES_AVAILABLE)&&tick==8765);
+  bool keep_ripple=(failure==EPD_DRAW_EMPTY_LINE_QUEUE);
+  assert(disabled==!keep_ripple&&turns==old+1&&scheduled==checks&&gray_calls==gray+(failure==EPD_DRAW_NO_PHASES_AVAILABLE)&&tick==8765);
   if(failure==EPD_DRAW_NO_PHASES_AVAILABLE)assert(profile_seen==DISPLAY_READER_GRAY_PAGE);
-  else assert(clears==failure-1&&rebuilds==clears&&cleaned==clears);
-  assert(!reader_rc110_ripple_unlocked(&h,a,1,false)&&turns==old+1);
+  else{++expected_clears;assert(clears==expected_clears&&rebuilds==clears&&cleaned==clears);}
+  result=EPD_DRAW_SUCCESS;
+  assert(!reader_rc110_ripple_unlocked(&h,a,1,false)&&turns==old+1+(keep_ripple?1:0));
  }
- disabled=false;recovery=EPD_DRAW_OTHER_ERROR;
+ disabled=false;result=EPD_DRAW_OTHER_ERROR;recovery=EPD_DRAW_OTHER_ERROR;
  assert(reader_rc110_ripple_unlocked(&h,a,1,false)==EPD_DRAW_OTHER_ERROR&&disabled&&tick==8765);
  puts("PASS: actual RC110 reader outlet retains crop/gray image/background,8 bands/11090us,restored clock,rails and checked recovery without history commits");
 }
@@ -102,7 +107,7 @@ int main(void){EpdiyHighlevelState h={.gray=9};EpdRect a={10,30,640,1080};
  s_system_binary=false;
  assert(!update_display_reader_turn_unlocked(&h,a,0,8,true,NULL)&&prepares==old&&last_wave==&normal);
  effect=1;result=EPD_DRAW_EMPTY_LINE_QUEUE;
- assert(update_display_reader_turn_unlocked(&h,a,0,8,false,NULL)==EPD_DRAW_SUCCESS&&disabled&&current_tick==old_tick);
+ assert(update_display_reader_turn_unlocked(&h,a,0,8,false,NULL)==EPD_DRAW_SUCCESS&&!disabled&&current_tick==old_tick);
  assert(last_wave==&E0470_FULL_WAVEFORM&&clear==1&&recover==1);
  puts("PASS: actual enabled dispatcher changes only reader ripple; ordinary/FastBW/main/edge/images/backgrounds retain their correct routes and grays");
 }

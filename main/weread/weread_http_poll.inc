@@ -169,6 +169,7 @@ static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_
 #endif
     for(;;){
         esp_err_t err=http_poll_guard(p);if(err!=ESP_OK)return err;
+        weread_client_yield_for_display(p->cancel,p->cancel_ctx);
         unsigned connections=p->connections;
         errno=0;err=esp_http_client_open(client,length);
         if(err==ESP_OK){http_poll_progress(p);return ESP_OK;}
@@ -199,6 +200,7 @@ static int http_poll_write(esp_http_client_handle_t client,const char *data,int 
     if(!p)return esp_http_client_write(client,data,bytes);
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
+        weread_client_yield_for_display(p->cancel,p->cancel_ctx);
         errno=0;int n=esp_http_client_write(client,data,bytes);
         if(n>0){http_poll_progress(p);return n;}
         if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;
@@ -209,6 +211,7 @@ static int64_t http_poll_headers(esp_http_client_handle_t client,http_poll_t *p)
     if(!p)return esp_http_client_fetch_headers(client);
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
+        weread_client_yield_for_display(p->cancel,p->cancel_ctx);
         errno=0;int64_t n=esp_http_client_fetch_headers(client);
         if(n>=0){http_poll_progress(p);return n;}
         if(n!=-ESP_ERR_HTTP_EAGAIN&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;
@@ -219,6 +222,7 @@ static int http_poll_read(esp_http_client_handle_t client,char *data,int bytes,h
     if(!p)return esp_http_client_read(client,data,bytes);
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
+        weread_client_yield_for_display(p->cancel,p->cancel_ctx);
         errno=0;int n=esp_http_client_read(client,data,bytes);
         if(n>=0){if(n)http_poll_progress(p);return n;}
         if(n!=-ESP_ERR_HTTP_EAGAIN&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;

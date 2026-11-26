@@ -545,6 +545,9 @@ enum EpdDrawError epd_draw_base(
 enum EpdDrawError epd_draw_base_from_phase(EpdRect area,const uint8_t* data,EpdRect crop,
     enum EpdDrawMode mode,int temperature,const bool* lines,const uint8_t* columns,
     const EpdWaveform* waveform,int first_phase);
+void epd_display_scan_begin(void);
+void epd_display_scan_end(void);
+bool epd_display_scan_active(void);
 #endif
 
 /// 下一次扫描按行选择相位 LUT；负相位表示该行保持。/ Select a phase LUT by line for the next scan; negative phases hold.

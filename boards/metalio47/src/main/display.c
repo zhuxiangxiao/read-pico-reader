@@ -198,6 +198,7 @@ static void ui_native_cleaned(const EpdWaveform* wave,enum EpdDrawMode mode,bool
 
 static const void* s_main_armed;
 static bool s_main_fault;
+static bool s_turn_already_recovered;
 static bool s_main_ui_prefill_slow;
 static bool s_main_switch_erase;
 // 只由四个主页真实快刷切换作用域授予，避免同页/文件子页/阅读继承。
@@ -437,7 +438,11 @@ static enum EpdDrawError main_recover(EpdiyHighlevelState* hl, enum EpdDrawError
     }
     use_scan_for(&E0470_FULL_WAVEFORM, MODE_GC16);
     epd_poweron();
+#ifdef ESP_PLATFORM
+    epd_clear_area_cycles(epd_full_screen(), 1, 15);
+#else
     epd_clear();
+#endif
     epd_hl_waveform(hl, &E0470_FULL_WAVEFORM);
     enum EpdDrawError result = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
@@ -852,6 +857,7 @@ bool display_take_white_exit(void) {
 
 static enum EpdDrawError update_display_full_unlocked(EpdiyHighlevelState* hl) {
     s_full_refresh_requested = false;
+    s_turn_already_recovered = false;
     if(s_system_binary)system_normalize(hl);
     if(s_main_fault)return main_recover(hl,EPD_DRAW_SUCCESS);
     display_main_transition_cancel();
@@ -1000,7 +1006,7 @@ static enum EpdDrawError reader_rc110_ripple_unlocked(EpdiyHighlevelState* hl, E
         reader_rails_schedule_check();
         return result;
     }
-    metalio_text_ripple_disable();
+    if (!(result & EPD_DRAW_EMPTY_LINE_QUEUE)) metalio_text_ripple_disable();
     if (result == EPD_DRAW_NO_PHASES_AVAILABLE)
         return reader_gray_present_unlocked(hl, area, DISPLAY_READER_GRAY_PAGE, true);
     // 部分扫描后的物理灰阶未知；沿RC110从白重建完整目标，失败交给现有上层重试。
@@ -1012,11 +1018,18 @@ static enum EpdDrawError reader_rc110_ripple_unlocked(EpdiyHighlevelState* hl, E
     use_scan_for(&E0470_FULL_WAVEFORM, MODE_GC16);
     epd_poweron();
     epd_hl_waveform(hl, &E0470_FULL_WAVEFORM);
+#ifdef ESP_PLATFORM
+    epd_clear_area_cycles(epd_full_screen(), 1, 15);
+#else
     epd_clear();
+#endif
     enum EpdDrawError recovered = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
     ui_page_cleaned(recovered);
     rails_keepalive();
+#ifdef ESP_PLATFORM
+    if (recovered & EPD_DRAW_EMPTY_LINE_QUEUE) s_turn_already_recovered = true;
+#endif
     return recovered;
 }
 #endif
@@ -1087,12 +1100,19 @@ static enum EpdDrawError update_display_reader_turn_unlocked(EpdiyHighlevelState
     use_scan_for(&E0470_FULL_WAVEFORM, MODE_GC16);
     epd_poweron();
     epd_hl_waveform(hl, &E0470_FULL_WAVEFORM);
+#ifdef ESP_PLATFORM
+    epd_clear_area_cycles(epd_full_screen(), 1, 15);
+#else
     epd_clear();
+#endif
     enum EpdDrawError recovered = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
     epd_hl_waveform(hl, &E0470_WAVEFORM);
 
     ui_page_cleaned(recovered);
     rails_keepalive();
+#ifdef ESP_PLATFORM
+    if (recovered & EPD_DRAW_EMPTY_LINE_QUEUE) s_turn_already_recovered = true;
+#endif
     ESP_LOGW(TAG, "water turn failed (%d), recovery=%d", result, recovered);
     return recovered;
 }
@@ -1102,13 +1122,19 @@ static enum EpdDrawError update_display_reader_turn_unlocked(EpdiyHighlevelState
 int display_pclk_mhz(void) { return s_pclk_mhz; }
 
 static void guard_draw_result_unlocked(EpdiyHighlevelState* hl, enum EpdDrawError result) {
-    if (!(result & EPD_DRAW_EMPTY_LINE_QUEUE)) return;
+    bool skip = s_turn_already_recovered;
+    s_turn_already_recovered = false;
+    if (skip || !(result & EPD_DRAW_EMPTY_LINE_QUEUE)) return;
     display_main_transition_cancel();
     s_pclk_mhz = DISPLAY_PCLK_SAFE_MHZ;
     read_pico_epd_set_pclk(DISPLAY_PCLK_SAFE_MHZ);
     use_scan_for(&E0470_FULL_WAVEFORM, MODE_GC16);
     epd_poweron();
+#ifdef ESP_PLATFORM
+    epd_clear_area_cycles(epd_full_screen(), 1, 15);
+#else
     epd_clear();
+#endif
     // 清物理屏后仅重置旧帧基准，保留目标页；否则局部刷新会留下整页白屏。
     // Reset only the old-frame baseline after clearing; preserving the target prevents blank pages after partial updates.
     enum EpdDrawError recovered = epd_hl_update_screen_from_white(hl, MODE_GC16, 25);
@@ -1133,7 +1159,7 @@ int64_t local_display_elapsed_us;
 
 // 连续相位全部完成后，back已是真实黑白画面；不因尚未补灰阶而多做一次整屏GC16。
 // Once continuous phases finish, back is the real binary frame; pending gray restoration alone does not require full GC16.
-static bool display_needs_full(void) { return s_full_refresh_requested; }
+static bool display_needs_full(void) { s_turn_already_recovered = false; return s_full_refresh_requested; }
 
 enum EpdDrawError update_display_reader_gray(EpdiyHighlevelState* hl, EpdRect area,
     display_reader_gray_profile_t profile, bool full) {

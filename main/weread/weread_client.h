@@ -63,6 +63,8 @@ typedef esp_err_t (*weread_download_transport_fn)(const char *url, const char *h
     weread_download_info_t *info, void *ctx);
 void weread_client_set_download_transport(weread_download_transport_fn fn, void *ctx);
 void weread_client_set_radio_awake(bool awake);
+/// 扫屏期间让出后台 HTTP/SD 突发，避免与 EPD 供数争用。/ Yield background HTTP/SD bursts while EPD scanning is active.
+void weread_client_yield_for_display(weread_cancel_fn cancel, void *ctx);
 /// 下载正文进度回调：bytes 为本次HTTP尝试的已写字节，done 表示正文传输完成、进入解包校验。
 /// Download body progress: bytes are written for this HTTP attempt; done marks body completion before unpacking.
 typedef void (*weread_download_progress_fn)(uint64_t bytes, bool done, void *ctx);

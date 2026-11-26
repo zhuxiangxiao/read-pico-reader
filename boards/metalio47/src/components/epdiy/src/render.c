@@ -11,6 +11,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <stdatomic.h>
 #include <stdalign.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,10 +30,15 @@
 #ifdef KIIKO_LOCAL_LATENCY
 static bool s_pipeline_enabled;
 void epd_pipeline_enable(bool enabled) { __atomic_store_n(&s_pipeline_enabled,enabled,__ATOMIC_RELAXED); }
-bool epd_pipeline_enabled(void) { return __atomic_load_n(&s_pipeline_enabled,__ATOMIC_RELAXED); }
+bool IRAM_ATTR epd_pipeline_enabled(void) { return __atomic_load_n(&s_pipeline_enabled,__ATOMIC_RELAXED); }
 #else
-bool epd_pipeline_enabled(void) { return true; }
+bool IRAM_ATTR epd_pipeline_enabled(void) { return true; }
 #endif
+
+static atomic_int s_scan_busy_depth;
+void epd_display_scan_begin(void) { atomic_fetch_add_explicit(&s_scan_busy_depth, 1, memory_order_acq_rel); }
+void epd_display_scan_end(void) { atomic_fetch_sub_explicit(&s_scan_busy_depth, 1, memory_order_acq_rel); }
+bool epd_display_scan_active(void) { return atomic_load_explicit(&s_scan_busy_depth, memory_order_acquire) > 0; }
 
 static inline int min(int x, int y) {
     return x < y ? x : y;
@@ -351,9 +357,11 @@ static enum EpdDrawError IRAM_ATTR epd_draw_base_impl(
         render_context.line_mask, drawn_columns, render_context.display_width / 4
     );
 
+    epd_display_scan_begin();
     s_scan_active=true;
     lcd_do_update(&render_context);
     s_scan_active=false;
+    epd_display_scan_end();
     render_context.phase_luts = NULL;
     render_context.line_phase = NULL;
     render_context.col_band_x0 = NULL;

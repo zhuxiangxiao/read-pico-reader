@@ -912,6 +912,7 @@ static esp_err_t scan_book_cache(const char *id) {
     struct dirent *e;
     for (;;) {
         if (cancelled(NULL) || scan_fg_active()) { ok = false; break; }
+        weread_client_yield_for_display(cancelled, NULL);
         errno = 0;
         e = readdir(dir);
         if (!e) { if (errno) ok = false; break; }
@@ -976,6 +977,7 @@ static esp_err_t prefetch_job(void) {
         size_t probes = 0;
         for (size_t i = s_work.chapter_idx; ; ++i) {
             if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
+            weread_client_yield_for_display(cancelled, NULL);
             size_t t = 0;
             uint32_t uid = book_cache_uid_for(s_work.id, i, &t);
             if (t && i >= t) {

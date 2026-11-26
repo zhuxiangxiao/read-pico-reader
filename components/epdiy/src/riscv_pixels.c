@@ -170,8 +170,11 @@ calc_epd_input_1ppB_1k_S3_VE_aligned(
     uint32_t j = 0;
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31) && defined(ESP_PLATFORM)
+#ifdef KIIKO_LOCAL_LATENCY
     extern bool epd_pipeline_enabled(void);
-    if(epd_pipeline_enabled()) {
+    if(epd_pipeline_enabled())
+#endif
+    {
 #define READY4(v) (lut[((v)&255u)*4+3]|lut[(((v)>>8)&255u)*4+2]|lut[(((v)>>16)&255u)*4+1]|lut[((v)>>24)*4])
         for(;j+4<=n;j+=4) {
             const uint32_t a=ld[j],b=ld[j+1],c=ld[j+2],d=ld[j+3];

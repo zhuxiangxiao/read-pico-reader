@@ -5464,7 +5464,11 @@ static bool present(app_ctx_t* ctx, app_redraw_t redraw) {
     int64_t start = esp_timer_get_time();
     const int64_t frame_minute=ui_nav_clock_minute();
     if (redraw == APP_REDRAW_PAGE || redraw == APP_REDRAW_FULL) render(ctx, ctx->fb);
+#if KIIKO_BOARD_METALIO47 && defined(ESP_PLATFORM)
+    bool prep = read_pico_transfer_radio_busy() ? false : kick_prep();
+#else
     bool prep = kick_prep();
+#endif
     int64_t drawn = esp_timer_get_time();
     // 本地细点阵挡板已是黑白目标，不注册灰区，省去暂存和第二轮GL16。
     // Local fine-dot guards are already BW targets; omit gray bands to skip staging and the second GL16 pass.

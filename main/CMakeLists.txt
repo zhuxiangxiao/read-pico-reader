@@ -447,9 +447,9 @@ if(EXISTS "${CMAKE_BINARY_DIR}/kiiko_fork_inc/kiiko_ota_origin_gen.h")
     target_include_directories(${COMPONENT_LIB} PRIVATE "${CMAKE_BINARY_DIR}/kiiko_fork_inc")
 endif()
 
-# 解析、设置与页面调度按体积编译，为在线书源保留原分区；S31 保留热点绘制与微信读书/封面路径为性能优化(-O2)。
+# 解析、设置、书架外壳与阅读器主控按 -Os 编译，为在线书源保留原分区并缓解 S31 I-Cache 压力；S31 保留热点像素、字体与 EPD/封面解码路径为性能优化(-O2)。
 # 首页概览、时钟控件与封面裁剪/缩放开销低、可重建，一并换出应用槽余量。
-# Size-optimize cold parsing/settings/setup within original slots; on S31 keep hot UI/cover/WeRead paths at -O2.
+# Size-optimize cold parsing/settings/reader shell/UI kit within original slots; on S31 keep hot pixel/font/layout/EPD/cover-decode paths at -O2.
 # Home overview, clock widgets and cover crop/scale helpers are cheap and rebuildable, so trade their size for app-slot headroom.
 set(weread_cold_size_sources
     app_dashboard.c ui_home_clock.c book_cover.c
@@ -469,10 +469,7 @@ set(weread_cold_size_sources
     app_weread.c book_source_weread.c book_weread_crypto.c
     weread_client.c weread_store.c weread_shelf.c weread_toc.c weread_chapter.c
     weread_progress.c weread_position.c weread_runtime.c)
-set(weread_size_sources ${weread_cold_size_sources})
-if(NOT KIIKO_BOARD_METALIO47)
-    list(APPEND weread_size_sources html_text.c app_book.c ui_shelf.c ui_kit.c)
-endif()
+set(weread_size_sources ${weread_cold_size_sources} html_text.c app_book.c ui_shelf.c ui_kit.c)
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)

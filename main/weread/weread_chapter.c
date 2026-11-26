@@ -393,6 +393,7 @@ typedef struct { char root[512], name[512], parent[1024], last_path[1024]; FILE 
 static bool extract(void *ctx, const char *name, const uint8_t *bytes, size_t n, size_t offset, size_t total) {
     extract_t *x = ctx;
     if (cancelled()) return false;
+    weread_client_yield_for_display(s_cancel, s_cancel_ctx);
     if (!offset) {
         if (x->file) { x->error = ESP_ERR_INVALID_RESPONSE; goto fail; }
         char path[1024], mapped[48];
@@ -667,6 +668,7 @@ static esp_err_t assemble(const char *root, const char *id, uint32_t uid, uint32
     size_t total = 0;
     if (err == ESP_OK) cJSON_ArrayForEach(entry, files) {
         if (!cJSON_IsString(entry) || cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
+        weread_client_yield_for_display(s_cancel, s_cancel_ctx);
         char normalized[512], mapped[48];
         const char *disk = weread_resource_path(NULL, entry->valuestring, normalized, sizeof(normalized))
             ? weread_chapter_storage_path(normalized, mapped) : NULL;

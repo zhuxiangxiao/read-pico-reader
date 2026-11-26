@@ -21,6 +21,9 @@
 #if defined(ESP_PLATFORM)
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+__attribute__((weak)) bool epd_display_scan_active(void) { return false; }
 typedef struct { wifi_ps_type_t previous; bool restore; } radio_ps_guard_t;
 static radio_ps_guard_t radio_ps_enter(void) {
     radio_ps_guard_t g = { .previous = WIFI_PS_MIN_MODEM, .restore = false };
@@ -53,6 +56,16 @@ void weread_client_set_radio_awake(bool awake) {
 #else
 void weread_client_set_radio_awake(bool awake) { (void)awake; }
 #endif
+void weread_client_yield_for_display(weread_cancel_fn cancel, void *ctx) {
+#if defined(ESP_PLATFORM)
+    for (unsigned waited = 0; waited < 80 && epd_display_scan_active(); ++waited) {
+        if (weread_client_cancelled() || (cancel && cancel(ctx))) break;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+#else
+    (void)cancel; (void)ctx;
+#endif
+}
 
 #if defined(ESP_PLATFORM)
 #include "freertos/FreeRTOS.h"
@@ -784,6 +797,7 @@ static esp_err_t weread_client_dispatch_raw(
     unsigned body_chunks = 0;
     while (err == ESP_OK) {
         if (weread_client_cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
+        weread_client_yield_for_display(NULL, NULL);
         char chunk[2048];
         int n = http_poll_read(client, chunk, sizeof(chunk),poll);
         if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
@@ -1240,6 +1254,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
     unsigned chunks = 0;
     while (err == ESP_OK) {
         if (cancel && cancel(ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        weread_client_yield_for_display(cancel, ctx);
         int n = http_poll_read(client, buffer, (int)chunk_cap, poll);
         if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         if (!n) {
@@ -1247,6 +1262,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
             break;
         }
         if ((size_t)n > limit - info->bytes) { err = ESP_ERR_INVALID_SIZE; break; }
+        weread_client_yield_for_display(cancel, ctx);
         if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { err = ESP_FAIL; break; }
         info->bytes += (size_t)n;
         // 每4块（32KiB）推进一次跨线程进度，节流避免逐块同步。/ Advance cross-thread progress every4 chunks (32KiB), keeping per-chunk sync cheap.

@@ -20,9 +20,9 @@
 #include "lcd_driver.h"
 #include "render_lcd.h"
 
-// S31 C 查表需要更长的准备窗口；Pico 上层档位不应覆盖它。
-// S31 C lookup needs its own prefill margin, independent of Pico profiles.
-static int s_prefill_lines = 192;
+// S31 C 查表需要更长的准备窗口；两队列共 254 槽，240 行预填兼顾安全与最大裕量。
+// S31 C lookup needs a wider prefill margin; 240 rows fits safely inside the 254-slot queues.
+static int s_prefill_lines = 240;
 #ifdef KIIKO_LOCAL_LATENCY
 #include "esp_private/spi_flash_os.h"
 #include "esp_rom_sys.h"
@@ -552,7 +552,7 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
 
 #endif
 
-// 空闲根页可请求128行，两生产者各64行；其他调用保持192行以保护音频/传输余量。
-// Idle roots may request128 rows,64 per producer; other callers retain192 to protect audio/transfer margins.
-void epd_lcd_set_prefill_lines(int lines) { s_prefill_lines = lines == 128 || lines == 160 ? lines : 192; }
+// 空闲根页可请求128行，两生产者各64行；其他调用保持240行以保护音频/传输与Wi-Fi余量。
+// Idle roots may request 128 rows, 64 per producer; other callers retain 240 to protect audio/transfer and Wi-Fi margins.
+void epd_lcd_set_prefill_lines(int lines) { s_prefill_lines = lines == 128 || lines == 160 ? lines : 240; }
 int epd_lcd_prefill_lines(void) { return s_prefill_lines; }
