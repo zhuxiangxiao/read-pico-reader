@@ -454,6 +454,8 @@ endif()
 set(weread_cold_size_sources
     app_dashboard.c ui_home_clock.c book_cover.c
     book_index_cache.c book_title.c book_toc.c book_weread_cover.c
+    book_progress.c book_cover_jobs.c book_shelf_page_cache.c metalio_cover_cache.c
+    book_source.c book_txt.c book_epub.c zip_reader.c gbk.c
     book_xteink_sync.c book_history_backup.c book_lock_collage.c book_lock_bookmark.c weread_auth.c
     settings.c app_device_settings.c app_files.c app_transfer.c app_image.c vcom_setup.c
     app_cloud_sync.c ui_keyboard.c ota_online.c ota_release.c app_onboarding.c ui_wallpaper.c
@@ -469,15 +471,14 @@ set(weread_cold_size_sources
     weread_progress.c weread_position.c weread_runtime.c)
 set(weread_size_sources ${weread_cold_size_sources})
 if(NOT KIIKO_BOARD_METALIO47)
-    list(APPEND weread_size_sources html_text.c book_epub.c book_txt.c book_source.c zip_reader.c
-        app_book.c ui_shelf.c ui_kit.c book_progress.c)
+    list(APPEND weread_size_sources html_text.c app_book.c ui_shelf.c ui_kit.c)
 endif()
 foreach(weread_source IN LISTS kiiko_selected_sources)
     get_filename_component(weread_source_name "${weread_source}" NAME)
     if(weread_source_name IN_LIST weread_size_sources)
         set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Os")
         # IDF6.1 GCC supports Oz; cold UI/setup/update code makes room for the shared shelf without changing assets or slots.
-        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|book_library|book_import|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock|lock_screen|lock_pin|lock_pin_flow|setup_state|factory_reset|time_service|sleep|crash_note|sd_recovery|pmu_selftest|debug_panel|file_tree|file_search|usb_storage|book_added|book_ticket|book_excerpt|book_cover_auto|book_image_header|ui_home_widget|ui_quick_menu|ui_ai_menu|ui_lock_feedback|ui_avatar|app_weread|book_source_weread|book_weread_crypto|weread_client|weread_store|weread_shelf|weread_toc|weread_progress|weread_position|weread_runtime)\\.c$")
+        if(weread_source_name MATCHES "^(settings|app_device_settings|app_onboarding|app_files|app_cloud_sync|app_font_pick|app_transfer|app_image|book_index_cache|book_title|book_toc|book_weread_cover|book_progress|book_cover_jobs|book_shelf_page_cache|metalio_cover_cache|book_source|book_txt|book_epub|zip_reader|gbk|book_xteink_sync|book_history_backup|book_lock_collage|book_lock_bookmark|book_store|book_library|book_import|weread_auth|ota_update|ota_online|ota_release|vcom_setup|ui_wallpaper|ui_menu|ui_nav|ui_text_input|ui_text_edit|ui_quick_menu_input|ui_wifi_qr|ui_pinpad|ui_power_dialog|ui_ime|ui_keyboard|datamatrix|ui_online_fonts|online_font_store|online_font|app_boot_recovery|app_dashboard|ui_home_clock|lock_screen|lock_pin|lock_pin_flow|setup_state|factory_reset|time_service|sleep|crash_note|sd_recovery|pmu_selftest|debug_panel|file_tree|file_search|usb_storage|book_added|book_ticket|book_excerpt|book_cover_auto|book_image_header|ui_home_widget|ui_quick_menu|ui_ai_menu|ui_lock_feedback|ui_avatar|app_weread|book_source_weread|book_weread_crypto|weread_client|weread_store|weread_shelf|weread_toc|weread_chapter|weread_progress|weread_position|weread_runtime)\\.c$")
             set_source_files_properties("${weread_source}" PROPERTIES COMPILE_OPTIONS "-Oz;-fno-inline-small-functions;-Wno-error=format-truncation")
         endif()
         # Pico 应用槽更紧：封面裁剪/缩放也走 Oz；S31 保留 Os 以免书架封面生成变慢。
