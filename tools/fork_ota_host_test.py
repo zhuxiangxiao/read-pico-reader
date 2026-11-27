@@ -16,7 +16,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fork_ota_config as cfg
-from fork_package_ota import normalize_notes, package_ota
+from fork_package_ota import extract_annotated_tag_notes, normalize_notes, package_ota
 from fork_stage_ota_pages import stage_ota_pages
 from fork_sync_upstream import inspect_upstream, merge_upstream
 
@@ -432,12 +432,101 @@ def test_build_firmware_cli_dry_run() -> None:
         assert bad.returncode != 0
 
 
+def test_annotated_tag_notes_extraction() -> None:
+    expected_notes = (
+        "1. 微信读书大书架同步提速\n"
+        "2. 长章 RLE 精确映射免重排\n"
+        "3. 网络升级 select 唤醒与连接复用"
+    )
+    commit_subject = "perf(weread): raw english commit message"
+    with tempfile.TemporaryDirectory(prefix="kiiko-tag-notes-") as td:
+        tmp = Path(td)
+        origin_bare = tmp / "origin.git"
+        work_repo = tmp / "work"
+        ci_checkout = tmp / "ci-checkout"
+
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(origin_bare)], check=True, capture_output=True)
+        subprocess.run(["git", "clone", str(origin_bare), str(work_repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(work_repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(work_repo), "config", "user.email", "test@example.com"], check=True)
+        (work_repo / "README.md").write_text("hi\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(work_repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(work_repo), "commit", "-m", commit_subject], check=True, capture_output=True)
+        commit_sha = subprocess.check_output(["git", "-C", str(work_repo), "rev-parse", "HEAD"], text=True).strip()
+
+        subprocess.run(["git", "-C", str(work_repo), "tag", "-a", "release-20261127", "-m", expected_notes], check=True)
+        subprocess.run(["git", "-C", str(work_repo), "tag", "release-light-20261127", "HEAD"], check=True)
+        subprocess.run(["git", "-C", str(work_repo), "push", "origin", "main", "release-20261127", "release-light-20261127"], check=True, capture_output=True)
+
+        # Reproduce actions/checkout@v4 shallow dereferenced tag fetch behavior.
+        subprocess.run(["git", "init", str(ci_checkout)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(ci_checkout), "remote", "add", "origin", str(origin_bare)], check=True)
+        subprocess.run(
+            ["git", "-C", str(ci_checkout), "fetch", "--no-tags", "--prune", "--depth=1", "origin",
+             f"+{commit_sha}:refs/tags/release-20261127"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(ci_checkout), "checkout", "--force", "refs/tags/release-20261127"], check=True, capture_output=True)
+        assert subprocess.check_output(
+            ["git", "-C", str(ci_checkout), "cat-file", "-t", "refs/tags/release-20261127"],
+            text=True,
+        ).strip() == "commit"
+
+        # Without --fetch-tag, lightweight shallow tag must return "" and never leak commit message.
+        assert extract_annotated_tag_notes("release-20261127", repo_dir=ci_checkout, fetch=False) == ""
+        # With fetch=True, the real annotated tag object is fetched and preserves multi-line Chinese notes.
+        assert extract_annotated_tag_notes("release-20261127", repo_dir=ci_checkout, fetch=True) == expected_notes
+        assert subprocess.check_output(
+            ["git", "-C", str(ci_checkout), "cat-file", "-t", "refs/tags/release-20261127"],
+            text=True,
+        ).strip() == "tag"
+        # Lightweight tag on origin must still return "" and never leak commit message.
+        assert extract_annotated_tag_notes("release-light-20261127", repo_dir=ci_checkout, fetch=True) == ""
+
+        bdir = tmp / "build/boards"
+        (bdir / "packages/pico").mkdir(parents=True)
+        (bdir / "pico/build/config").mkdir(parents=True)
+        (bdir / "pico/build/config/sdkconfig.h").write_text("#define CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE 1\n", encoding="utf-8")
+        (bdir / "packages/pico/firmware.bin").write_bytes(make_fake_firmware("pico", "0.3.3-rc108.1", FORK_ORIGIN))
+
+        meta = package_ota(
+            "pico",
+            bdir,
+            "0.3.3-rc108.1",
+            tmp / "out-annotated",
+            ota_origin=FORK_ORIGIN,
+            notes="",
+            root=ROOT,
+            tag="release-20261127",
+            fetch_tag=False,
+            repo_dir=ci_checkout,
+        )
+        assert meta["notes"] == expected_notes
+
+        meta_light = package_ota(
+            "pico",
+            bdir,
+            "0.3.3-rc108.1",
+            tmp / "out-lightweight",
+            ota_origin=FORK_ORIGIN,
+            notes="",
+            root=ROOT,
+            tag="release-light-20261127",
+            fetch_tag=False,
+            repo_dir=ci_checkout,
+        )
+        assert meta_light["notes"] != commit_subject
+        assert meta_light["notes"].startswith("基于上游 ")
+
+
 def main() -> int:
     test_config_and_versions()
     test_cmake_header_generation()
     test_package_and_pages_staging()
     test_sync_upstream_git()
     test_build_firmware_cli_dry_run()
+    test_annotated_tag_notes_extraction()
     print("PASS: fork OTA config, CMake origin header, packaging, Pages staging, upstream sync, and build CLI")
     return 0
 

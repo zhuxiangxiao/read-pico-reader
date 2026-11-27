@@ -131,8 +131,9 @@ jobs:
         env:
           NOTES: ${{ inputs.notes }}
         run: |
-          if [ -z "$NOTES" ] && [ "${{ github.event_name }}" = "push" ]; then
-            NOTES="$(git -c safe.directory="$GITHUB_WORKSPACE" tag -l --format='%(contents)' "${{ github.ref_name }}" 2>/dev/null || true)"
+          tag_args=()
+          if [ -z "$NOTES" ] && [ "${{ github.event_name }}" = "push" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            tag_args=(--tag "${{ github.ref_name }}" --fetch-tag)
           fi
           . "$IDF_PATH/export.sh"
           board_release_flags=()
@@ -154,6 +155,7 @@ jobs:
             --version "${{ matrix.version }}" \
             --ota-origin "${{ needs.plan.outputs.ota_origin }}" \
             --notes "$NOTES" \
+            "${tag_args[@]}" \
             --output "build/ota-dist/${{ matrix.board }}"
       - uses: actions/upload-artifact@v4
         with:

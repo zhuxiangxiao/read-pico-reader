@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import zipfile
 
@@ -23,6 +24,42 @@ from fork_ota_config import (
     validate_firmware_bytes,
     validate_ota_origin,
 )
+
+
+def _git_cmd(args: list[str], repo_dir: Path) -> subprocess.CompletedProcess[str]:
+    resolved = Path(repo_dir).resolve()
+    return subprocess.run(
+        ["git", "-c", f"safe.directory={resolved}", "-C", str(resolved), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+
+def extract_annotated_tag_notes(tag: str, repo_dir: Path = ROOT, fetch: bool = False) -> str:
+    tag_name = (tag or "").strip()
+    if not tag_name:
+        return ""
+    ref = f"refs/tags/{tag_name}"
+    type_proc = _git_cmd(["cat-file", "-t", ref], repo_dir)
+    obj_type = type_proc.stdout.strip() if type_proc.returncode == 0 else ""
+    if obj_type != "tag" and fetch:
+        _git_cmd(["fetch", "--no-tags", "--depth=1", "--force", "origin", f"{ref}:{ref}"], repo_dir)
+        type_proc = _git_cmd(["cat-file", "-t", ref], repo_dir)
+        obj_type = type_proc.stdout.strip() if type_proc.returncode == 0 else ""
+    if obj_type != "tag":
+        return ""
+    msg_proc = _git_cmd(["for-each-ref", "--format=%(contents)", ref], repo_dir)
+    if msg_proc.returncode != 0:
+        return ""
+    text = msg_proc.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    for marker in ("\n-----BEGIN PGP SIGNATURE-----", "\n-----BEGIN SSH SIGNATURE-----"):
+        idx = text.find(marker)
+        if idx >= 0:
+            text = text[:idx]
+            break
+    return text.strip()
 
 
 def normalize_notes(notes: str | None, base_version: str, version: str) -> str:
@@ -45,6 +82,9 @@ def package_ota(
     ota_origin: str | None = None,
     notes: str = "",
     root: Path = ROOT,
+    tag: str = "",
+    fetch_tag: bool = False,
+    repo_dir: Path | None = None,
 ) -> dict:
     board = canonical_board(board)
     spec = board_spec(board, root=root)
@@ -79,7 +119,10 @@ def package_ota(
 
     sha256 = hashlib.sha256(data).hexdigest()
     size = len(data)
-    clean_notes = normalize_notes(notes, spec["base_version"], version)
+    raw_notes = (notes or "").strip()
+    if not raw_notes and tag:
+        raw_notes = extract_annotated_tag_notes(tag, repo_dir=repo_dir or root, fetch=fetch_tag)
+    clean_notes = normalize_notes(raw_notes, spec["base_version"], version)
 
     bin_filename = f"{spec['update_prefix']}-{version}.bin"
     feed_filename = spec["feed_filename"]
@@ -170,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", required=True)
     parser.add_argument("--ota-origin", default=None)
     parser.add_argument("--notes", default="")
+    parser.add_argument("--tag", default="")
+    parser.add_argument("--fetch-tag", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -180,6 +225,8 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         ota_origin=args.ota_origin,
         notes=args.notes,
+        tag=args.tag,
+        fetch_tag=args.fetch_tag,
     )
     print(json.dumps(meta, ensure_ascii=False))
     return 0

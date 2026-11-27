@@ -81,7 +81,7 @@ git push origin HEAD
 git push origin HEAD:main
 ```
 
-3. Choose a non-colliding release tag for the requested scope and keep the annotated tag message concise in Chinese (< 384 UTF-8 bytes so it fits device OTA prompts):
+3. Choose a non-colliding release tag for the requested scope and keep the annotated tag message concise in Chinese (< 384 UTF-8 bytes so it fits device OTA prompts). The device OTA confirmation screen (`draw_upgrade_notes` in `app_device_settings.c`) splits on `\n` / `;` / `；`, wraps at `540 px` (~19–20 Chinese chars/line), and renders at most 6 lines — format annotated tag messages as concise numbered Chinese lines (`1. ...\n2. ...`, `<= 6` short lines):
    - Dual-board (`all`): `release-YYYYMMDD` (append `-2`, `-3`, ... if already exists)
    - Pico only (`pico`): `release-pico-YYYYMMDD`
    - Metalio S31 only (`metalio47`): `release-s31-YYYYMMDD`

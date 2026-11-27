@@ -26,6 +26,7 @@ if run.get("status") != "completed" or run.get("conclusion") != "success":
     sys.exit(1)
 print(f"Workflow Run: {run.get('url')} (ref={run.get('headBranch')}, conclusion={run.get('conclusion')})")
 PY
+HEAD_BRANCH="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1]).get("headBranch") or "")' "$RUN_JSON")"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -65,11 +66,24 @@ with open(out_path, "w", encoding="utf-8") as fh:
     json.dump([found[b] for b in expected], fh, ensure_ascii=False, indent=2)
 PY
 
-python3 - "$META_FILE" <<'PY'
+python3 - "$META_FILE" "$HEAD_BRANCH" <<'PY'
 import json, subprocess, sys, time, urllib.parse
 
 with open(sys.argv[1], encoding="utf-8") as fh:
     boards = json.load(fh)
+head_branch = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+
+tag_notes = None
+commit_subject = None
+if head_branch:
+    ref = f"refs/tags/{head_branch}"
+    tproc = subprocess.run(["git", "cat-file", "-t", ref], capture_output=True, text=True, check=False)
+    if tproc.returncode == 0 and tproc.stdout.strip() == "tag":
+        mproc = subprocess.run(["git", "for-each-ref", "--format=%(contents)", ref], capture_output=True, text=True, check=False)
+        cproc = subprocess.run(["git", "log", "-1", "--format=%s", f"{ref}^{{commit}}"], capture_output=True, text=True, check=False)
+        if mproc.returncode == 0 and cproc.returncode == 0:
+            tag_notes = mproc.stdout.strip()
+            commit_subject = cproc.stdout.strip()
 
 for meta in boards:
     board = meta["board"]
@@ -136,10 +150,18 @@ for meta in boards:
     if cl != expected_size:
         raise SystemExit(f"ERROR [{board}]: content-length {cl} != expected {expected_size} for {bin_url}")
 
+    if tag_notes is not None and commit_subject is not None and tag_notes != commit_subject:
+        if feed.get("notes", "").strip() == commit_subject:
+            raise SystemExit(
+                f"ERROR [{board}]: {feed_url} notes fell back to raw commit subject "
+                f"{commit_subject!r} instead of annotated tag notes"
+            )
+
     print(f"[{board}] VERIFIED:")
     print(f"  version:        {version} (upstream base {base_version})")
     print(f"  binary size:    {expected_size} B (free_app_bytes={free_bytes} B)")
     print(f"  release:        {rel.get('url')} ({len(assets_by_name)} assets)")
     print(f"  pages manifest: {feed_url}")
     print(f"  bin url:        {bin_url} ({status_line}, content-length={cl})")
+    print(f"  notes:          {feed.get('notes')!r}")
 PY
