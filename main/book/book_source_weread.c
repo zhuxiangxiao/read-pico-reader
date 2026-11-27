@@ -32,11 +32,46 @@ static bool s_txt, s_prepared_local;
 static WR_EXT_BSS char s_prepared_id[64],s_prepared_owner[32];
 static weread_toc_t s_prepared_toc;
 typedef struct {
+    uint32_t byte;
+    uint32_t unit;
+    uint16_t count;
+    uint8_t byte_step;
+    uint8_t unit_step;
+} weread_map_run_t;
+#define WR_MAP_MAX_RUNS (65536u / sizeof(weread_map_run_t))
+static uint32_t *s_toc_offsets;
+static size_t s_toc_index_count;
+static bool s_toc_uid_sorted;
+static void free_toc_indices(void) {
+    free(s_toc_offsets); s_toc_offsets = NULL;
+    s_toc_index_count = 0;
+    s_toc_uid_sorted = false;
+}
+static void rebuild_toc_indices(void) {
+    free_toc_indices();
+    if (!s_toc.count) return;
+    s_toc_offsets = wr_alloc_raw((s_toc.count + 1u) * sizeof(*s_toc_offsets));
+    if (s_toc_offsets) {
+        uint64_t acc = 0;
+        s_toc_offsets[0] = 0;
+        for (size_t i = 0; i < s_toc.count; ++i) {
+            acc += s_toc.chapters[i].word_count ? (uint64_t)s_toc.chapters[i].word_count * 3u : 1u;
+            s_toc_offsets[i + 1u] = acc > UINT32_MAX ? UINT32_MAX : (uint32_t)acc;
+        }
+    }
+    bool sorted = true;
+    for (size_t i = 1; i < s_toc.count; ++i) {
+        if (s_toc.chapters[i].uid <= s_toc.chapters[i - 1u].uid) { sorted = false; break; }
+    }
+    s_toc_uid_sorted = sorted;
+    s_toc_index_count = s_toc.count;
+}
+typedef struct {
     char root[512],resources[512],owner[32],storage[256];
     uint32_t uid,version;
     size_t index,new_index;
     weread_toc_t toc;
-    weread_position_point_t *map;
+    weread_map_run_t *map;
     size_t map_count,map_capacity;
     uint32_t text_bytes,source_units;
     bool map_ready;
@@ -49,7 +84,7 @@ static bool binding_owned(const loaded_chapter_t *b){
 static void binding_free(loaded_chapter_t **b){
     if(*b){weread_toc_free(&(*b)->toc);free((*b)->map);free(*b);*b=NULL;}
 }
-size_t book_weread_map_cache_bytes(void){WR_GUARD;return ((s_loaded?s_loaded->map_capacity:0)+(s_candidate?s_candidate->map_capacity:0))*sizeof(weread_position_point_t);}
+size_t book_weread_map_cache_bytes(void){WR_GUARD;return ((s_loaded?s_loaded->map_capacity:0)+(s_candidate?s_candidate->map_capacity:0))*sizeof(weread_map_run_t);}
 void book_weread_discard_loaded(void){WR_GUARD;binding_free(&s_candidate);}
 bool book_weread_directory_in_use(const char *root){WR_GUARD;
     return root&&((s_loaded&&(!strcmp(root,s_loaded->root)||!strcmp(root,s_loaded->resources)))||
@@ -63,8 +98,9 @@ static const char *bound_resource(const char *root){
     if(root&&binding_owned(s_loaded)&&!strcmp(root,s_loaded->root))return s_loaded->resources;
     return NULL;
 }
-static struct {char *text,*roots;size_t len;} s_css;
-static void clear_css(void){free(s_css.text);free(s_css.roots);memset(&s_css,0,sizeof(s_css));}
+typedef struct { char *root, *text; size_t len; } css_slot_t;
+static struct { css_slot_t res, ch; char *merged; } s_css;
+static void clear_css(void){free(s_css.res.root);free(s_css.res.text);free(s_css.ch.root);free(s_css.ch.text);free(s_css.merged);memset(&s_css,0,sizeof(s_css));}
 void book_weread_clear_prepared(void){WR_GUARD;weread_toc_free(&s_prepared_toc);s_prepared_id[0]=s_prepared_owner[0]=0;s_prepared_local=false;}
 bool book_weread_prepared(const char *id){WR_GUARD;
     const weread_auth_session_t *s=weread_auth_get_current_session();
@@ -117,6 +153,7 @@ esp_err_t book_weread_reload_toc(const char *id){WR_GUARD;
     if(err!=ESP_OK)return err;
     if(!toc.count){weread_toc_free(&toc);return ESP_ERR_NOT_FOUND;}
     weread_toc_free(&s_toc);s_toc=toc;
+    rebuild_toc_indices();
     return ESP_OK;
 }
 esp_err_t book_weread_validate_prepared(const char *id,uint32_t uid,uint32_t index,uint32_t offset,uint32_t *version){WR_GUARD;
@@ -198,7 +235,7 @@ bool book_weread_stat(const char *uri, struct stat *out) { WR_GUARD;
 }
 bool book_weread_is_open(void) { WR_GUARD; return s_id[0] != 0; }
 bool book_weread_plain_text(void) { WR_GUARD; return s_id[0] && s_txt; }
-void book_weread_close(void) { WR_GUARD; binding_free(&s_loaded);binding_free(&s_candidate);clear_css();s_id[0] = 0; s_txt = false; weread_toc_free(&s_toc); }
+void book_weread_close(void) { WR_GUARD; binding_free(&s_loaded);binding_free(&s_candidate);clear_css();s_id[0] = 0; s_txt = false; free_toc_indices(); weread_toc_free(&s_toc); }
 esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!book_path_is_weread(uri) || strlen(uri + 9) >= sizeof(s_id)) return ESP_ERR_INVALID_ARG;
     if (!weread_auth_is_authenticated() && !weread_auth_is_expired()) {
@@ -222,12 +259,23 @@ esp_err_t book_weread_open(const char *uri) { WR_GUARD;
     if (!toc.count) { weread_toc_free(&toc); return ESP_ERR_NOT_FOUND; }
     book_weread_close(); s_toc = toc;
     strcpy(s_id, uri + 9); s_txt = !strcasecmp(b.format, "txt");
+    rebuild_toc_indices();
     return ESP_OK;
 }
 size_t book_weread_count(void) { WR_GUARD; return s_toc.count; }
 uint32_t book_weread_uid(size_t i) { WR_GUARD; return i < s_toc.count ? s_toc.chapters[i].uid : 0; }
 uint32_t book_weread_chapter_index(size_t i) { WR_GUARD; return i < s_toc.count ? s_toc.chapters[i].index : 0; }
 size_t book_weread_index(uint32_t uid) { WR_GUARD;
+    if (!s_toc.count) return SIZE_MAX;
+    if (s_toc_index_count == s_toc.count && s_toc_uid_sorted) {
+        size_t lo = 0, hi = s_toc.count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (s_toc.chapters[mid].uid < uid) lo = mid + 1;
+            else hi = mid;
+        }
+        return (lo < s_toc.count && s_toc.chapters[lo].uid == uid) ? lo : SIZE_MAX;
+    }
     for (size_t i = 0; i < s_toc.count; ++i) if (s_toc.chapters[i].uid == uid) return i;
     return SIZE_MAX;
 }
@@ -240,6 +288,9 @@ esp_err_t book_weread_title(size_t i, char *out, size_t cap) { WR_GUARD;
     memcpy(out, title, n + 1); return ESP_OK;
 }
 uint32_t book_weread_offset(size_t index) {
+    if (s_toc_offsets && s_toc_index_count == s_toc.count) {
+        return s_toc_offsets[index < s_toc.count ? index : s_toc.count];
+    }
     uint64_t n = 0;
     for (size_t i = 0; i < index && i < s_toc.count; ++i)
         n += s_toc.chapters[i].word_count ? (uint64_t)s_toc.chapters[i].word_count * 3 : 1;
@@ -257,6 +308,12 @@ static bool collect_css(const char *dir, char **css, size_t *used, size_t cap, u
     for(;;){
         errno=0;e=readdir(d);if(!e){if(errno)ok=false;break;}
         if (*e->d_name == '.') continue;
+#ifdef DT_REG
+        if (e->d_type == DT_REG) {
+            const char *ext = strrchr(e->d_name, '.');
+            if (!ext || strcasecmp(ext, ".css")) continue;
+        }
+#endif
         int n = snprintf(path, 1024, "%s/%s", dir, e->d_name);
         if (n < 0 || n >= 1024) continue;
         struct stat st; if (lstat(path, &st)) {ok=false;break;}
@@ -274,6 +331,26 @@ static bool collect_css(const char *dir, char **css, size_t *used, size_t cap, u
     }
     closedir(d); if(*css)(*css)[*used] = 0;return ok;
 }
+static bool css_slot_load(css_slot_t *slot, const char *dir, size_t cap, bool *changed) {
+    if (!dir || !*dir) {
+        if (slot->root || slot->text) {
+            free(slot->root); free(slot->text); memset(slot, 0, sizeof(*slot)); *changed = true;
+        }
+        return true;
+    }
+    if (slot->root && !strcmp(slot->root, dir)) return true;
+    char *css = NULL; size_t used = 0;
+    if (!collect_css(dir, &css, &used, cap, 0)) { free(css); return false; }
+    size_t dlen = strlen(dir) + 1;
+    char *root = wr_alloc(dlen);
+    if (!root) { free(css); return false; }
+    memcpy(root, dir, dlen);
+    if (css) { char *small = wr_realloc(css, used + 1); if (small) css = small; }
+    free(slot->root); free(slot->text);
+    slot->root = root; slot->text = css; slot->len = used;
+    *changed = true;
+    return true;
+}
 static const char *chapter_css(size_t i,const char *validated_root,size_t *used) {
     const size_t cap = 256u * 1024u;
     *used = 0;
@@ -283,21 +360,27 @@ static const char *chapter_css(size_t i,const char *validated_root,size_t *used)
     esp_err_t res=bound?(wr_copy(paths->resource,sizeof(paths->resource),bound)?(*bound?ESP_OK:ESP_ERR_NOT_FOUND):ESP_ERR_INVALID_SIZE):weread_chapter_resource_directory(s_id,paths->resource,sizeof(paths->resource));
     esp_err_t ch=validated_root?(wr_copy(paths->chapter,sizeof(paths->chapter),validated_root)?ESP_OK:ESP_ERR_INVALID_SIZE):weread_chapter_directory(s_id,book_weread_uid(i),paths->chapter,sizeof(paths->chapter));
     if((res!=ESP_OK&&res!=ESP_ERR_NOT_FOUND)||ch!=ESP_OK)return NULL;
-    bool have_res=res==ESP_OK,have_ch=ch==ESP_OK;
-    if(!have_res)paths->resource[0]=0;
-    if(!have_ch)paths->chapter[0]=0;
-    if(s_css.roots&&!strcmp(s_css.roots,paths->resource)&&!strcmp(s_css.roots+strlen(s_css.roots)+1,paths->chapter)){*used=s_css.len;return s_css.text;}
-    // 缓存只保留当前资源代次的CSS，避免每次映射遍历全部图片。/ Keep only the current resource generation's CSS, avoiding image-directory scans on each mapping.
-    clear_css();char *css=NULL;
-    if ((have_res&&!collect_css(paths->resource,&css,used,cap,0)) ||
-        (have_ch&&(!have_res||strcmp(paths->resource,paths->chapter))&&!collect_css(paths->chapter,&css,used,cap,0))) {free(css);return NULL;}
-    if(!css)css=wr_alloc(1);
-    if(!css)return NULL;
-    size_t rlen=strlen(paths->resource)+1,clen=strlen(paths->chapter)+1;
-    s_css.roots=wr_alloc(rlen+clen);if(!s_css.roots){free(css);return NULL;}
-    memcpy(s_css.roots,paths->resource,rlen);memcpy(s_css.roots+rlen,paths->chapter,clen);
-    char *small=wr_realloc(css,*used+1);s_css.text=small?small:css;s_css.len=*used;
-    return s_css.text;
+    bool have_res=res==ESP_OK,have_ch=ch==ESP_OK,changed=false;
+    const char *ch_dir = (have_ch && (!have_res || strcmp(paths->resource, paths->chapter))) ? paths->chapter : "";
+    if (!css_slot_load(&s_css.res, have_res ? paths->resource : "", cap, &changed) ||
+        !css_slot_load(&s_css.ch, ch_dir, cap > s_css.res.len ? cap - s_css.res.len : 0, &changed)) {
+        clear_css();
+        return NULL;
+    }
+    if (!s_css.ch.len) { *used = s_css.res.len; return s_css.res.text ? s_css.res.text : ""; }
+    if (!s_css.res.len) { *used = s_css.ch.len; return s_css.ch.text; }
+    if (changed || !s_css.merged) {
+        size_t total = s_css.res.len + s_css.ch.len;
+        char *m = wr_alloc(total + 1);
+        if (!m) { clear_css(); return NULL; }
+        memcpy(m, s_css.res.text, s_css.res.len);
+        memcpy(m + s_css.res.len, s_css.ch.text, s_css.ch.len);
+        m[total] = 0;
+        free(s_css.merged);
+        s_css.merged = m;
+    }
+    *used = s_css.res.len + s_css.ch.len;
+    return s_css.merged;
 }
 typedef struct {
     loaded_chapter_t *binding;
@@ -310,24 +393,44 @@ typedef struct {
 static void cache_character(void *ctx,size_t text_offset,size_t html_offset){
     map_cache_writer_t *w=ctx;loaded_chapter_t *b=w->binding;
     if(!w->complete)return;
-    if(b->map_count==8192||text_offset>UINT32_MAX||html_offset>w->bytes||html_offset<w->cursor){w->complete=false;return;}
+    if(text_offset>UINT32_MAX||html_offset>w->bytes||html_offset<w->cursor){w->complete=false;return;}
     while(w->next<w->count&&w->source[w->next].byte<=html_offset){w->cursor=w->source[w->next].byte;w->units=w->source[w->next].unit;++w->next;}
     w->units+=weread_utf16_length(w->html+w->cursor,html_offset-w->cursor);w->cursor=html_offset;
-    if(b->map_count&&(b->map[b->map_count-1].byte>text_offset||b->map[b->map_count-1].unit>w->units)){w->complete=false;return;}
-    b->map[b->map_count++]=(weread_position_point_t){(uint32_t)text_offset,w->units};
+    uint32_t tb=(uint32_t)text_offset,tu=w->units;
+    if(b->map_count){
+        weread_map_run_t *last=&b->map[b->map_count-1];
+        uint32_t prev_b=last->byte+(uint32_t)(last->count-1u)*last->byte_step;
+        uint32_t prev_u=last->unit+(uint32_t)(last->count-1u)*last->unit_step;
+        if(prev_b>tb||prev_u>tu){w->complete=false;return;}
+        uint32_t db=tb-prev_b,du=tu-prev_u;
+        if(db>=1&&db<=4&&du>=1&&du<=2&&last->count<UINT16_MAX){
+            if(last->count==1){last->byte_step=(uint8_t)db;last->unit_step=(uint8_t)du;last->count=2;return;}
+            if(last->byte_step==db&&last->unit_step==du){last->count++;return;}
+        }
+    }
+    if(b->map_count==b->map_capacity){
+        if(b->map_capacity>=WR_MAP_MAX_RUNS){w->complete=false;return;}
+        size_t next_cap=b->map_capacity?b->map_capacity*2u:256u;
+        if(next_cap>WR_MAP_MAX_RUNS)next_cap=WR_MAP_MAX_RUNS;
+        weread_map_run_t *grown=wr_realloc(b->map,next_cap*sizeof(*b->map));
+        if(!grown){w->complete=false;return;}
+        b->map=grown;b->map_capacity=next_cap;
+    }
+    b->map[b->map_count++]=(weread_map_run_t){tb,tu,1,0,0};
 }
 static esp_err_t parse_loaded(loaded_chapter_t *b,const char *text,size_t len,const char *css,size_t css_len,const char *anchor,size_t *offset,html_text_t *out){
     if(anchor&&!s_txt)return html_to_blocks_with_css_anchor(text,len,css,css_len,anchor,offset,out);
-    b->map=wr_alloc(8192u*sizeof(*b->map));
-    if(!b->map){if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);}
-    b->map_capacity=8192;
-    char *path=wr_alloc(600);
-    if(!path){free(b->map);b->map=NULL;b->map_capacity=0;if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);}
+    const size_t init_runs = 256u;
+    b->map=wr_alloc(init_runs*sizeof(*b->map));
+    if(!b->map)goto fallback;
+    b->map_capacity=init_runs;
+    char *path=wr_alloc_raw(600);
+    if(!path)goto fallback;
     snprintf(path,600,"%s/position.map",b->root);FILE *f=fopen(path,"rb");free(path);
     weread_position_header_t h={0};
     bool valid=f&&fread(&h,sizeof(h),1,f)==1&&h.magic==WEREAD_POSITION_MAGIC&&h.count&&h.count<=16384&&h.bytes==len;
-    weread_position_point_t *points=valid?wr_alloc((size_t)h.count*sizeof(*points)):NULL;
-    if(valid&&!points){fclose(f);free(b->map);b->map=NULL;b->map_capacity=0;if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);}
+    weread_position_point_t *points=valid?wr_alloc_raw((size_t)h.count*sizeof(*points)):NULL;
+    if(valid&&!points){fclose(f);goto fallback;}
     valid=valid&&fread(points,sizeof(*points),h.count,f)==h.count&&fgetc(f)==EOF&&!ferror(f);
     if(f&&fclose(f))valid=false;
     for(uint32_t i=0;valid&&i<h.count;++i)valid=points[i].byte<=h.bytes&&points[i].unit<=h.units&&
@@ -340,12 +443,17 @@ static esp_err_t parse_loaded(loaded_chapter_t *b,const char *text,size_t len,co
         for(size_t at=0;at<len&&writer.complete;++at)if(((unsigned char)text[at]&0xc0)!=0x80)cache_character(&writer,at,at);
     }else err=html_to_blocks_mapped(text,len,css,css_len,cache_character,&writer,out);
     free(points);
-    if(err==ESP_OK&&writer.complete&&(!b->map_count||b->map[b->map_count-1].byte<=out->len)){
+    uint32_t last_byte = b->map_count ? (b->map[b->map_count-1].byte + (uint32_t)(b->map[b->map_count-1].count-1u)*b->map[b->map_count-1].byte_step) : 0;
+    if(err==ESP_OK&&writer.complete&&(!b->map_count||last_byte<=out->len)){
         b->map_ready=true;b->source_units=h.units;b->text_bytes=(uint32_t)out->len;
         if(b->map_count){void *small=wr_realloc(b->map,b->map_count*sizeof(*b->map));if(small){b->map=small;b->map_capacity=b->map_count;}}
         else{free(b->map);b->map=NULL;b->map_capacity=0;}
     }else{free(b->map);b->map=NULL;b->map_count=b->map_capacity=0;}
     return err;
+fallback:
+    free(b->map);b->map=NULL;b->map_capacity=0;
+    if(s_txt){out->utf8=(char*)text;out->len=len;return ESP_OK;}
+    return html_to_blocks_with_css_anchor(text,len,css,css_len,NULL,offset,out);
 }
 esp_err_t book_weread_load(size_t i, const char *anchor, size_t *offset, html_text_t *out) { WR_GUARD;
     if (!out || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
@@ -385,7 +493,7 @@ esp_err_t book_weread_load(size_t i, const char *anchor, size_t *offset, html_te
 }
 esp_err_t book_weread_commit_loaded(size_t *chapter,uint32_t *v){WR_GUARD;
     if(!chapter||!v||!binding_owned(s_candidate)||*chapter!=s_candidate->index)return ESP_ERR_INVALID_STATE;
-    if(s_candidate->toc.count){weread_toc_free(&s_toc);s_toc=s_candidate->toc;memset(&s_candidate->toc,0,sizeof(s_candidate->toc));}
+    if(s_candidate->toc.count){weread_toc_free(&s_toc);s_toc=s_candidate->toc;memset(&s_candidate->toc,0,sizeof(s_candidate->toc));rebuild_toc_indices();}
     *chapter=s_candidate->new_index;*v=s_candidate->version;s_candidate->index=*chapter;
     binding_free(&s_loaded);s_loaded=s_candidate;s_candidate=NULL;
     if(!strcmp(s_prepared_id,s_id))book_weread_clear_prepared();
@@ -412,15 +520,28 @@ static void mapped_character(void *ctx, size_t text_offset, size_t html_offset) 
 static esp_err_t map_dense(const loaded_chapter_t *bound,bool to_cloud,uint32_t input,uint32_t *output) {
     if (!bound || !bound->map_ready || !bound->map_count) return ESP_ERR_NOT_FOUND;
     if (!to_cloud && input > bound->source_units) return WEREAD_ERR_POSITION;
-    size_t lo = 0,hi = bound->map_count;
+    size_t lo = 0, hi = bound->map_count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        uint32_t key = to_cloud ? bound->map[mid].byte : bound->map[mid].unit;
-        if (key < input) lo = mid + 1;
+        const weread_map_run_t *r = &bound->map[mid];
+        uint32_t last_key = to_cloud
+            ? r->byte + (uint32_t)(r->count - 1u) * r->byte_step
+            : r->unit + (uint32_t)(r->count - 1u) * r->unit_step;
+        if (last_key < input) lo = mid + 1;
         else hi = mid;
     }
-    *output = lo < bound->map_count ? (to_cloud ? bound->map[lo].unit : bound->map[lo].byte) :
-        to_cloud ? bound->source_units : bound->text_bytes;
+    if (lo >= bound->map_count) {
+        *output = to_cloud ? bound->source_units : bound->text_bytes;
+        return ESP_OK;
+    }
+    const weread_map_run_t *r = &bound->map[lo];
+    uint32_t first_key = to_cloud ? r->byte : r->unit;
+    uint32_t k = 0;
+    if (input > first_key) {
+        uint8_t step = to_cloud ? r->byte_step : r->unit_step;
+        k = (input - first_key + step - 1u) / step;
+    }
+    *output = (to_cloud ? r->unit : r->byte) + k * (to_cloud ? r->unit_step : r->byte_step);
     return ESP_OK;
 }
 esp_err_t book_weread_map_cached(size_t i,uint32_t version,bool to_cloud,uint32_t input,uint32_t *output) { WR_GUARD;
@@ -557,9 +678,10 @@ esp_err_t book_weread_map_candidate(size_t i,bool to_cloud,uint32_t input,uint32
     if (!bound) return ESP_ERR_NOT_FOUND;
     return map_dense(bound,to_cloud,input,output);
 }
-esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *len, bool *png) { WR_GUARD;
+esp_err_t book_weread_image_prefix(size_t i, const char *src, size_t max_bytes, uint8_t **data, size_t *len, bool *png, size_t *total_size) { WR_GUARD;
     if (!data || !len || !png || i >= s_toc.count) return ESP_ERR_INVALID_ARG;
     *data = NULL; *len = 0;
+    if (total_size) *total_size = 0;
     struct { char name[512], decoded[512], root[512], path[1024]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
     if (!paths) return ESP_ERR_NO_MEM;
     if (!weread_resource_path(NULL, src, paths->name, sizeof(paths->name))) return ESP_ERR_INVALID_ARG;
@@ -585,13 +707,20 @@ esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *l
         if (!f) continue;
         struct stat st;
         if (fstat(fileno(f), &st) || st.st_size <= 0 || st.st_size > 8 * 1024 * 1024) { fclose(f); return ESP_ERR_INVALID_SIZE; }
-        size_t size = (size_t)st.st_size; uint8_t *buf = wr_alloc(size);
+        size_t full = (size_t)st.st_size;
+        size_t size = (max_bytes && max_bytes < full) ? max_bytes : full;
+        uint8_t *buf = wr_alloc_raw(size);
         if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
         bool ok = fread(buf, 1, size, f) == size; fclose(f);
         if (!ok) { free(buf); return ESP_FAIL; }
-        *data = buf; *len = size; *png = size >= 8 && !memcmp(buf, "\x89PNG\r\n\x1a\n", 8); return ESP_OK;
+        *data = buf; *len = size; *png = size >= 8 && !memcmp(buf, "\x89PNG\r\n\x1a\n", 8);
+        if (total_size) *total_size = full;
+        return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
+}
+esp_err_t book_weread_image(size_t i, const char *src, uint8_t **data, size_t *len, bool *png) {
+    return book_weread_image_prefix(i, src, 0, data, len, png, NULL);
 }
 
 bool book_weread_metadata(const char *uri, char *title, size_t tc, char *author, size_t ac) { WR_GUARD;

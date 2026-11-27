@@ -73,9 +73,14 @@ typedef struct {
 } rescue_record_t;
 _Static_assert(sizeof(rescue_record_t)<=1280,"bounded rescue record");
 static bool s_rescue_choice;
+static bool s_rescue_empty_known;
+static uint8_t s_rescue_empty_card[WEREAD_MEDIA_ID_BYTES];
+static char s_rescue_empty_key[360];
+static inline void rescue_cache_invalidate(void) { s_rescue_empty_known = false; }
 #if !defined(ESP_PLATFORM)
 static weread_progress_rescue_backend_t s_rescue_backend;
 void weread_progress_rescue_backend(const weread_progress_rescue_backend_t *backend){WR_GUARD;
+    rescue_cache_invalidate();
     if(backend)s_rescue_backend=*backend;else memset(&s_rescue_backend,0,sizeof(s_rescue_backend));
 }
 #endif
@@ -127,11 +132,29 @@ static bool rescue_owner(const rescue_record_t *record,const uint8_t *card){
         !strcmp(record->root,weread_auth_get_storage_root())&&!strcmp(record->vid,session->vid)&&!strcmp(record->device,session->device_id);
 }
 static esp_err_t rescue_find(const char *id,const uint8_t *card,rescue_record_t *record,unsigned *slot){
+    const weread_auth_session_t *session=weread_auth_get_current_session();
+    const char *root=weread_auth_get_storage_root();
+    char key[sizeof(s_rescue_empty_key)];
+    int klen = (session && root && card)
+        ? snprintf(key, sizeof(key), "%s\n%s\n%s", root, session->vid, session->device_id) : -1;
+    bool have_key = klen > 0 && (size_t)klen < sizeof(key);
+    if (s_rescue_empty_known && have_key &&
+        !memcmp(s_rescue_empty_card, card, sizeof(s_rescue_empty_card)) &&
+        !strcmp(s_rescue_empty_key, key)) {
+        return ESP_ERR_NOT_FOUND;
+    }
     esp_err_t failure=ESP_ERR_NOT_FOUND;
+    bool all_empty=true;
     for(unsigned i=0;i<2;++i){
         esp_err_t err=rescue_read(i,record);
+        if(err!=ESP_ERR_NOT_FOUND){all_empty=false;rescue_cache_invalidate();}
         if(err==ESP_OK&&rescue_owner(record,card)&&(!id||!strcmp(record->id,id))){*slot=i;return ESP_OK;}
         if(err!=ESP_OK&&err!=ESP_ERR_NOT_FOUND)failure=err;
+    }
+    if (all_empty && have_key) {
+        memcpy(s_rescue_empty_key, key, (size_t)klen + 1u);
+        memcpy(s_rescue_empty_card, card, sizeof(s_rescue_empty_card));
+        s_rescue_empty_known = true;
     }
     return failure;
 }
@@ -143,6 +166,7 @@ static bool rescue_enabled(void){
 #endif
 }
 static esp_err_t rescue_write(unsigned slot,rescue_record_t *record){
+    rescue_cache_invalidate();
     record->magic=0x57525231u;record->size=sizeof(*record);record->crc=rescue_crc(record);
     return rescue_io(slot,record,1);
 }
@@ -155,8 +179,10 @@ static bool progress_equal(const weread_progress_t *a,const weread_progress_t *b
         a->base_known==b->base_known&&a->sync_conflict==b->sync_conflict&&a->retry_after==b->retry_after&&
         a->retry_count==b->retry_count&&!strcmp(a->summary,b->summary);
 }
-static esp_err_t load_tf(const char *id,weread_progress_t *out);
-static esp_err_t save_tf(const char *id,const weread_progress_t *p);
+static esp_err_t load_tf_ex(const char *id,weread_progress_t *out,bool *primary_owned);
+static esp_err_t save_tf_ex(const char *id,const weread_progress_t *p,bool owner_verified);
+static inline esp_err_t load_tf(const char *id,weread_progress_t *out){return load_tf_ex(id,out,NULL);}
+static inline esp_err_t save_tf(const char *id,const weread_progress_t *p){return save_tf_ex(id,p,false);}
 
 
 static uint64_t number(const cJSON *o, const char *key) { uint64_t n = 0; wr_uint(o, key, &n); return n; }
@@ -263,12 +289,12 @@ static esp_err_t retain_foreign_owner(const char *id,const char *path){
     }
     cJSON_Delete(old);return err;
 }
-static esp_err_t save_tf(const char *id, const weread_progress_t *p) {
+static esp_err_t save_tf_ex(const char *id, const weread_progress_t *p, bool owner_verified) {
     char *path __attribute__((cleanup(wr_release))) = wr_alloc(512);
     if (!path) return ESP_ERR_NO_MEM;
     esp_err_t err = wr_cache_path(id, "progress.json", path, 512);
     if (err != ESP_OK) return err;
-    err=retain_foreign_owner(id,path);if(err!=ESP_OK)return err;
+    if(!owner_verified){err=retain_foreign_owner(id,path);if(err!=ESP_OK)return err;}
     cJSON *o = encode(p);
     cJSON *sync=o?cJSON_AddObjectToObject(o,"sync"):NULL;
     if (!sync || !cJSON_AddNumberToObject(sync,"revision",p->revision)||
@@ -309,7 +335,8 @@ static esp_err_t recover_owned(const char *path,const char *id,weread_progress_t
     if(err==ESP_OK&&(!wr_owner_matches(o)||!saved_id||strcmp(saved_id,id)||!decode(o,out,false)))err=ESP_ERR_INVALID_RESPONSE;
     cJSON_Delete(o);return err;
 }
-static esp_err_t load_tf(const char *id, weread_progress_t *out) { WR_GUARD;
+static esp_err_t load_tf_ex(const char *id, weread_progress_t *out, bool *primary_owned) { WR_GUARD;
+    if (primary_owned) *primary_owned = false;
     if (!out) return ESP_ERR_INVALID_ARG;
     memset(out, 0, sizeof(*out));
     load_tf_work_t *w __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*w));
@@ -327,7 +354,8 @@ static esp_err_t load_tf(const char *id, weread_progress_t *out) { WR_GUARD;
     cJSON_Delete(o);
     // 临时IO或OOM不能用旧副本冒充当前事务。/ Transient I/O and OOM must not turn a stale backup into the current transaction.
     if(err!=ESP_OK&&err!=ESP_ERR_NOT_FOUND&&err!=ESP_ERR_INVALID_RESPONSE&&err!=ESP_ERR_INVALID_SIZE){memset(out,0,sizeof(*out));return err;}
-    if(err==ESP_OK||err==ESP_ERR_NO_MEM){if(err!=ESP_OK)memset(out,0,sizeof(*out));return err;}
+    if(err==ESP_OK){if(primary_owned)*primary_owned=true;return ESP_OK;}
+    if(err==ESP_ERR_NO_MEM){memset(out,0,sizeof(*out));return err;}
     // 主文件缺失/损坏时优先本账号事务副本；明确切换账号时优先该账号归档。/ Prefer the same-owner transaction backup after interrupted commits, and owner archives after an explicit account switch.
     for(unsigned pass=0;pass<2;++pass){
         bool archive=pass? !foreign_valid:foreign_valid;
@@ -632,9 +660,45 @@ esp_err_t weread_progress_note(const char *id, uint32_t uid, uint32_t index, uin
     weread_book_t book; if (weread_shelf_find(id, &book)) p.book_version = book.book_version;
     return save(id, &p);
 }
+static uint32_t s_prefer_web_read_session;
+static inline bool resp_succ(const cJSON *r) {
+    return number(r, "succ") == 1 || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "succ"));
+}
+static esp_err_t try_web_read(const char *id, const weread_progress_t *p, progress_identity_t *identity,
+    char *url, size_t url_cap, cJSON **r, int *status) {
+    char *signed_body __attribute__((cleanup(wr_release))) = wr_alloc(4096);
+    if (!signed_body) return ESP_ERR_NO_MEM;
+    if (!book_weread_build_web_read_body(id, p->chapter_uid, p->chapter_index, p->chapter_offset,
+        p->progress, p->summary, (int64_t)time(NULL), WEREAD_DEFAULT_USER_AGENT, signed_body, 4096)) return ESP_ERR_INVALID_SIZE;
+    int n = snprintf(url, url_cap, "%s/web/book/read", web_base());
+    if (n < 0 || (size_t)n >= url_cap) return ESP_ERR_INVALID_SIZE;
+    esp_err_t err = request_mode(url, signed_body, r, status, identity);
+    if (err == ESP_OK && !resp_succ(*r)) err = ESP_ERR_INVALID_RESPONSE;
+    return err;
+}
 static esp_err_t send_progress(const char *id,const weread_progress_t *p, progress_identity_t *identity){
     esp_err_t err=ESP_OK;
     cJSON *body=NULL,*r=NULL;char *text=NULL;
+    char url[768];
+    uint32_t sess = 0;
+    bool prefer_web = false;
+    { WR_GUARD;
+        sess = session_stamp();
+        prefer_web = sess != 0 && s_prefer_web_read_session == sess;
+    }
+    int status = 0;
+    if (prefer_web) {
+        err = try_web_read(id, p, identity, url, sizeof(url), &r, &status);
+        if (err == ESP_OK) { cJSON_Delete(r); return ESP_OK; }
+        bool authed = false;
+        { WR_GUARD;
+            s_prefer_web_read_session = 0;
+            authed = weread_auth_is_authenticated();
+        }
+        cJSON_Delete(r); r = NULL;
+        if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_TIMEOUT || err == ESP_ERR_NO_MEM || err == ESP_ERR_INVALID_SIZE) return err;
+        if (!authed) return ESP_ERR_INVALID_STATE;
+    }
     { WR_GUARD; body=encode(p);
     if (!body || !cJSON_AddStringToObject(body, "bookId", id)) { cJSON_Delete(body); return ESP_ERR_NO_MEM; }
     // 只发送协议字段，不把本地状态混入 API。/ Send protocol fields without local bookkeeping.
@@ -642,18 +706,17 @@ static esp_err_t send_progress(const char *id,const weread_progress_t *p, progre
     for (size_t i = 0; i < 5; ++i) cJSON_DeleteItemFromObject(body, keys[i]);
     text = cJSON_PrintUnformatted(body); cJSON_Delete(body); }
     if (!text) return ESP_ERR_NO_MEM;
-    char url[768]; snprintf(url, sizeof(url), "%s/book/read", weread_client_get_base_url());
-    int status = 0; err = request_mode(url,text,&r,&status,identity); cJSON_free(text);
+    snprintf(url, sizeof(url), "%s/book/read", weread_client_get_base_url());
+    status = 0; err = request_mode(url,text,&r,&status,identity); cJSON_free(text);
+    bool learned_web = false;
     if (fallback(r, status)) {
         cJSON_Delete(r); r = NULL;
-        char *signed_body __attribute__((cleanup(wr_release)))=wr_alloc(4096);
-        if(!signed_body)return ESP_ERR_NO_MEM;
-        if (!book_weread_build_web_read_body(id, p->chapter_uid, p->chapter_index, p->chapter_offset,
-            p->progress, p->summary, (int64_t)time(NULL), WEREAD_DEFAULT_USER_AGENT, signed_body, 4096)) return ESP_ERR_INVALID_SIZE;
-        snprintf(url, sizeof(url), "%s/web/book/read", web_base());
-        err = request_mode(url,signed_body,&r,&status,identity);
+        err = try_web_read(id, p, identity, url, sizeof(url), &r, &status);
+        learned_web = (err == ESP_OK);
+    } else if (err == ESP_OK && !resp_succ(r)) {
+        err = ESP_ERR_INVALID_RESPONSE;
     }
-    if (err == ESP_OK && number(r, "succ") != 1 && !cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(r, "succ"))) err = ESP_ERR_INVALID_RESPONSE;
+    if (learned_web && sess) { WR_GUARD; s_prefer_web_read_session = sess; }
 #if defined(ESP_PLATFORM)
     if (err != ESP_OK) ESP_LOGW("weread", "report fail id=%s uid=%u idx=%u off=%u p=%u st=%d err=%d",
         id, (unsigned)p->chapter_uid, (unsigned)p->chapter_index,
@@ -691,21 +754,39 @@ esp_err_t weread_progress_report(const char *id,bool force,uint64_t now){WR_GUAR
     weread_progress_t p;esp_err_t err=weread_progress_load(id,&p);
     return err==ESP_OK?report_saved(id,&p,force,now):err;
 }
+static esp_err_t apply_progress_delta(weread_progress_t *dst, const weread_progress_t *delta, bool moved,
+    bool bound, uint32_t version, const char *id, uint64_t timestamp) {
+    if (moved) {
+        if (!delta->chapter_uid || delta->progress > 100 || !memchr(delta->summary, 0, sizeof(delta->summary))) return ESP_ERR_INVALID_ARG;
+        dst->chapter_uid = delta->chapter_uid;
+        dst->chapter_index = delta->chapter_index;
+        dst->chapter_offset = delta->chapter_offset;
+        dst->progress = delta->progress;
+        wr_display_copy(dst->summary, sizeof(dst->summary), delta->summary);
+        dst->position_pending = true;
+        uint32_t v = bound ? version : weread_shelf_book_version(id);
+        if (bound || v) dst->book_version = v;
+        dst->pending_pages = delta->pending_pages > UINT32_MAX - dst->pending_pages
+            ? UINT32_MAX : dst->pending_pages + delta->pending_pages;
+    }
+    dst->reading_time = delta->reading_time > UINT32_MAX - dst->reading_time
+        ? UINT32_MAX : dst->reading_time + delta->reading_time;
+    if (moved || delta->reading_time) {
+        dst->updated_at = timestamp;
+        dst->dirty = true;
+        dst->revision = next_revision(dst->revision);
+    }
+    return ESP_OK;
+}
 static esp_err_t store_sample(const char *id,weread_progress_t *sample,bool moved,bool bound,uint32_t content_version,uint64_t timestamp,bool *noted){WR_GUARD;
     if(!sample||!noted||timestamp>9007199254740991ULL)return ESP_ERR_INVALID_ARG;
     *noted=false;
     weread_progress_t *p __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*p));
     if(!p)return ESP_ERR_NO_MEM;
     esp_err_t err=weread_progress_load(id,p);if(err!=ESP_OK&&(!moved||err!=ESP_ERR_NOT_FOUND))return err;
-    if(moved){
-        if(!sample->chapter_uid||sample->progress>100||!memchr(sample->summary,0,sizeof(sample->summary)))return ESP_ERR_INVALID_ARG;
-        p->chapter_uid=sample->chapter_uid;p->chapter_index=sample->chapter_index;p->chapter_offset=sample->chapter_offset;p->progress=sample->progress;
-        wr_display_copy(p->summary,sizeof(p->summary),sample->summary);p->position_pending=true;
-        uint32_t version=bound?content_version:weread_shelf_book_version(id);if(bound||version)p->book_version=version;
-        p->pending_pages=sample->pending_pages>UINT32_MAX-p->pending_pages?UINT32_MAX:p->pending_pages+sample->pending_pages;
-    }
-    p->reading_time=sample->reading_time>UINT32_MAX-p->reading_time?UINT32_MAX:p->reading_time+sample->reading_time;
-    if(moved||sample->reading_time){p->updated_at=timestamp;p->dirty=true;p->revision=next_revision(p->revision);err=save(id,p);if(err!=ESP_OK)return err;}
+    err=apply_progress_delta(p,sample,moved,bound,content_version,id,timestamp);
+    if(err!=ESP_OK)return err;
+    if(moved||sample->reading_time){err=save(id,p);if(err!=ESP_OK)return err;}
     *noted=true;*sample=*p;
     return ESP_OK;
 }
@@ -725,17 +806,32 @@ esp_err_t weread_progress_store_version_resilient(const char *id,weread_progress
     if(!nonzero||(present&&memcmp(card,captured,sizeof(card))))return ESP_ERR_INVALID_STATE;
     rescue_store_work_t *w __attribute__((cleanup(wr_release)))=wr_alloc(sizeof(*w));
     if(!w)return ESP_ERR_NO_MEM;
-    w->delta=*sample;esp_err_t loaded=weread_progress_load(id,&w->old);
-    esp_err_t err=present?store_sample(id,sample,moved,true,version,timestamp,noted):ESP_ERR_INVALID_STATE;
-    if(err==ESP_OK){
-        unsigned slot;if(rescue_find(id,captured,&w->record,&slot)==ESP_OK)*rescued=true;
-        return ESP_OK;
-    }
-    if(!rescue_enabled()||(!moved&&!w->delta.reading_time))return err;
-    unsigned slot;esp_err_t found=rescue_find(id,captured,&w->record,&slot);
-    if(found==ESP_OK)w->old=w->record.desired;
-    else{
-        if(found!=ESP_ERR_NOT_FOUND)return found;
+    w->delta=*sample;
+    unsigned slot=0;esp_err_t found=rescue_find(id,captured,&w->record,&slot);
+    if(found==ESP_OK){
+        esp_err_t err=present?store_sample(id,sample,moved,true,version,timestamp,noted):ESP_ERR_INVALID_STATE;
+        if(err==ESP_OK){
+            if(rescue_find(id,captured,&w->record,&slot)==ESP_OK)*rescued=true;
+            return ESP_OK;
+        }
+        if(!moved&&!w->delta.reading_time)return err;
+        w->old=w->record.desired;
+    }else if(found!=ESP_ERR_NOT_FOUND){
+        return (!present&&!moved&&!w->delta.reading_time)?ESP_ERR_INVALID_STATE:found;
+    }else{
+        esp_err_t loaded=ESP_ERR_INVALID_STATE,err=ESP_ERR_INVALID_STATE;
+        if(present){
+            bool primary_owned=false;
+            loaded=load_tf_ex(id,&w->old,&primary_owned);
+            if(loaded==ESP_OK||(moved&&loaded==ESP_ERR_NOT_FOUND)){
+                w->next=w->old;
+                err=apply_progress_delta(&w->next,&w->delta,moved,true,version,id,timestamp);
+                if(err!=ESP_OK)return err;
+                if(moved||w->delta.reading_time)err=save_tf_ex(id,&w->next,primary_owned);
+                if(err==ESP_OK){*noted=true;*sample=w->next;return ESP_OK;}
+            }else err=loaded;
+        }
+        if(!moved&&!w->delta.reading_time)return err;
         if(loaded!=ESP_OK){if(!before||!before->chapter_uid)return err;w->old=*before;}
         bool empty=false;
         for(slot=0;slot<2;++slot)if(rescue_read(slot,&w->record)==ESP_ERR_NOT_FOUND){empty=true;break;}
@@ -747,14 +843,9 @@ esp_err_t weread_progress_store_version_resilient(const char *id,weread_progress
         memcpy(w->record.media,captured,sizeof(w->record.media));w->record.expected=w->old;
     }
     w->next=w->old;
-    if(moved){
-        if(!w->delta.chapter_uid||w->delta.progress>100||!memchr(w->delta.summary,0,sizeof(w->delta.summary)))return ESP_ERR_INVALID_ARG;
-        w->next.chapter_uid=w->delta.chapter_uid;w->next.chapter_index=w->delta.chapter_index;w->next.chapter_offset=w->delta.chapter_offset;w->next.progress=w->delta.progress;
-        w->next.book_version=version;w->next.position_pending=true;wr_display_copy(w->next.summary,sizeof(w->next.summary),w->delta.summary);
-        w->next.pending_pages=w->delta.pending_pages>UINT32_MAX-w->next.pending_pages?UINT32_MAX:w->next.pending_pages+w->delta.pending_pages;
-    }
-    w->next.reading_time=w->delta.reading_time>UINT32_MAX-w->next.reading_time?UINT32_MAX:w->next.reading_time+w->delta.reading_time;
-    w->next.updated_at=timestamp;w->next.dirty=true;w->next.revision=next_revision(w->next.revision);w->record.desired=w->next;
+    esp_err_t err=apply_progress_delta(&w->next,&w->delta,moved,true,version,id,timestamp);
+    if(err!=ESP_OK)return err;
+    w->record.desired=w->next;
     err=rescue_write(slot,&w->record);if(err!=ESP_OK)return err;
     *sample=w->next;*noted=*rescued=true;s_outbox.next_scan=0;wr_copy(s_outbox.hint,sizeof(s_outbox.hint),id);return ESP_OK;
 }
@@ -771,6 +862,8 @@ weread_progress_state_t weread_progress_state(const weread_progress_t *p) {
     return p->last_report_ms?WR_PROGRESS_SYNCED:WR_PROGRESS_LOCAL;
 }
 void weread_progress_outbox_reset(void) { WR_GUARD;
+    rescue_cache_invalidate();
+    s_prefer_web_read_session = 0;
     if(s_outbox.dir)closedir(s_outbox.dir);
     memset(&s_outbox,0,sizeof(s_outbox));
     memset(&s_observed,0,sizeof(s_observed));

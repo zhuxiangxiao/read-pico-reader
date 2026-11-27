@@ -16,6 +16,9 @@ void weread_chapter_set_cancel(weread_cancel_fn fn, void *ctx);
 esp_err_t weread_chapter_download(const char *book_id, uint32_t uid);
 /// 调度用的账号/版本/正文/映射头一致性检查；实际打开仍深校验映射。/ Scheduling check for owner/version/body/map-header consistency; opening still validates every map point.
 bool weread_chapter_cached(const char *book_id,uint32_t uid);
+/// 单遍扫描目录内已缓存章节，填充调用方 UID 位图并统计数量。/ Scan cached chapters in one directory pass and populate caller UID bitset.
+esp_err_t weread_chapter_scan_cached_uids(const char *book_id, const uint32_t *uids, size_t count,
+    uint8_t *bits, uint32_t *cached_count, weread_cancel_fn cancel, void *cancel_ctx);
 /// 自动补章预留最坏归档/展开/成品空间；已缓存章不受此门限影响。/ Reserve worst-case archive/extraction/body space for automatic prefetch; cached chapters remain readable.
 esp_err_t weread_chapter_prefetch_space(uint64_t *available);
 

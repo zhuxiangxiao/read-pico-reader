@@ -583,7 +583,7 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
                     }
                     bool version_ok = !toc.book_version || !local.book_version || toc.book_version == local.book_version;
                     bool index_ok = idx != SIZE_MAX && (!local.chapter_index || local.chapter_index == toc.chapters[idx].index);
-                    if (version_ok && index_ok && weread_chapter_cached(s_work.id, local.chapter_uid)) {
+                    if (version_ok && index_ok) {
                         if (!local.chapter_index) local.chapter_index = toc.chapters[idx].index;
                         if (!local.book_version) local.book_version = toc.book_version;
                         book_weread_adopt_prepared_local(s_work.id, &toc);
@@ -765,25 +765,26 @@ static esp_err_t prepare_open(bool choose, bool cloud) { WR_MEMORY_SCOPE;
     if(err!=ESP_OK)book_weread_clear_prepared();
     weread_toc_free(&toc); return err;
 }
+static uint16_t s_prefetch_dirty_count;
 static void update_shelf_counts_best_effort(const char *id, uint16_t cached, uint16_t total) {
     if (!wr_valid_id(id)) return;
     (void)weread_shelf_set_chapter_counts(id, cached, total);
 }
+static void update_shelf_counts_mem_best_effort(const char *id, uint16_t cached, uint16_t total, bool flush) {
+    if (!wr_valid_id(id)) return;
+    bool changed = false;
+    (void)weread_shelf_set_chapter_counts_mem(id, cached, total, &changed);
+    if (changed) {
+        if (s_prefetch_dirty_count < UINT16_MAX) ++s_prefetch_dirty_count;
+    }
+    if (flush || s_prefetch_dirty_count >= 10u) {
+        if (weread_shelf_flush_counts() == ESP_OK) s_prefetch_dirty_count = 0;
+    }
+}
 static uint16_t lookup_shelf_total_chapters(const char *id) {
     if (!wr_valid_id(id)) return 0;
-    weread_shelf_item_t *items = NULL;
-    size_t count = 0;
     uint16_t total = 0;
-    if (weread_shelf_snapshot(&items, &count) == ESP_OK) {
-        for (size_t i = 0; i < count; ++i) {
-            if (!strcmp(items[i].book_id, id)) {
-                total = items[i].total_chapters;
-                break;
-            }
-        }
-        free(items);
-    }
-    if (!total) {
+    if (!weread_shelf_get_chapter_counts(id, NULL, &total) || !total) {
         weread_toc_t toc = {0};
         if (weread_toc_load(id, &toc) == ESP_OK && toc.count) {
             total = toc.count > UINT16_MAX ? UINT16_MAX : (uint16_t)toc.count;
@@ -948,7 +949,7 @@ static esp_err_t scan_book_cache(const char *id) {
         (unsigned)atomic_load(&s_cached_count), (unsigned)atomic_load(&s_total_count));
     return ESP_OK;
 }
-static void sync_open_book_shelf_counts(const char *id) {
+static void sync_open_book_shelf_counts(const char *id, bool flush) {
     uint16_t c16 = 0, t16 = 0;
     bool ready = false;
     {
@@ -959,7 +960,8 @@ static void sync_open_book_shelf_counts(const char *id) {
             ready = true;
         }
     }
-    if (ready) update_shelf_counts_best_effort(id, c16, t16);
+    if (ready) update_shelf_counts_mem_best_effort(id, c16, t16, flush);
+    else if (flush && weread_shelf_flush_counts() == ESP_OK) s_prefetch_dirty_count = 0;
 }
 static esp_err_t prefetch_job(void) {
     if (s_work.prefetch_forward && !strcmp(s_work.value, "scan")) {
@@ -983,14 +985,14 @@ static esp_err_t prefetch_job(void) {
             if (t && i >= t) {
                 s_result.prefetch_done = true;
                 s_result.chapter_idx = i;
-                sync_open_book_shelf_counts(s_work.id);
+                sync_open_book_shelf_counts(s_work.id, true);
                 return ESP_OK;
             }
             if (!uid) {
                 if (t) return ESP_ERR_INVALID_STATE;
                 s_result.prefetch_done = true;
                 s_result.chapter_idx = i;
-                sync_open_book_shelf_counts(s_work.id);
+                sync_open_book_shelf_counts(s_work.id, true);
                 return ESP_OK;
             }
             if (scanned && book_cache_bit(s_work.id, i)) continue;
@@ -1007,7 +1009,7 @@ static esp_err_t prefetch_job(void) {
         book_cache_mark(s_work.id, target_idx, true);
         s_result.chapter_uid = target_uid;
         s_result.chapter_idx = target_idx;
-        sync_open_book_shelf_counts(s_work.id);
+        sync_open_book_shelf_counts(s_work.id, false);
         return ESP_OK;
     }
     if (!weread_auth_is_authenticated()) return ESP_ERR_INVALID_STATE;
@@ -1018,7 +1020,7 @@ static esp_err_t prefetch_job(void) {
     s_result.chapter_idx = target_idx;
     if (err == ESP_OK && !cancelled(NULL)) {
         book_cache_mark(s_work.id, target_idx, true);
-        sync_open_book_shelf_counts(s_work.id);
+        sync_open_book_shelf_counts(s_work.id, false);
     }
     return err;
 }
@@ -1044,6 +1046,8 @@ static esp_err_t cover_job_impl(const char *url,bool retry) {
         }
     }
     if (weread_cover_cache_path(s_work.id,"img",io->path,sizeof(io->path)) != ESP_OK) return ESP_ERR_INVALID_ARG;
+    bool have_magic = false;
+    unsigned char magic[12] = {0};
     if (url && *url) {
         snprintf(io->temporary, sizeof(io->temporary), "%s.part", io->path);
         strcpy(io->parent, io->path); *strrchr(io->parent, '/') = 0;
@@ -1053,16 +1057,22 @@ static esp_err_t cover_job_impl(const char *url,bool retry) {
         esp_err_t err = weread_client_download(url, out, 1024u * 1024u, cancelled, NULL, &info);
         s_result.http_status = info.status;
         bool ok = err == ESP_OK && info.status == 200 && !fflush(out);
-        unsigned char magic[12] = {0}; rewind(out); size_t n = fread(magic, 1, sizeof(magic), out);
+        rewind(out); size_t n = fread(magic, 1, sizeof(magic), out);
+        have_magic = n >= 4;
         ok = ok && n >= 3 && (!memcmp(magic, "\x89PNG", 4) || (magic[0] == 255 && magic[1] == 216 && magic[2] == 255) ||
             (n==12&&!memcmp(magic,"RIFF",4)&&!memcmp(magic+8,"WEBP",4)));
         if (fclose(out)) ok = false;
         if (!ok || cancelled(NULL)) { unlink(io->temporary); return err != ESP_OK ? err : ESP_ERR_INVALID_RESPONSE; }
         unlink(io->path); if (rename(io->temporary, io->path)) { unlink(io->temporary); return ESP_FAIL; }
     }
-    FILE *file = fopen(io->path, "rb"); if (!file) return ESP_ERR_NOT_FOUND;
-    unsigned char first[8]; size_t n = fread(first, 1, 8, file); fclose(file);
-    bool png = n == 8 && !memcmp(first, "\x89PNG", 4);
+    bool png = false;
+    if (have_magic) {
+        png = !memcmp(magic, "\x89PNG", 4);
+    } else {
+        FILE *file = fopen(io->path, "rb"); if (!file) return ESP_ERR_NOT_FOUND;
+        unsigned char first[8]; size_t n = fread(first, 1, 8, file); fclose(file);
+        png = n == 8 && !memcmp(first, "\x89PNG", 4);
+    }
     s_result.cover = wr_alloc(WEREAD_COVER_WIDTH * WEREAD_COVER_HEIGHT);
     if (!s_result.cover) return ESP_ERR_NO_MEM;
     if (!book_image_file_grayscale(io->path, png, WEREAD_COVER_WIDTH, WEREAD_COVER_HEIGHT, s_result.cover)) {
@@ -1124,9 +1134,6 @@ static esp_err_t cover_dispatch(void) {
 }
 static esp_err_t probe_shelf_job(void) { WR_MEMORY_SCOPE;
     if (!s_work.probe_count) return ESP_ERR_INVALID_ARG;
-    weread_shelf_item_t *before = NULL;
-    size_t before_count = 0;
-    (void)weread_shelf_snapshot(&before, &before_count);
     bool updated = false;
     esp_err_t err = ESP_OK;
     for (size_t i = 0; i < s_work.probe_count; ++i) {
@@ -1139,24 +1146,20 @@ static esp_err_t probe_shelf_job(void) { WR_MEMORY_SCOPE;
         if (cerr != ESP_OK) continue;
         if (total > 0 || cached > 0) {
             uint16_t prev_c = 0, prev_t = 0;
-            bool had = false;
-            for (size_t j = 0; j < before_count; ++j) {
-                if (!strcmp(before[j].book_id, s_work.probe_ids[i])) {
-                    prev_c = before[j].cached_chapters;
-                    prev_t = before[j].total_chapters;
-                    had = true;
-                    break;
-                }
-            }
+            bool had = weread_shelf_get_chapter_counts(s_work.probe_ids[i], &prev_c, &prev_t);
             if (!had || prev_c != cached || prev_t != total) {
-                esp_err_t serr = weread_shelf_set_chapter_counts(s_work.probe_ids[i], cached, total);
-                if (serr == ESP_OK) updated = true;
+                bool chg = false;
+                esp_err_t serr = weread_shelf_set_chapter_counts_mem(s_work.probe_ids[i], cached, total, &chg);
+                if (serr == ESP_OK && chg) updated = true;
                 else if (serr == ESP_ERR_NO_MEM) { err = serr; break; }
             }
         }
     }
-    free(before);
-    if (updated) snapshot();
+    if (updated) {
+        (void)weread_shelf_flush_counts();
+        s_prefetch_dirty_count = 0;
+        snapshot();
+    }
     return err;
 }
 static esp_err_t cache_book_job(void) { WR_MEMORY_SCOPE;
@@ -1207,14 +1210,7 @@ static esp_err_t cache_book_job(void) { WR_MEMORY_SCOPE;
         for (size_t i = 0; i < total; ++i) uids[i] = toc.chapters[i].uid;
         weread_toc_free(&toc);
 
-        for (size_t i = 0; i < total; ++i) {
-            if (cancelled(NULL)) { err = ESP_ERR_INVALID_STATE; break; }
-            if (i && !(i & 31u)) pause_ms(1);
-            if (weread_chapter_cached(s_work.id, uids[i])) {
-                bits[i >> 3u] |= (uint8_t)(1u << (i & 7u));
-                ++cached_count;
-            }
-        }
+        err = weread_chapter_scan_cached_uids(s_work.id, uids, total, bits, &cached_count, cancelled, NULL);
         if (err != ESP_OK) break;
 
         total_u16 = total > UINT16_MAX ? UINT16_MAX : (uint16_t)total;
@@ -1420,7 +1416,7 @@ static esp_err_t job_run(void) {
             err = weread_chapter_download(s_work.id, (uint32_t)s_work.chapter);
             if (err == ESP_OK && !cancelled(NULL) && s_work.chapter_idx != SIZE_MAX) {
                 book_cache_mark(s_work.id, s_work.chapter_idx, true);
-                sync_open_book_shelf_counts(s_work.id);
+                sync_open_book_shelf_counts(s_work.id, false);
             }
             break;
         case WR_JOB_PREFETCH:
@@ -1787,6 +1783,8 @@ void weread_runtime_stop(void) {
 #if !defined(ESP_PLATFORM)
     if (s_joinable) { pthread_join(s_thread, NULL); s_joinable = false; }
 #endif
+    (void)weread_shelf_flush_counts();
+    s_prefetch_dirty_count = 0;
     book_cache_clear();
     atomic_store(&s_cloud_jump_ready, false); atomic_store(&s_live_valid, false);
     atomic_store(&s_sync_downloading_uid, 0); atomic_store(&s_prefetch_downloading_uid, 0);
@@ -1833,6 +1831,12 @@ bool weread_reader_cached(const char *uri,size_t chapter){
         if((s_work.job==WR_JOB_CHAPTER||s_work.job==WR_JOB_PREFETCH)&&!strcmp(s_work.id,uri+9)&&
            (s_work.chapter==uid||atomic_load(&s_prefetch_downloading_uid)==uid))return false;
         if(s_work.job==WR_JOB_CLOUD_SYNC&&!strcmp(s_work.id,uri+9)&&atomic_load(&s_sync_downloading_uid)==uid)return false;
+    }
+    {
+        WR_GUARD;
+        if (book_cache_scanned(uri + 9) && chapter < s_book_cache.total && !book_cache_bit(uri + 9, chapter)) {
+            return false;
+        }
     }
     return weread_chapter_cached(uri+9,uid);
 }
@@ -2332,6 +2336,7 @@ void weread_reader_end(uint64_t now) {
     atomic_store(&s_adopting_prefetch_uid,0);
     { WR_GUARD; s_cloud_jump.rebased = false; }
     if (s_reader.id[0]) weread_reader_flush(now, false);
+    if (weread_shelf_flush_counts() == ESP_OK) s_prefetch_dirty_count = 0;
     book_cache_clear();
     char exit_id[64] = {0};
     bool exit_note = s_reader.id[0] && !s_reader.save_failed && s_reader.retry &&

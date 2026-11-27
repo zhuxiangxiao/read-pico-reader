@@ -110,7 +110,8 @@ static void merged_notes(void) {
         }
         units+=weread_utf16_length(original,n);
     }
-    html_text_free(&parsed);book_weread_close();mode=0;
+    html_text_free(&parsed);
+    book_weread_close();mode=0;
 }
 static void scan_fat_tree(const char *dir, bool in_wr, size_t *wr_css_count) {
     DIR *d = opendir(dir);
@@ -346,6 +347,13 @@ int main(void) {
     html_text_free(&parsed);
     // 单独覆盖代理对、实体、标签和反向映射。/ Cover surrogate pairs, entities, markup and inverse mapping.
     assert(weread_utf16_length("甲😀乙",strlen("甲😀乙"))==4);
+    assert(weread_utf16_length("Hello, WeRead!", 14) == 14);
+    assert(weread_utf16_length("éüñ", strlen("éüñ")) == 3);
+    // Invalid UTF-8 (overlong E0 80 AF, surrogate ED A0 80, >U+10FFFF F4 90 80 80, lone cont 80, truncated E4 B8)
+    assert(weread_utf16_length("\xe0\x80\xaf", 3) == 3);
+    assert(weread_utf16_length("\xed\xa0\x80", 3) == 3);
+    assert(weread_utf16_length("\xf4\x90\x80\x80", 4) == 4);
+    assert(weread_utf16_length("a\x80\xe4\xb8z", 5) == 5);
     assert(weread_chapter_directory("test_book_101",1,dir,sizeof(dir))==ESP_OK);
     const char *html="<p>甲😀&amp;乙</p>";char map_path[600],body_path[600];
     snprintf(body_path,sizeof(body_path),"%s/body.html",dir);
@@ -360,7 +368,41 @@ int main(void) {
     assert(book_weread_map(0,false,co,&back)==ESP_OK && back==local);
     local=(uint32_t)(strstr(parsed.utf8,"&")-parsed.utf8);
     assert(book_weread_map(0,true,local,&co)==ESP_OK && co==6);
-    html_text_free(&parsed);book_weread_close();
+    html_text_free(&parsed);
+    // Exhaustive long-chapter run-length map vs file-map ground-truth comparison (30k+ chars, >8192 limit).
+    {
+        size_t pcount = 260;
+        size_t html_cap = pcount * 256u + 64u;
+        char *long_html = malloc(html_cap);
+        assert(long_html);
+        size_t pos = 0;
+        for (size_t k = 0; k < pcount; ++k) {
+            pos += (size_t)snprintf(long_html + pos, html_cap - pos,
+                "<p>第%04zu段正文MixedASCII😀&amp;实体。这是用来测试超过八千字符长章精确位置映射的连续文本内容。</p>", k);
+        }
+        assert(pos > 20000 && wr_write_bytes(body_path, long_html, pos) == ESP_OK);
+        uint32_t total_units = weread_utf16_length(long_html, pos);
+        struct { weread_position_header_t h; weread_position_point_t p[2]; } lmap = {
+            {WEREAD_POSITION_MAGIC, 2, (uint32_t)pos, total_units}, {{0, 0}, {(uint32_t)pos, total_units}}};
+        assert(wr_write_bytes(map_path, &lmap, sizeof(lmap)) == ESP_OK);
+        assert(book_weread_load(0, NULL, NULL, &parsed) == ESP_OK);
+        assert(book_weread_commit_loaded(&(size_t){0}, &(uint32_t){0}) == ESP_OK);
+        size_t cache_b = book_weread_map_cache_bytes();
+        assert(cache_b > 0 && cache_b <= 65536);
+        assert(parsed.len > 15000);
+        for (size_t off = 0; off <= parsed.len; off += 37) {
+            uint32_t rc = 0, fc = 0;
+            assert(book_weread_map_cached(0, 100, true, (uint32_t)off, &rc) == ESP_OK);
+            assert(book_weread_map_detached("test_book_101", 1, 100, false, (uint32_t)off, &fc) == ESP_OK);
+            assert(rc == fc);
+        }
+        uint32_t rb = 0;
+        assert(book_weread_map_cached(0, 100, false, 0, &rb) == ESP_OK && rb == 0);
+        assert(book_weread_map_cached(0, 100, false, total_units, &rb) == ESP_OK);
+        html_text_free(&parsed);
+        free(long_html);
+    }
+    book_weread_close();
     mode = 0; assert(weread_chapter_load("txt_book_202", 1, &text, &len) == ESP_OK);
     assert(len && strstr(text, "序章")); free(text);
     merged_notes();

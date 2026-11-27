@@ -437,7 +437,11 @@ int main(int argc,char **argv){
         assert(!weread_reader_chapter_cached(uri,2));
         // 离开阅读后位图释放；单章探测仍返回有界结果且不启动整书扫描。
         // Leaving the reader releases the bitmap; the probe stays bounded and never starts a full scan.
+        uint16_t mc = 0, mt = 0; bool chg = false;
+        assert(weread_shelf_set_chapter_counts_mem("window_book", 2, 8, &chg) == ESP_OK);
+        assert(weread_shelf_get_chapter_counts("window_book", &mc, &mt) && mc == 2 && mt == 8);
         weread_reader_end(now);
+        assert(weread_shelf_load() == ESP_OK && weread_shelf_get_chapter_counts("window_book", &mc, &mt) && mc == 2 && mt == 8);
         assert(weread_reader_chapter_cached(uri,0)&&!weread_reader_chapter_cached(uri,2));
         assert(!weread_reader_chapter_cached("weread://missing_book",0));
         puts("PASS: TOC chapter probe marks bitmap hits while ready and falls back to one bounded check outside the reader");

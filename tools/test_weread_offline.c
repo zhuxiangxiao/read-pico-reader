@@ -20,7 +20,7 @@ static uint64_t free_bytes=UINT64_C(512)*1024*1024;
 static unsigned calls,downloads,plain_parses,html_allocations,mapped_parses;
 static bool deny_map;
 void *actual_wr_alloc(size_t);
-void *wr_alloc(size_t bytes){return deny_map&&bytes==8192u*sizeof(weread_position_point_t)?NULL:actual_wr_alloc(bytes);}
+void *wr_alloc(size_t bytes){return deny_map&&bytes==256u*12u?NULL:actual_wr_alloc(bytes);}
 esp_err_t actual_html_to_blocks_mapped(const char *,size_t,const char *,size_t,html_source_observer_fn,void *,html_text_t *);
 esp_err_t html_to_blocks_mapped(const char *html,size_t len,const char *css,size_t css_len,html_source_observer_fn fn,void *ctx,html_text_t *out){++mapped_parses;return actual_html_to_blocks_mapped(html,len,css,css_len,fn,ctx,out);}
 void *offline_html_malloc(size_t bytes,unsigned caps){(void)caps;++html_allocations;return malloc(bytes);}
@@ -43,7 +43,7 @@ static esp_err_t request(const char *url,const char *method,const char *headers,
     char toc[4096]="";size_t used=0;
     if(strstr(url,"chapterInfos")){
         used=(size_t)snprintf(toc,sizeof(toc),"{\"data\":[{\"bookId\":\"offline_book\",\"bookVersion\":100,\"synckey\":1,\"clearAll\":1,\"updated\":[");
-        for(unsigned i=1;i<=16;++i)used+=(size_t)snprintf(toc+used,sizeof(toc)-used,"%s{\"chapterUid\":%u,\"chapterIdx\":%u,\"title\":\"测试%u\"}",i==1?"":",",i*10,i,i);
+        for(unsigned i=1;i<=17;++i)used+=(size_t)snprintf(toc+used,sizeof(toc)-used,"%s{\"chapterUid\":%u,\"chapterIdx\":%u,\"title\":\"测试%u\"}",i==1?"":",",i*10,i,i);
         snprintf(toc+used,sizeof(toc)-used,"]}]}");
     }
     const char *r=toc[0]?toc:"{\"synckey\":1,\"books\":[{\"bookId\":\"offline_book\",\"title\":\"离线测试\",\"format\":\"epub\",\"bookVersion\":100}]}";
@@ -77,12 +77,12 @@ int main(int argc,char **argv){
     assert(weread_chapter_download_ex("offline_book",10,true)==WEREAD_ERR_STORAGE&&!downloads);
     no_space_query=true;assert(weread_chapter_download_ex("offline_book",10,true)==ESP_FAIL&&!downloads);no_space_query=false;
     free_bytes=104u*1024*1024;assert(weread_chapter_prefetch_space(NULL)==ESP_OK);
-    for(uint32_t uid=10;uid<=160;uid+=10)assert(weread_chapter_download_ex("offline_book",uid,true)==ESP_OK&&weread_chapter_cached("offline_book",uid));
+    for(uint32_t uid=10;uid<=170;uid+=10)assert(weread_chapter_download_ex("offline_book",uid,true)==ESP_OK&&weread_chapter_cached("offline_book",uid));
     assert(!plain_parses&&!html_allocations);
-    puts("PASS: assembling16 chapters including1MiB decorative background invokes no HTML parser and allocates no parser text/workspace");
+    puts("PASS: assembling17 chapters including1MiB decorative background invokes no HTML parser and allocates no parser text/workspace");
     unsigned old_downloads=downloads,old_calls=calls;free_bytes=0;no_space_query=true;
     assert(weread_chapter_download_ex("offline_book",10,true)==ESP_OK&&downloads==old_downloads&&calls==old_calls);no_space_query=false;
-    assert(book_weread_open("weread://offline_book")==ESP_OK&&book_weread_count()==16);
+    assert(book_weread_open("weread://offline_book")==ESP_OK&&book_weread_count()==17);
     html_text_t text={0};assert(book_weread_load(0,NULL,NULL,&text)==ESP_OK&&text.utf8&&!text.len&&!text.image_count);html_text_free(&text);
     assert(book_weread_load(1,NULL,NULL,&text)==ESP_OK);
     printf("background-only images=%u bytes=%u\n",(unsigned)text.image_count,(unsigned)text.len);fflush(stdout);
@@ -121,17 +121,23 @@ int main(int argc,char **argv){
         else assert(!text.image_count&&!text.len);
         assert(book_weread_map_cache_bytes()<=128u*1024u);
         if(i==12){
-            current=i;assert(book_weread_commit_loaded(&current,&actual_version)==ESP_OK&&!book_weread_map_cache_bytes());
-            before_maps=mapped_parses;
-            assert(book_weread_map_cached(i,100,true,100,&absent)==ESP_ERR_NOT_FOUND&&mapped_parses==before_maps);
+            current=i;assert(book_weread_commit_loaded(&current,&actual_version)==ESP_OK&&book_weread_map_cache_bytes()>0&&book_weread_map_cache_bytes()<=65536);
+            before_maps=mapped_parses;uint32_t c12=0;
+            assert(book_weread_map_cached(i,100,true,100,&c12)==ESP_OK&&mapped_parses==before_maps);
         }
         html_text_free(&text);
     }
+    current=16;assert(book_weread_load(16,NULL,NULL,&text)==ESP_OK&&book_weread_commit_loaded(&current,&actual_version)==ESP_OK&&!book_weread_map_cache_bytes());
+    before_maps=mapped_parses;
+    assert(book_weread_map_cached(16,100,true,10,&absent)==ESP_ERR_NOT_FOUND&&mapped_parses==before_maps);
+    cloud=0;assert(book_weread_map_version(16,100,true,10,&cloud)==ESP_OK&&mapped_parses==before_maps+1);
+    html_text_free(&text);
+    puts("PASS: >5461-run overflow drops exact RAM map safely and falls back to complete file mapping");
     current=15;assert(book_weread_load(15,NULL,NULL,&text)==ESP_OK&&text.len==18000&&book_weread_commit_loaded(&current,&actual_version)==ESP_OK);
-    assert(book_weread_map_cache_bytes()==48000);before_maps=mapped_parses;
+    assert(book_weread_map_cache_bytes()>0&&book_weread_map_cache_bytes()<=48000);before_maps=mapped_parses;
     for(unsigned i=0;i<6000;i+=43){uint32_t cloud=0,local=0;assert(book_weread_map_version(15,100,true,i*3,&cloud)==ESP_OK&&cloud==15+i);assert(book_weread_map_version(15,100,false,cloud,&local)==ESP_OK&&local==i*3);}
     assert(mapped_parses==before_maps);html_text_free(&text);
-    puts("PASS: typical6000-Han chapter uses48000 exact-map bytes;280 bidirectional save queries perform zero reparse");
+    puts("PASS: 6000-Han chapter fits within compressed exact-map budget; 280 bidirectional save queries perform zero reparse");
     // Detached recovery retains the rendered edition/UID even if newer shelf/TOC metadata appears.
     uint32_t large_raw=0,recovered=0,identity=0;unsigned before_downloads=downloads;
     assert(book_weread_map(12,true,100,&large_raw)==ESP_OK);

@@ -86,14 +86,19 @@ void wr_lock(void) { pthread_once(&s_service_once, init_service_mutex); pthread_
 void wr_unlock(int *guard) { (void)guard; wr_memory_leave(NULL); pthread_mutex_unlock(&s_service_mutex); }
 #endif
 
-void *wr_alloc(size_t bytes) {
+void *wr_alloc_raw(size_t bytes) {
 #if defined(ESP_PLATFORM) || defined(WEREAD_TEST_MEMORY)
     size_t available=heap_caps_get_free_size(MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if(available<512u*1024u||bytes>available-512u*1024u)return NULL;
-    return heap_caps_calloc(1,bytes,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    return heap_caps_malloc(bytes?bytes:1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
 #else
-    return calloc(1,bytes);
+    return malloc(bytes?bytes:1);
 #endif
+}
+void *wr_alloc(size_t bytes) {
+    void *p = wr_alloc_raw(bytes);
+    if (p && bytes) memset(p, 0, bytes);
+    return p;
 }
 void *wr_realloc(void *pointer,size_t bytes) {
 #if defined(ESP_PLATFORM) || defined(WEREAD_TEST_MEMORY)
@@ -148,7 +153,9 @@ esp_err_t wr_mkdirs(const char *path) {
     if (!path || !*path) return ESP_ERR_INVALID_ARG;
     size_t len = strlen(path);
     if (len >= 768) return ESP_ERR_INVALID_SIZE;
-    char *buf __attribute__((cleanup(wr_release))) = wr_alloc(len + 1);
+    struct stat fast_st;
+    if (!stat(path, &fast_st)) return S_ISDIR(fast_st.st_mode) ? ESP_OK : ESP_FAIL;
+    char *buf __attribute__((cleanup(wr_release))) = wr_alloc_raw(len + 1);
     if (!buf) return ESP_ERR_NO_MEM;
     memcpy(buf, path, len + 1);
     for (char *p = buf + 1; ; ++p) {
@@ -196,7 +203,7 @@ static esp_err_t read_json(const char *path, cJSON **out) {
         fclose(f); return ESP_ERR_INVALID_SIZE;
     }
     size_t len = (size_t)st.st_size;
-    char *buf = wr_alloc(len + 1);
+    char *buf = wr_alloc_raw(len + 1);
     if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     bool ok = fread(buf, 1, len, f) == len;
     if (fclose(f)) ok = false;
@@ -263,10 +270,13 @@ esp_err_t wr_write_stream(const char *path, wr_stream_writer_fn writer, void *ct
     FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
     if (!f && fd >= 0) close(fd);
     if (!f) {ESP_LOGW("weread","cache open failed errno=%d",errno);return ESP_FAIL;}
+    char *io_vbuf = wr_alloc_raw(4096);
+    if (io_vbuf) (void)setvbuf(f, io_vbuf, _IOFBF, 4096);
     esp_err_t write_err = writer(f, ctx);
     bool ok = write_err == ESP_OK && !ferror(f) && !fflush(f);
     if (ok && fsync(fileno(f))) ok = false;
     if (fclose(f)) ok = false;
+    free(io_vbuf);
     if (ok && !rename(tmp, path)) return ESP_OK;
     if (ok && errno == EEXIST) {
         memcpy(scratch, path, path_len);
@@ -337,8 +347,11 @@ bool wr_set_owner(cJSON *json) {
     return cJSON_AddStringToObject(json, "vid", owner) != NULL;
 }
 
+cJSON *wr_dup_json(const cJSON *value) {
+    return cJSON_Duplicate(value, true);
+}
 bool wr_set_copy(cJSON *o, const char *key, const cJSON *value) {
-    cJSON *copy = cJSON_Duplicate(value, true);
+    cJSON *copy = wr_dup_json(value);
     if (!copy) return false;
     cJSON_DeleteItemFromObjectCaseSensitive(o, key);
     if (cJSON_AddItemToObject(o, key, copy)) return true;

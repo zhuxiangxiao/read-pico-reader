@@ -7,9 +7,14 @@
 #include "weread_position.h"
 uint32_t weread_utf16_length(const char *s, size_t len) {
     uint32_t units = 0;
-    for (size_t i = 0; i < len; ++units) {
+    size_t i = 0;
+    while (i < len) {
         unsigned char c = (unsigned char)s[i];
-        size_t n = c < 0x80 ? 1 : c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 1;
+        if (c < 0x80) {
+            do { ++units; ++i; } while (i < len && (unsigned char)s[i] < 0x80);
+            continue;
+        }
+        size_t n = c >= 0xc2 && c <= 0xdf ? 2 : c >= 0xe0 && c <= 0xef ? 3 : c >= 0xf0 && c <= 0xf4 ? 4 : 1;
         bool valid = n <= len - i;
         for (size_t j = 1; j < n && valid; ++j) valid = ((unsigned char)s[i + j] & 0xc0) == 0x80;
         if (valid && n >= 3) {
@@ -18,7 +23,7 @@ uint32_t weread_utf16_length(const char *s, size_t len) {
                 (c == 0xf0 && b < 0x90) || (c == 0xf4 && b >= 0x90)) valid = false;
         }
         if (!valid) n = 1;
-        if (n == 4) ++units;
+        units += (n == 4) ? 2u : 1u;
         i += n;
     }
     return units;

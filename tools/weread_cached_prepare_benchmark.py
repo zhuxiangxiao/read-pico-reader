@@ -10,10 +10,14 @@ baseline='68b378c73fae1000f52b6ee6344a06d228ab5a99'
 sources=['main/book/book_weread_crypto.c','main/book/book_source_weread.c','main/book/html_text.c',
          *[f'main/weread/weread_{n}.c' for n in ('runtime','chapter','position','progress','shelf','toc','store','auth','client')],
          'tools/weread_stubs/cJSON.c']
-headers=subprocess.check_output(['git','ls-files','main/book/*.h','main/weread/*.h','tools/weread_stubs/*.h'],cwd=root,text=True).splitlines()
-paths=sorted(set(sources+headers))
+def headers_for(rev=None):
+    cmd=(['git','ls-tree','-r','--name-only',rev,'--','main/book','main/weread','tools/weread_stubs']
+         if rev else ['git','ls-files','main/book/*.h','main/weread/*.h','tools/weread_stubs/*.h'])
+    return [p for p in subprocess.check_output(cmd,cwd=root,text=True).splitlines() if p.endswith('.h')]
+baseline_paths=sorted(set(sources+headers_for(baseline)))
+current_paths=sorted(set(sources+headers_for(None)))
 harness=(root/'tools/test_weread_cached_prepare_benchmark.c').read_bytes()
-current={name:(root/name).read_bytes() for name in paths}
+current={name:(root/name).read_bytes() for name in current_paths}
 assert all((root/name).read_bytes()==data for name,data in current.items()),'sources changed during snapshot'
 fixtures=out/'fixtures';fixtures.mkdir(exist_ok=True)
 generator=runpy.run_path(str(root/'tools/fixtures/weread/generate_fixtures.py'))
@@ -29,7 +33,8 @@ report={'baseline_commit':baseline,'current_head':subprocess.check_output(['git'
 env=dict(os.environ,ASAN_OPTIONS='abort_on_error=1:halt_on_error=1',UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1')
 for label in ('baseline','current'):
     folder=out/label;folder.mkdir(exist_ok=True);digest=hashlib.sha256();file_hashes={}
-    for name in paths:
+    label_paths=current_paths if label=='current' else baseline_paths
+    for name in label_paths:
         data=current[name] if label=='current' else subprocess.check_output(['git','show',f'{baseline}:{name}'],cwd=root)
         target=folder/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
         digest.update(name.encode()+b'\0'+data);file_hashes[name]=hashlib.sha256(data).hexdigest()

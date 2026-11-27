@@ -299,10 +299,23 @@ bool book_weread_decrypt_encrypt_key_candidates(const char *encrypt_key,
 void book_weread_gilbert_vernam(uint8_t *data, size_t len,
                                 const uint8_t *key, size_t key_len, size_t start) {
     if (!data || !len || !key || !key_len) return;
+    if (key_len == 1) {
+        uint8_t k0 = key[0];
+        for (size_t i = 0; i < len; ++i) data[i] ^= k0;
+        return;
+    }
+    size_t r = start % key_len;
+    size_t idx = r + (start / key_len) % key_len;
+    if (idx >= key_len) idx -= key_len;
     for (size_t i = 0; i < len; ++i) {
-        size_t pos = start + i;
-        size_t idx = (pos + pos / key_len) % key_len;
         data[i] ^= key[idx];
+        if (++r == key_len) {
+            r = 0;
+            idx += 2;
+            while (idx >= key_len) idx -= key_len;
+        } else if (++idx == key_len) {
+            idx = 0;
+        }
     }
 }
 
@@ -409,12 +422,11 @@ static bool normalize_archive_path(const char *raw, size_t raw_len, char *out, s
 
 /* ---- PKWARE ZipCrypto + ZIP 解包 / ZipCrypto + ZIP Unpacker --------------- */
 
-static uint32_t pk_crc32_byte(uint32_t crc, uint8_t b) {
+static inline uint32_t pk_crc32_byte(uint32_t crc, uint8_t b) {
     // IEEE 802.3 CRC-32 single-step without pre/post complement for ZipCrypto key schedule.
-    crc ^= b;
-    for (int i = 0; i < 8; ++i)
-        crc = (crc >> 1) ^ ((crc & 1u) ? UINT32_C(0xedb88320) : 0u);
-    return crc;
+    static const z_crc_t *tbl = NULL;
+    if (!tbl) tbl = get_crc_table();
+    return (crc >> 8) ^ (uint32_t)tbl[(crc ^ b) & 0xffu];
 }
 
 typedef struct {
@@ -692,26 +704,32 @@ esp_err_t book_weread_unpack_tar(const uint8_t *payload, size_t len,
 
 /* ---- 文件流归档 / File-stream Archives --------------------------------- */
 
-static bool archive_read(FILE *f, size_t offset, void *data, size_t len) {
-    return offset <= 64u * 1024u * 1024u && !fseek(f, (long)offset, SEEK_SET) &&
-        fread(data, 1, len, f) == len;
+static bool archive_read_seq(FILE *f, size_t *cur, size_t offset, void *data, size_t len) {
+    if (offset > 64u * 1024u * 1024u) return false;
+    if (!len) return true;
+    if (*cur != offset) {
+        if (fseek(f, (long)offset, SEEK_SET)) { *cur = SIZE_MAX; return false; }
+    }
+    if (fread(data, 1, len, f) != len) { *cur = SIZE_MAX; return false; }
+    *cur = offset + len;
+    return true;
 }
-static bool archive_size(FILE *f, size_t *size) {
+static bool archive_size(FILE *f, size_t *size, size_t *cur) {
     if (!f || fseek(f, 0, SEEK_END)) return false;
     long n = ftell(f);
     if (n < 0 || n > 64 * 1024 * 1024) return false;
-    *size = (size_t)n; return true;
+    *size = (size_t)n; *cur = (size_t)n; return true;
 }
 
 esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t password_len,
                                      book_weread_archive_chunk_fn sink, void *ctx) {
     if (!f || !sink) return ESP_ERR_INVALID_ARG;
-    size_t size;
-    if (!archive_size(f, &size) || size < 22) return ESP_ERR_INVALID_SIZE;
+    size_t size, cur_pos = SIZE_MAX;
+    if (!archive_size(f, &size, &cur_pos) || size < 22) return ESP_ERR_INVALID_SIZE;
     size_t tail_len = size < 65557u ? size : 65557u;
     uint8_t *tail = WR_ALLOC(tail_len);
     if (!tail) return ESP_ERR_NO_MEM;
-    if (!archive_read(f, size - tail_len, tail, tail_len)) { free(tail); return ESP_FAIL; }
+    if (!archive_read_seq(f, &cur_pos, size - tail_len, tail, tail_len)) { free(tail); return ESP_FAIL; }
     size_t end = SIZE_MAX;
     for (size_t i = tail_len - 22u;; --i) {
         if (le32(tail + i) == UINT32_C(0x06054b50) && i + 22u + le16(tail + i + 20) == tail_len) {
@@ -730,9 +748,15 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
         return ESP_ERR_INVALID_RESPONSE;
     uint8_t *scratch = WR_ALLOC(8192);
     if (!scratch) return ESP_ERR_NO_MEM;
+    uint8_t *cd_buf = (cd_size && cd_size <= 256u * 1024u) ? WR_ALLOC(cd_size) : NULL;
+    if (cd_buf && !archive_read_seq(f, &cur_pos, cd, cd_buf, cd_size)) {
+        free(cd_buf); free(scratch); return ESP_FAIL;
+    }
     uint8_t *in = scratch, *out = scratch + 4096;
     size_t pos = cd, cd_end = cd + cd_size, expanded = 0;
     esp_err_t err = ESP_OK;
+    z_stream zs = {0};
+    bool zs_init = false;
 #if defined(ESP_PLATFORM)
     uint8_t dec_in11 = 0, dec_check = 0;
     uint16_t fail_flags = 0, fail_method = 0;
@@ -741,13 +765,19 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
     char fail_name[96] = "";
 #endif
     for (unsigned entry = 0; entry < count && err == ESP_OK; ++entry) {
-        uint8_t header[46], local[30];
+        uint8_t header_buf[46];
+        const uint8_t *header = header_buf;
 #if defined(ESP_PLATFORM)
         fail_entry = entry; fail_flags = fail_method = 0; fail_mm = false;
         dec_in11 = dec_check = 0; fail_name[0] = 0;
 #endif
-        if (pos > cd_end || cd_end - pos < sizeof(header) || !archive_read(f, pos, header, sizeof(header)) ||
-            le32(header) != UINT32_C(0x02014b50)) { err = ESP_ERR_INVALID_RESPONSE; break; }
+        if (pos > cd_end || cd_end - pos < sizeof(header_buf)) { err = ESP_ERR_INVALID_RESPONSE; break; }
+        if (cd_buf) {
+            header = cd_buf + (pos - cd);
+        } else if (!archive_read_seq(f, &cur_pos, pos, header_buf, sizeof(header_buf))) {
+            err = ESP_ERR_INVALID_RESPONSE; break;
+        }
+        if (le32(header) != UINT32_C(0x02014b50)) { err = ESP_ERR_INVALID_RESPONSE; break; }
         uint16_t flags = le16(header + 8), method = le16(header + 10), name_len = le16(header + 28);
         uint32_t crc = le32(header + 16), compressed = le32(header + 20), plain = le32(header + 24);
         size_t local_pos = le32(header + 42);
@@ -756,8 +786,12 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
         fail_flags = flags; fail_method = method;
 #endif
         char raw[512], name[512];
-        if (record > cd_end - pos || !name_len || name_len >= sizeof(raw) ||
-            !archive_read(f, pos + 46, raw, name_len)) { err = ESP_ERR_INVALID_RESPONSE; break; }
+        if (record > cd_end - pos || !name_len || name_len >= sizeof(raw)) { err = ESP_ERR_INVALID_RESPONSE; break; }
+        if (cd_buf) {
+            memcpy(raw, header + 46, name_len);
+        } else if (!archive_read_seq(f, &cur_pos, pos + 46, raw, name_len)) {
+            err = ESP_ERR_INVALID_RESPONSE; break;
+        }
         raw[name_len] = 0; pos += record;
         if (raw[name_len - 1] == '/') continue;
         unsigned kind = (le32(header + 38) >> 16) & 0170000u;
@@ -771,18 +805,20 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
         if (compressed > WR_ARCHIVE_ENTRY_MAX || plain > WR_ARCHIVE_ENTRY_MAX ||
             plain > 64u * 1024u * 1024u - expanded) { err = ESP_ERR_INVALID_SIZE; break; }
         expanded += plain;
-        if (local_pos > cd || cd - local_pos < 30 || !archive_read(f, local_pos, local, sizeof(local)) ||
-            le32(local) != UINT32_C(0x04034b50) || le16(local + 6) != flags || le16(local + 8) != method ||
-            le16(local + 26) != name_len) { err = ESP_ERR_INVALID_RESPONSE; break; }
-        size_t data = local_pos + 30u + name_len + le16(local + 28);
-        if (data > cd || compressed > cd - data ||
-            !archive_read(f, local_pos + 30, in, name_len) || memcmp(in, raw, name_len)) {
+        if (local_pos > cd || cd - local_pos < 30u + name_len ||
+            !archive_read_seq(f, &cur_pos, local_pos, in, 30u + name_len) ||
+            le32(in) != UINT32_C(0x04034b50) || le16(in + 6) != flags || le16(in + 8) != method ||
+            le16(in + 26) != name_len || memcmp(in + 30, raw, name_len)) {
+            err = ESP_ERR_INVALID_RESPONSE; break;
+        }
+        size_t data = local_pos + 30u + name_len + le16(in + 28);
+        if (data > cd || compressed > cd - data) {
             err = ESP_ERR_INVALID_RESPONSE; break;
         }
         bool hdr_mismatch = false;
         pk_keys_t pk;
         if (flags & 1u) {
-            if (!password || !password_len || compressed < 12 || !archive_read(f, data, in, 12)) {
+            if (!password || !password_len || compressed < 12 || !archive_read_seq(f, &cur_pos, data, in, 12)) {
                 err = ESP_ERR_INVALID_STATE; break;
             }
             pk_init(&pk, password, password_len);
@@ -795,15 +831,21 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
 #endif
             data += 12; compressed -= 12;
         }
-        z_stream zs = {0};
-        zs.zalloc=wr_zalloc;zs.zfree=wr_zfree;
-        if (method == 8 && inflateInit2(&zs, -MAX_WBITS) != Z_OK) { err = ESP_ERR_NO_MEM; break; }
+        if (method == 8) {
+            if (!zs_init) {
+                zs.zalloc = wr_zalloc; zs.zfree = wr_zfree;
+                if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) { err = ESP_ERR_NO_MEM; break; }
+                zs_init = true;
+            } else if (inflateReset(&zs) != Z_OK) {
+                err = ESP_FAIL; break;
+            }
+        }
         size_t remaining = compressed, done = 0;
         uint32_t actual_crc = (uint32_t)crc32(0, NULL, 0);
         bool ended = false;
         while (remaining && err == ESP_OK) {
             size_t n = remaining < 4096 ? remaining : 4096;
-            if (!archive_read(f, data, in, n)) { err = ESP_FAIL; break; }
+            if (!archive_read_seq(f, &cur_pos, data, in, n)) { err = ESP_FAIL; break; }
             data += n; remaining -= n;
             if (flags & 1u) for (size_t i = 0; i < n; ++i) {
                 uint8_t b = in[i] ^ pk_decrypt_byte(&pk); pk_update(&pk, b); in[i] = b;
@@ -836,11 +878,11 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
                 if (ended) break;
             }
         }
-        if (method == 8) inflateEnd(&zs);
         if (err == ESP_OK && (done != plain || (method == 8 && !ended))) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_RESPONSE;
         if (err == ESP_OK && actual_crc != crc) err = hdr_mismatch ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_CRC;
         if (err == ESP_OK && !plain && !sink(ctx, name, out, 0, 0, 0)) err = ESP_ERR_INVALID_STATE;
     }
+    if (zs_init) inflateEnd(&zs);
 #if defined(ESP_PLATFORM)
     if (err != ESP_OK) {
         ESP_LOGW("weread", "zip fail err=%d entry=%u/%u flags=0x%x m=%u mm=%u b11=%02x/%02x name=%.64s",
@@ -848,20 +890,21 @@ esp_err_t book_weread_unpack_zip_file(FILE *f, const uint8_t *password, size_t p
             (unsigned)fail_mm, (unsigned)dec_in11, (unsigned)dec_check, fail_name);
     }
 #endif
+    free(cd_buf);
     free(scratch);
     return err;
 }
 
 esp_err_t book_weread_unpack_tar_file(FILE *f, book_weread_archive_chunk_fn sink, void *ctx) {
     if (!f || !sink) return ESP_ERR_INVALID_ARG;
-    size_t size;
-    if (!archive_size(f, &size) || size < 512) return ESP_ERR_INVALID_SIZE;
+    size_t size, cur_pos = SIZE_MAX;
+    if (!archive_size(f, &size, &cur_pos) || size < 512) return ESP_ERR_INVALID_SIZE;
     uint8_t *buf = WR_ALLOC(4096);
     if (!buf) return ESP_ERR_NO_MEM;
     esp_err_t err = ESP_OK;
     size_t pos = 0, entries = 0;
     while (size - pos >= 512 && err == ESP_OK) {
-        if (!archive_read(f, pos, buf, 512)) { err = ESP_FAIL; break; }
+        if (!archive_read_seq(f, &cur_pos, pos, buf, 512)) { err = ESP_FAIL; break; }
         bool empty = true;
         for (size_t i = 0; i < 512; ++i) if (buf[i]) { empty = false; break; }
         if (empty) break;
@@ -886,7 +929,7 @@ esp_err_t book_weread_unpack_tar_file(FILE *f, book_weread_archive_chunk_fn sink
             size_t done = 0;
             do {
                 n = plain - done < 4096 ? (size_t)plain - done : 4096;
-                if (!archive_read(f, pos + done, buf, n)) { err = ESP_FAIL; break; }
+                if (!archive_read_seq(f, &cur_pos, pos + done, buf, n)) { err = ESP_FAIL; break; }
                 if (!sink(ctx, name, buf, n, done, (size_t)plain)) { err = ESP_ERR_INVALID_STATE; break; }
                 done += n;
             } while (done < plain);

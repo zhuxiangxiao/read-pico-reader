@@ -24,6 +24,7 @@ void wr_memory_leave(int *guard);
 
 /// 可回收工作缓冲优先使用PSRAM，避免扩大内部任务栈。/ Reclaimable work buffers use PSRAM instead of growing internal task stacks.
 void *wr_alloc(size_t bytes);
+void *wr_alloc_raw(size_t bytes);
 void *wr_realloc(void *pointer, size_t bytes);
 /// 开机单次注册稳定的JSON分配器，仅WR_GUARD作用域内使用PSRAM。/ Register once at boot; only WR_GUARD scopes route JSON allocations to PSRAM.
 void wr_memory_init(void);
@@ -49,4 +50,5 @@ esp_err_t wr_write_bytes(const char *path, const void *data, size_t len);
 esp_err_t wr_request_json(const char *endpoint, const cJSON *body, cJSON **out);
 bool wr_owner_matches(const cJSON *json);
 bool wr_set_owner(cJSON *json);
+cJSON *wr_dup_json(const cJSON *value);
 bool wr_set_copy(cJSON *object, const char *key, const cJSON *value);

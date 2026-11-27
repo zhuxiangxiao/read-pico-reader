@@ -31,6 +31,10 @@ static int compare(const void *a, const void *b) {
     return x->uid == y->uid ? 0 : x->uid < y->uid ? -1 : 1;
 }
 
+static int compare_uid_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x == y ? 0 : (x < y ? -1 : 1);
+}
 static int compare_uid(const void *a, const void *b) {
     uint32_t x = ((const weread_chapter_info_t *)a)->uid, y = ((const weread_chapter_info_t *)b)->uid;
     return x == y ? 0 : x < y ? -1 : 1;
@@ -412,7 +416,7 @@ static esp_err_t read_valid_toc_file(const char *path, char **buf_out, size_t *l
     if (fstat(fileno(f), &st)) { fclose(f); return ESP_FAIL; }
     if (st.st_size <= 0 || st.st_size > WEREAD_JSON_LIMIT) { fclose(f); return ESP_ERR_INVALID_SIZE; }
     size_t len = (size_t)st.st_size;
-    char *buf = wr_alloc(len + 1u);
+    char *buf = wr_alloc_raw(len + 1u);
     if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     bool ok = fread(buf, 1, len, f) == len;
     if (fclose(f)) ok = false;
@@ -478,21 +482,44 @@ static esp_err_t decode_bytes(const char *s, size_t root_start, size_t root_end,
     size_t n = js_arr_count(s, ch_start, ch_end);
     if (n > WEREAD_TOC_LIMIT) return ESP_ERR_INVALID_SIZE;
     if (!n) return ESP_OK;
-    out->chapters = wr_alloc(n * sizeof(*out->chapters));
+    out->chapters = wr_alloc_raw(n * sizeof(*out->chapters));
     if (!out->chapters) return ESP_ERR_NO_MEM;
     js_iter_t arr;
     if (!js_arr_begin(s, ch_start, ch_end, &arr)) return ESP_ERR_INVALID_RESPONSE;
+    bool uid_strict_inc = true, idx_sorted = true;
     while (js_arr_next(&arr, &vs, &ve)) {
         esp_err_t err = parse_chapter_slice(s, vs, ve, &out->chapters[out->count]);
         if (err != ESP_OK) return err;
+        if (out->count > 0u) {
+            const weread_chapter_info_t *prev = &out->chapters[out->count - 1u];
+            const weread_chapter_info_t *cur = &out->chapters[out->count];
+            if (cur->uid <= prev->uid) uid_strict_inc = false;
+            if (compare(prev, cur) > 0) idx_sorted = false;
+        }
         ++out->count;
     }
-    // 按UID查重不增加工作数组，大目录避免两两比较。/ Sort by UID to detect duplicates without another work array or quadratic scans.
-    if (out->count > 1u) qsort(out->chapters, out->count, sizeof(*out->chapters), compare_uid);
-    for (size_t i = 1u; i < out->count; ++i) {
-        if (out->chapters[i - 1u].uid == out->chapters[i].uid) return ESP_ERR_INVALID_RESPONSE;
+    if (out->count > 1u && !uid_strict_inc) {
+        // 仅非递增 UID 时在轻量 uint32 数组中查重，已按序加载的目录免去大结构体双排序。
+        // Detect duplicates on a compact uint32 array when UIDs are not strictly increasing; sorted caches skip struct qsort.
+        uint32_t *uids = wr_alloc_raw(out->count * sizeof(uint32_t));
+        if (uids) {
+            for (size_t i = 0; i < out->count; ++i) uids[i] = out->chapters[i].uid;
+            qsort(uids, out->count, sizeof(uint32_t), compare_uid_u32);
+            bool dup = false;
+            for (size_t i = 1u; i < out->count; ++i) {
+                if (uids[i - 1u] == uids[i]) { dup = true; break; }
+            }
+            free(uids);
+            if (dup) return ESP_ERR_INVALID_RESPONSE;
+        } else {
+            qsort(out->chapters, out->count, sizeof(*out->chapters), compare_uid);
+            idx_sorted = false;
+            for (size_t i = 1u; i < out->count; ++i) {
+                if (out->chapters[i - 1u].uid == out->chapters[i].uid) return ESP_ERR_INVALID_RESPONSE;
+            }
+        }
     }
-    if (out->count > 1u) qsort(out->chapters, out->count, sizeof(*out->chapters), compare);
+    if (out->count > 1u && !idx_sorted) qsort(out->chapters, out->count, sizeof(*out->chapters), compare);
     return ESP_OK;
 }
 
@@ -601,21 +628,18 @@ static esp_err_t stream_json_str(FILE *f, toc_stream_ctx_t *ctx, const char *s) 
             err = stream_write(f, ctx, run, (size_t)(p - run));
             if (err != ESP_OK) return err;
         }
-        char esc[7];
+        static const char k_in[] = "\"\\\b\f\n\r\t";
+        static const char k_out[] = "\"\\bfnrt";
+        static const char k_hex[] = "0123456789abcdef";
+        char esc[6] = { '\\' };
         size_t esc_len = 2u;
-        esc[0] = '\\';
-        switch (c) {
-            case '"': esc[1] = '"'; break;
-            case '\\': esc[1] = '\\'; break;
-            case '\b': esc[1] = 'b'; break;
-            case '\f': esc[1] = 'f'; break;
-            case '\n': esc[1] = 'n'; break;
-            case '\r': esc[1] = 'r'; break;
-            case '\t': esc[1] = 't'; break;
-            default:
-                snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
-                esc_len = 6u;
-                break;
+        const char *m = strchr(k_in, (char)c);
+        if (m) {
+            esc[1] = k_out[m - k_in];
+        } else {
+            esc[1] = 'u'; esc[2] = '0'; esc[3] = '0';
+            esc[4] = k_hex[c >> 4]; esc[5] = k_hex[c & 0x0Fu];
+            esc_len = 6u;
         }
         err = stream_write(f, ctx, esc, esc_len);
         if (err != ESP_OK) return err;
@@ -798,7 +822,13 @@ static esp_err_t sync_toc(const char *id, uint32_t expected, weread_toc_t *out) 
     if (err == ESP_OK) {
         if (clear) weread_toc_free(&old_toc);
         size_t base_count = old_toc.count;
-        if (base_count > 1u) qsort(old_toc.chapters, base_count, sizeof(*old_toc.chapters), compare_uid);
+        if (base_count > 1u) {
+            bool base_uid_sorted = true;
+            for (size_t i = 1u; i < base_count; ++i) {
+                if (old_toc.chapters[i - 1u].uid > old_toc.chapters[i].uid) { base_uid_sorted = false; break; }
+            }
+            if (!base_uid_sorted) qsort(old_toc.chapters, base_count, sizeof(*old_toc.chapters), compare_uid);
+        }
         size_t updated_count = js_arr_count(raw_resp, updated_start, updated_end);
         size_t cap = base_count + updated_count;
         if (cap > WEREAD_TOC_LIMIT) cap = WEREAD_TOC_LIMIT;
@@ -809,7 +839,7 @@ static esp_err_t sync_toc(const char *id, uint32_t expected, weread_toc_t *out) 
                 old_toc.chapters = NULL;
                 old_toc.count = 0;
             } else {
-                merged.chapters = wr_alloc(cap * sizeof(*merged.chapters));
+                merged.chapters = wr_alloc_raw(cap * sizeof(*merged.chapters));
                 if (!merged.chapters) err = ESP_ERR_NO_MEM;
                 else if (base_count > 0u) {
                     memcpy(merged.chapters, old_toc.chapters, base_count * sizeof(*merged.chapters));
@@ -871,13 +901,11 @@ static esp_err_t sync_toc(const char *id, uint32_t expected, weread_toc_t *out) 
             err = dedup_tail(&merged, base_count);
         }
         if (err == ESP_OK && merged.count > WEREAD_TOC_LIMIT) err = ESP_ERR_INVALID_SIZE;
-        if (err == ESP_OK && merged.count > 1u) {
-            qsort(merged.chapters, merged.count, sizeof(*merged.chapters), compare_uid);
-        }
 
         if (err == ESP_OK && has_removed) {
             size_t rem_count = js_arr_count(raw_resp, removed_start, removed_end);
             if (rem_count > 0u && merged.count > 0u) {
+                if (merged.count > 1u) qsort(merged.chapters, merged.count, sizeof(*merged.chapters), compare_uid);
                 uint8_t *dead = wr_alloc((merged.count + 7u) / 8u);
                 if (!dead) err = ESP_ERR_NO_MEM;
                 js_iter_t rem_it;
@@ -922,7 +950,13 @@ static esp_err_t sync_toc(const char *id, uint32_t expected, weread_toc_t *out) 
     raw_resp = NULL;
 
     if (err == ESP_OK) {
-        if (merged.count > 1u) qsort(merged.chapters, merged.count, sizeof(*merged.chapters), compare);
+        if (merged.count > 1u) {
+            bool idx_sorted = true;
+            for (size_t i = 1u; i < merged.count; ++i) {
+                if (compare(&merged.chapters[i - 1u], &merged.chapters[i]) > 0) { idx_sorted = false; break; }
+            }
+            if (!idx_sorted) qsort(merged.chapters, merged.count, sizeof(*merged.chapters), compare);
+        }
         merged.synckey = new_key;
         merged.update_time = updated_at;
         merged.book_version = version;

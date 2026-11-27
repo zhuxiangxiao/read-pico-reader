@@ -117,8 +117,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Transfer-Encoding","chunked")
                 self.send_header("Connection","close")
                 self.end_headers()
-            chunks=[b'{"errcode":',b'-2013}'] if self.path.startswith("/expired") else [b'{"succ":',b'true,"data":"',b'A'*11000,b'"}']
+            if current_mode==15:
+                chunks=[b'{"succ":',b'true,"data":"']+[b'A'*1500]*6+[b'A'*2000]
+            else:
+                chunks=[b'{"errcode":',b'-2013}'] if self.path.startswith("/expired") else [b'{"succ":',b'true,"data":"',b'A'*11000,b'"}']
             for chunk in chunks:
+                if current_mode==13:time.sleep(0.008)
+                elif current_mode==15:time.sleep(0.012)
                 self.wfile.write(f"{len(chunk):x}\r\n".encode()+chunk+b"\r\n")
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
@@ -144,7 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200);self.send_header("Transfer-Encoding","chunked");self.send_header("Connection","close");self.end_headers()
             data=bytes(ord('A')+i%26 for i in range(256))
             for i in range(0,len(data),11):
-                part=data[i:i+11];self.wfile.write(f"{len(part):x}\r\n".encode()+part+b"\r\n")
+                if current_mode==16 and i<120:time.sleep(0.003)
+                part=data[i:i+11];self.wfile.write(f"{len(part):x}\r\n".encode()+part+b"\r\n");self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n");self.close_connection=True
         except (BrokenPipeError,ConnectionResetError):pass
         except Exception as exc:errors.append(repr(exc))

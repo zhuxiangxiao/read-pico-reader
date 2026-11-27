@@ -3,6 +3,7 @@
 // Only WeRead worker traffic uses this poller; numeric peers preserve original Host, SNI and credential boundaries.
 #if defined(ESP_PLATFORM) || defined(WEREAD_TEST_ASYNC_HTTP)
 #include <errno.h>
+#include <sys/select.h>
 #if defined(ESP_PLATFORM)
 #include <stdatomic.h>
 #include "lwip/dns.h"
@@ -161,12 +162,45 @@ static void http_poll_reset(http_poll_t *p) {
 }
 static const char *http_poll_host(http_poll_t *p) { return p?p->authority:NULL; }
 static esp_err_t http_poll_error(http_poll_t *p,esp_err_t fallback) { return p&&p->error?p->error:fallback; }
+static void http_poll_wait(esp_http_client_handle_t client, http_poll_t *p, bool want_read, bool want_write, unsigned *spin) {
+    int fd = esp_http_client_get_socket(client);
+    if (fd < 0 || fd >= FD_SETSIZE || *spin >= 2u) {
+        *spin = 0;
+        http_poll_pause();
+        return;
+    }
+    uint64_t now = client_now_ms();
+    uint64_t rem = p->deadline > now ? p->deadline - now : 1u;
+    unsigned wait_ms = rem < 15u ? (unsigned)rem + 1u : 15u;
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds); FD_ZERO(&wfds);
+    if (want_read) FD_SET(fd, &rfds);
+    if (want_write) FD_SET(fd, &wfds);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = (suseconds_t)(wait_ms * 1000u) };
+    int r = select(fd + 1, want_read ? &rfds : NULL, want_write ? &wfds : NULL, NULL, &tv);
+    uint64_t after = client_now_ms();
+    if (r > 0 && after <= now) ++(*spin);
+    else {
+        if (r < 0 && errno != EINTR) http_poll_pause();
+        *spin = 0;
+    }
+}
+static inline void http_poll_wait_rx(esp_http_client_handle_t client, http_poll_t *p, uint64_t t0, unsigned *spin) {
+#if defined(ESP_PLATFORM)
+    if (client_now_ms() - t0 >= 15u) { taskYIELD(); *spin = 0; return; }
+#else
+    (void)t0;
+#endif
+    http_poll_wait(client, p, true, false, spin);
+}
 static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_poll_t *p) {
     if(!p)return esp_http_client_open(client,length);
 #if defined(ESP_PLATFORM)
     uint64_t connect_started=client_now_ms();
     unsigned connect_retries=0;
 #endif
+    unsigned spin = 0;
+    bool allow_write = true;
     for(;;){
         esp_err_t err=http_poll_guard(p);if(err!=ESP_OK)return err;
         weread_client_yield_for_display(p->cancel,p->cancel_ctx);
@@ -180,6 +214,7 @@ static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_
             // open rebuilds request headers on reentry; restart an incomplete header on a fresh connection before any body is sent.
             if(p->header_restarts++>=3)return ESP_FAIL;
             esp_http_client_close(client);p->connected=false;
+            allow_write = true; spin = 0;
 #if defined(ESP_PLATFORM)
             connect_started=client_now_ms();
 #endif
@@ -189,44 +224,51 @@ static esp_err_t http_poll_open(esp_http_client_handle_t client,int length,http_
                 client_now_ms()-connect_started>=3500){
             ESP_LOGW("weread","http connect stalled 3.5s (#%u), retrying peer=%s",connect_retries+1,p->peer);
             esp_http_client_close(client);p->connected=false;
+            allow_write = true; spin = 0;
             connect_started=client_now_ms();++connect_retries;
             p->deadline=connect_started+(connect_retries==1?11500:8000);
         }
 #endif
-        http_poll_pause();
+        http_poll_wait(client, p, true, allow_write, &spin);
+        if (allow_write && spin >= 2u) { allow_write = false; spin = 0; }
     }
 }
 static int http_poll_write(esp_http_client_handle_t client,const char *data,int bytes,http_poll_t *p) {
     if(!p)return esp_http_client_write(client,data,bytes);
+    unsigned spin = 0;
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
         weread_client_yield_for_display(p->cancel,p->cancel_ctx);
         errno=0;int n=esp_http_client_write(client,data,bytes);
-        if(n>0){http_poll_progress(p);return n;}
+        if(n>0){spin=0;http_poll_progress(p);return n;}
         if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;
-        http_poll_pause();
+        http_poll_wait(client, p, false, true, &spin);
     }
 }
 static int64_t http_poll_headers(esp_http_client_handle_t client,http_poll_t *p) {
     if(!p)return esp_http_client_fetch_headers(client);
+    unsigned spin = 0;
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
         weread_client_yield_for_display(p->cancel,p->cancel_ctx);
+        uint64_t t0 = client_now_ms();
         errno=0;int64_t n=esp_http_client_fetch_headers(client);
         if(n>=0){http_poll_progress(p);return n;}
         if(n!=-ESP_ERR_HTTP_EAGAIN&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;
-        http_poll_pause();
+        http_poll_wait_rx(client, p, t0, &spin);
     }
 }
 static int http_poll_read(esp_http_client_handle_t client,char *data,int bytes,http_poll_t *p) {
     if(!p)return esp_http_client_read(client,data,bytes);
+    unsigned spin = 0;
     for(;;){
         if(http_poll_guard(p)!=ESP_OK)return -1;
         weread_client_yield_for_display(p->cancel,p->cancel_ctx);
+        uint64_t t0 = client_now_ms();
         errno=0;int n=esp_http_client_read(client,data,bytes);
-        if(n>=0){if(n)http_poll_progress(p);return n;}
+        if(n>=0){spin=0;if(n)http_poll_progress(p);return n;}
         if(n!=-ESP_ERR_HTTP_EAGAIN&&errno!=EAGAIN&&errno!=EWOULDBLOCK)return n;
-        http_poll_pause();
+        http_poll_wait_rx(client, p, t0, &spin);
     }
 }
 #else

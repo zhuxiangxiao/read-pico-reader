@@ -341,17 +341,20 @@ static uint32_t version(const char *id) {
     if (weread_toc_load(id, &toc) == ESP_OK && toc.book_version) v = toc.book_version;
     weread_toc_free(&toc); return v;
 }
-static esp_err_t manifest(const char *id, uint32_t uid, bool res, cJSON **out) {
+static esp_err_t manifest_in_dir(const char *book_dir, const char *id, uint32_t uid, bool res, uint32_t expected_version, cJSON **out) {
     char leaf[64], path[512]; *out = NULL;
     if (res) strcpy(leaf, "resources.json"); else snprintf(leaf, sizeof(leaf), "chapter-%u.json", (unsigned)uid);
-    esp_err_t err = wr_cache_path(id, leaf, path, sizeof(path));
+    esp_err_t err = book_dir ? join(book_dir, leaf, path, sizeof(path)) : wr_cache_path(id, leaf, path, sizeof(path));
     if (err == ESP_OK) err = wr_read_json(path, out);
-    if (err == ESP_OK && (!wr_owner_matches(*out) || number(*out, "bookVersion") != version(id) ||
+    if (err == ESP_OK && (!wr_owner_matches(*out) || number(*out, "bookVersion") != expected_version ||
         (!res && number(*out, "chapterUid") != uid))) err = ESP_ERR_INVALID_RESPONSE;
     const char *root = wr_string(*out, "root");
     if (err == ESP_OK && (!root || !*root || strstr(root, "..") || root[0] == '/' || strchr(root, '\\'))) err = ESP_ERR_INVALID_RESPONSE;
     if (err != ESP_OK) { cJSON_Delete(*out); *out = NULL; }
     return err;
+}
+static esp_err_t manifest(const char *id, uint32_t uid, bool res, cJSON **out) {
+    return manifest_in_dir(NULL, id, uid, res, version(id), out);
 }
 static esp_err_t directory(const char *id, uint32_t uid, bool res, char *out, size_t cap) {
     cJSON *m = NULL;
@@ -379,7 +382,7 @@ static esp_err_t read_file(const char *path, char **out, size_t *len) {
     FILE *f = fopen(path, "rb"); if (!f) return ESP_ERR_NOT_FOUND;
     struct stat st;
     if (fstat(fileno(f), &st) || st.st_size < 0 || st.st_size > CHAPTER_LIMIT) { fclose(f); return ESP_ERR_INVALID_SIZE; }
-    size_t n = (size_t)st.st_size; char *buf = wr_alloc(n + 1);
+    size_t n = (size_t)st.st_size; char *buf = wr_alloc_raw(n + 1);
     if (!buf) { fclose(f); return ESP_ERR_NO_MEM; }
     bool ok = fread(buf, 1, n, f) == n; if (fclose(f)) ok = false;
     if (!ok) { free(buf); return ESP_FAIL; }
@@ -448,11 +451,13 @@ static bool append_source(FILE *f, const char *data, size_t len, size_t *total, 
     p->units += weread_utf16_length(data, len); return true;
 }
 static bool merged_file(const cJSON *files, const char *path) {
-    cJSON *file; char normalized[512], decoded[512];
+    cJSON *file;
+    struct { char normalized[512], decoded[512]; } *tmp __attribute__((cleanup(wr_release))) = wr_alloc_raw(sizeof(*tmp));
+    if (!tmp) return false;
     cJSON_ArrayForEach(file,files) {
-        if(!cJSON_IsString(file)||!weread_resource_path(NULL,file->valuestring,normalized,sizeof(normalized)))continue;
-        if(!strcmp(normalized,path))return true;
-        if(strchr(normalized,'%')&&weread_resource_path_decode(normalized,decoded,sizeof(decoded))&&!strcmp(decoded,path))return true;
+        if(!cJSON_IsString(file)||!weread_resource_path(NULL,file->valuestring,tmp->normalized,sizeof(tmp->normalized)))continue;
+        if(!strcmp(tmp->normalized,path))return true;
+        if(strchr(tmp->normalized,'%')&&weread_resource_path_decode(tmp->normalized,tmp->decoded,sizeof(tmp->decoded))&&!strcmp(tmp->decoded,path))return true;
     }
     return false;
 }
@@ -469,12 +474,21 @@ static void note_id(char out[24], const char *source, const char *fragment) {
 static bool append_html(FILE *f, const char *data, size_t len, const char *source, const cJSON *files, size_t *total, position_writer_t *map) {
     size_t start = 0; bool tag = false;
     for (size_t i = 0; i < len; ++i) {
+        if (!tag) {
+            const char *lt = memchr(data + i, '<', len - i);
+            if (!lt) break;
+            i = (size_t)(lt - data);
+            tag = true;
+            continue;
+        }
         if (data[i] == '<') tag = true;
-        if (data[i] == '>') tag = false;
-        if (!tag || !i || !isspace((unsigned char)data[i - 1])) continue;
-        size_t k = len - i >= 3 && !strncasecmp(data + i, "src", 3) ? 3 :
-            len - i >= 4 && !strncasecmp(data + i, "href", 4) ? 4 :
-            len - i >= 2 && !strncasecmp(data + i, "id", 2) ? 2 : 0;
+        else if (data[i] == '>') { tag = false; continue; }
+        if (!i || !isspace((unsigned char)data[i - 1])) continue;
+        unsigned char lc = (unsigned char)data[i] | 0x20u;
+        if (lc != 's' && lc != 'h' && lc != 'i') continue;
+        size_t k = lc == 's' && len - i >= 3 && !strncasecmp(data + i, "src", 3) ? 3 :
+            lc == 'h' && len - i >= 4 && !strncasecmp(data + i, "href", 4) ? 4 :
+            lc == 'i' && len - i >= 2 && !strncasecmp(data + i, "id", 2) ? 2 : 0;
         if (!k) continue;
         size_t j = i + k;
         while (j < len && isspace((unsigned char)data[j])) ++j;
@@ -741,23 +755,34 @@ static void release_chapter_work(chapter_download_work_t **p) {
     if(*p)weread_secure_zero(*p,sizeof(**p));
     wr_release(p);
 }
+static bool chapter_cached_in_dir(const char *book_dir, uint32_t uid, uint32_t expected_version,
+    char *scratch_dir, size_t dir_cap, char *scratch_path, size_t path_cap) {
+    cJSON *m = NULL;
+    esp_err_t err = manifest_in_dir(book_dir, NULL, uid, false, expected_version, &m);
+    if (err == ESP_OK) err = join(book_dir, wr_string(m, "root"), scratch_dir, dir_cap);
+    cJSON_Delete(m);
+    struct stat st = {0};
+    if (err != ESP_OK || stat(scratch_dir, &st) || !S_ISDIR(st.st_mode)) return false;
+    if (join(scratch_dir, "body.html", scratch_path, path_cap) != ESP_OK) return false;
+    bool body_ok = !stat(scratch_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
+    off_t body_size = st.st_size;
+    if (!body_ok || join(scratch_dir, "position.map", scratch_path, path_cap) != ESP_OK) return false;
+    if (stat(scratch_path, &st) || !S_ISREG(st.st_mode)) return false;
+    FILE *f = fopen(scratch_path, "rb");
+    if (!f) return false;
+    weread_position_header_t h = {0};
+    bool ok = fread(&h, sizeof(h), 1, f) == 1;
+    if (fclose(f)) ok = false;
+    return ok && h.magic == WEREAD_POSITION_MAGIC && h.bytes == (uint32_t)body_size && h.count && h.count <= 16384 &&
+        st.st_size == (off_t)(sizeof(h) + (size_t)h.count * sizeof(weread_position_point_t));
+}
 bool weread_chapter_cached(const char *id,uint32_t uid){WR_GUARD;
     if(!wr_valid_id(id)||!uid)return false;
-    struct { char existing[512], cache_path[600]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc(sizeof(*paths));
+    struct { char book_dir[512], existing[512], cache_path[600]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc_raw(sizeof(*paths));
     if(!paths)return false;
-    if (weread_chapter_directory(id, uid, paths->existing, sizeof(paths->existing)) == ESP_OK) {
-        struct stat st={0}; join(paths->existing, "body.html", paths->cache_path, sizeof(paths->cache_path));
-        bool body_ok = !stat(paths->cache_path, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && st.st_size <= CHAPTER_LIMIT;
-        off_t body_size=st.st_size;
-        join(paths->existing, "position.map", paths->cache_path, sizeof(paths->cache_path));
-        if (!body_ok || stat(paths->cache_path, &st) || !S_ISREG(st.st_mode)) return false;
-        FILE *f=fopen(paths->cache_path,"rb");if(!f)return false;
-        weread_position_header_t h={0};bool ok=fread(&h,sizeof(h),1,f)==1;
-        if(fclose(f))ok=false;
-        return ok&&h.magic==WEREAD_POSITION_MAGIC&&h.bytes==(uint32_t)body_size&&h.count&&h.count<=16384&&
-            st.st_size==(off_t)(sizeof(h)+(size_t)h.count*sizeof(weread_position_point_t));
-    }
-    return false;
+    if (wr_cache_book_dir(id, paths->book_dir, sizeof(paths->book_dir)) != ESP_OK) return false;
+    return chapter_cached_in_dir(paths->book_dir, uid, version(id),
+        paths->existing, sizeof(paths->existing), paths->cache_path, sizeof(paths->cache_path));
 }
 esp_err_t weread_chapter_storage_info(uint64_t *free_bytes, uint64_t *total_bytes){WR_GUARD;
     if(free_bytes)*free_bytes=0;
@@ -1363,13 +1388,82 @@ esp_err_t weread_chapter_clean_all_caches(uint64_t *freed_bytes, uint32_t *clean
     return err;
 }
 
-static int cmp_u32(const void *a, const void *b) {
-    uint32_t va = *(const uint32_t *)a, vb = *(const uint32_t *)b;
-    return va < vb ? -1 : (va > vb ? 1 : 0);
+typedef struct {
+    uint32_t uid;
+    uint32_t idx;
+} chapter_uid_idx_t;
+static int cmp_uid_idx(const void *a, const void *b) {
+    const chapter_uid_idx_t *x = a, *y = b;
+    return x->uid < y->uid ? -1 : (x->uid > y->uid ? 1 : 0);
 }
-
+static esp_err_t scan_cached_uids_internal(const char *book_id, uint32_t expected_version,
+    const uint32_t *uids, const weread_chapter_info_t *chapters, size_t count, uint8_t *bits,
+    uint32_t *cached_count, weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    if (cached_count) *cached_count = 0;
+    if (!wr_valid_id(book_id) || !count || (!uids && !chapters)) return ESP_ERR_INVALID_ARG;
+    if (cancel_fn && cancel_fn(cancel_ctx)) return ESP_ERR_INVALID_STATE;
+    struct { char book_dir[512], existing[512], cache_path[600]; } *paths __attribute__((cleanup(wr_release))) = wr_alloc_raw(sizeof(*paths));
+    if (!paths) return ESP_ERR_NO_MEM;
+    esp_err_t err = wr_cache_book_dir(book_id, paths->book_dir, sizeof(paths->book_dir));
+    if (err != ESP_OK) return err;
+    if (!sd_io_ready_for(paths->book_dir)) return ESP_ERR_INVALID_STATE;
+#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
+    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
+        read_pico_sd_access_scope(paths->book_dir);
+    if (!sd_access.allowed) return ESP_ERR_INVALID_STATE;
+#endif
+    struct stat st;
+    if (stat(paths->book_dir, &st)) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+    chapter_uid_idx_t *sorted __attribute__((cleanup(wr_release))) = wr_alloc_raw(count * sizeof(*sorted));
+    uint8_t *seen __attribute__((cleanup(wr_release))) = wr_alloc((count + 7u) / 8u);
+    if (!sorted || !seen) return ESP_ERR_NO_MEM;
+    for (size_t i = 0; i < count; ++i) {
+        sorted[i].uid = chapters ? chapters[i].uid : uids[i];
+        sorted[i].idx = (uint32_t)i;
+    }
+    qsort(sorted, count, sizeof(*sorted), cmp_uid_idx);
+    DIR *d = opendir(paths->book_dir);
+    if (!d) return errno == ENOENT ? ESP_OK : ESP_FAIL;
+    struct dirent *entry;
+    while ((entry = readdir(d))) {
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        uint32_t uid = 0;
+        if (!parse_chapter_manifest_uid(entry->d_name, &uid)) continue;
+        chapter_uid_idx_t key = { .uid = uid, .idx = 0 };
+        const chapter_uid_idx_t *found = bsearch(&key, sorted, count, sizeof(*sorted), cmp_uid_idx);
+        if (!found) continue;
+        size_t pos = (size_t)(found - sorted);
+        seen[pos >> 3u] |= (uint8_t)(1u << (pos & 7u));
+    }
+    closedir(d);
+    uint32_t cached = 0;
+    for (size_t i = 0; err == ESP_OK && i < count; ++i) {
+        if (!seen[i >> 3u]) { i |= 7u; continue; }
+        if (!(seen[i >> 3u] & (uint8_t)(1u << (i & 7u)))) continue;
+        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
+        if (chapter_cached_in_dir(paths->book_dir, sorted[i].uid, expected_version,
+                paths->existing, sizeof(paths->existing), paths->cache_path, sizeof(paths->cache_path))) {
+            ++cached;
+            if (bits) {
+                size_t idx = sorted[i].idx;
+                bits[idx >> 3u] |= (uint8_t)(1u << (idx & 7u));
+            }
+        }
+    }
+    if (err == ESP_OK && cached_count) *cached_count = cached;
+    return err;
+}
+esp_err_t weread_chapter_scan_cached_uids(const char *book_id, const uint32_t *uids, size_t count,
+    uint8_t *bits, uint32_t *cached_count, weread_cancel_fn cancel, void *cancel_ctx) { WR_GUARD;
+    if (!wr_valid_id(book_id) || (!uids && count) || (count && !bits)) return ESP_ERR_INVALID_ARG;
+    if (bits && count) memset(bits, 0, (count + 7u) / 8u);
+    if (cached_count) *cached_count = 0;
+    if (!count) return ESP_OK;
+    return scan_cached_uids_internal(book_id, version(book_id), uids, NULL, count, bits, cached_count, cancel, cancel_ctx);
+}
 esp_err_t weread_chapter_count_cached(const char *book_id, uint16_t *cached_chapters,
-    uint16_t *total_chapters, weread_cancel_fn cancel_fn, void *cancel_ctx) {
+    uint16_t *total_chapters, weread_cancel_fn cancel_fn, void *cancel_ctx) { WR_GUARD;
     if (cached_chapters) *cached_chapters = 0;
     if (total_chapters) *total_chapters = 0;
     if (!wr_valid_id(book_id)) return ESP_ERR_INVALID_ARG;
@@ -1383,75 +1477,11 @@ esp_err_t weread_chapter_count_cached(const char *book_id, uint16_t *cached_chap
         weread_toc_free(&toc);
         return ESP_OK;
     }
-    uint32_t *uids = wr_alloc(toc_count * sizeof(uint32_t));
-    if (!uids) {
-        weread_toc_free(&toc);
-        return ESP_ERR_NO_MEM;
-    }
-    for (size_t i = 0; i < toc_count; ++i) uids[i] = toc.chapters[i].uid;
-    weread_toc_free(&toc);
-    qsort(uids, toc_count, sizeof(uint32_t), cmp_u32);
-    char *dir __attribute__((cleanup(wr_release))) = wr_alloc(512);
-    if (!dir) { free(uids); return ESP_ERR_NO_MEM; }
-    err = wr_cache_book_dir(book_id, dir, 512);
-    if (err != ESP_OK) { free(uids); return err; }
-    if (!sd_io_ready_for(dir)) { free(uids); return ESP_ERR_INVALID_STATE; }
-#if defined(ESP_PLATFORM) && defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47
-    read_pico_sd_access_scope_t sd_access __attribute__((cleanup(read_pico_sd_access_scope_end))) =
-        read_pico_sd_access_scope(dir);
-    if (!sd_access.allowed) { free(uids); return ESP_ERR_INVALID_STATE; }
-#endif
-    struct stat st;
-    if (stat(dir, &st)) {
-        free(uids);
-        if (errno == ENOENT) {
-            if (total_chapters) *total_chapters = total_u16;
-            return ESP_OK;
-        }
-        return ESP_FAIL;
-    }
-    if (!S_ISDIR(st.st_mode)) { free(uids); return ESP_FAIL; }
-    DIR *d = opendir(dir);
-    if (!d) {
-        free(uids);
-        if (errno == ENOENT) {
-            if (total_chapters) *total_chapters = total_u16;
-            return ESP_OK;
-        }
-        return ESP_FAIL;
-    }
-    uint8_t *seen = wr_alloc((toc_count + 7u) / 8u);
-    uint32_t *cands = NULL;
-    size_t cand_count = 0, cand_cap = 0;
-    if (!seen) { closedir(d); free(uids); return ESP_ERR_NO_MEM; }
-    struct dirent *entry;
-    while ((entry = readdir(d))) {
-        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
-        uint32_t uid = 0;
-        if (!parse_chapter_manifest_uid(entry->d_name, &uid)) continue;
-        uint32_t *found = bsearch(&uid, uids, toc_count, sizeof(uint32_t), cmp_u32);
-        if (!found) continue;
-        size_t idx = (size_t)(found - uids);
-        if (seen[idx >> 3u] & (uint8_t)(1u << (idx & 7u))) continue;
-        seen[idx >> 3u] |= (uint8_t)(1u << (idx & 7u));
-        if (cand_count == cand_cap) {
-            size_t next = cand_cap ? cand_cap * 2 : 16;
-            uint32_t *bigger = wr_realloc(cands, next * sizeof(uint32_t));
-            if (!bigger) { err = ESP_ERR_NO_MEM; break; }
-            cands = bigger;
-            cand_cap = next;
-        }
-        cands[cand_count++] = uid;
-    }
-    closedir(d);
-    free(seen);
-    free(uids);
+    uint32_t ver = weread_shelf_book_version(book_id);
+    if (!ver && !book_weread_cached_version(book_id, &ver)) ver = toc.book_version;
     uint32_t cached = 0;
-    for (size_t i = 0; err == ESP_OK && i < cand_count; ++i) {
-        if (cancel_fn && cancel_fn(cancel_ctx)) { err = ESP_ERR_INVALID_STATE; break; }
-        if (weread_chapter_cached(book_id, cands[i])) ++cached;
-    }
-    free(cands);
+    err = scan_cached_uids_internal(book_id, ver, NULL, toc.chapters, toc_count, NULL, &cached, cancel_fn, cancel_ctx);
+    weread_toc_free(&toc);
     if (err == ESP_OK) {
         uint16_t cached_u16 = cached > total_u16 ? total_u16 : (uint16_t)cached;
         if (cached_chapters) *cached_chapters = cached_u16;

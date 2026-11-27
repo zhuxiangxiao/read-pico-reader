@@ -3,7 +3,7 @@
  * WeRead secure HTTPS client with sensitive header stripping and renewal replay.
  */
 // 网络和缓存按体积优化，保留双板原应用分区。/ Optimize network/cache code for size within the original app slots.
-#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__)
+#if defined(ESP_PLATFORM) && defined(__GNUC__) && !defined(__clang__) && !(defined(KIIKO_BOARD_METALIO47) && KIIKO_BOARD_METALIO47)
 #pragma GCC optimize ("Os")
 #endif
 #include "weread_client.h"
@@ -12,6 +12,7 @@
 #include "cJSON.h"
 #include "esp_log.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -510,39 +511,53 @@ static uint64_t client_now_ms(void) {
 #endif
 }
 #if defined(ESP_PLATFORM)
-#define HTTP_POOL_IDLE_MS 25000u
-static WR_EXT_BSS struct {
+#define HTTP_POOL_SLOTS 2u
+#define HTTP_POOL_IDLE_MS 45000u
+typedef struct {
     esp_http_client_handle_t client;
     char host[128];
     char peer[48];
     int port;
     uint64_t last_used_ms;
-} s_pool;
-static void http_pool_close(void) {
-    http_lock();
-    esp_http_client_handle_t c = s_pool.client;
-    memset(&s_pool, 0, sizeof(s_pool));
-    http_unlock();
-    if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
+} http_pool_slot_t;
+static WR_EXT_BSS http_pool_slot_t s_pool[HTTP_POOL_SLOTS];
+static void http_close_handles(esp_http_client_handle_t *list, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (list[i]) { esp_http_client_close(list[i]); esp_http_client_cleanup(list[i]); }
+    }
 }
-static bool http_pool_peer(const char *host, int port, char peer[48]) {
-    bool ok = false;
-    esp_http_client_handle_t stale = NULL;
-    uint64_t now = client_now_ms();
-    http_lock();
-    if (s_pool.client) {
-        if (now - s_pool.last_used_ms >= HTTP_POOL_IDLE_MS ||
-            esp_http_client_get_state(s_pool.client) < HTTP_STATE_CONNECTED) {
-            stale = s_pool.client;
-            memset(&s_pool, 0, sizeof(s_pool));
-        } else if (s_pool.port == port && !strcasecmp(s_pool.host, host)) {
-            memcpy(peer, s_pool.peer, sizeof(s_pool.peer));
-            ok = true;
+static void http_pool_prune_locked(uint64_t now, esp_http_client_handle_t stale[HTTP_POOL_SLOTS]) {
+    for (size_t i = 0; i < HTTP_POOL_SLOTS; ++i) {
+        if (s_pool[i].client && (now - s_pool[i].last_used_ms >= HTTP_POOL_IDLE_MS ||
+            esp_http_client_get_state(s_pool[i].client) < HTTP_STATE_CONNECTED)) {
+            stale[i] = s_pool[i].client;
+            memset(&s_pool[i], 0, sizeof(s_pool[i]));
         }
     }
+}
+static int http_pool_match_locked(const char *host, int port) {
+    for (size_t i = 0; i < HTTP_POOL_SLOTS; ++i) {
+        if (s_pool[i].client && s_pool[i].port == port && !strcasecmp(s_pool[i].host, host)) return (int)i;
+    }
+    return -1;
+}
+static void http_pool_close(void) {
+    esp_http_client_handle_t doomed[HTTP_POOL_SLOTS] = {0};
+    http_lock();
+    for (size_t i = 0; i < HTTP_POOL_SLOTS; ++i) doomed[i] = s_pool[i].client;
+    memset(&s_pool, 0, sizeof(s_pool));
     http_unlock();
-    if (stale) { esp_http_client_close(stale); esp_http_client_cleanup(stale); }
-    return ok;
+    http_close_handles(doomed, HTTP_POOL_SLOTS);
+}
+static bool http_pool_peer(const char *host, int port, char peer[48]) {
+    esp_http_client_handle_t stale[HTTP_POOL_SLOTS] = {0};
+    http_lock();
+    http_pool_prune_locked(client_now_ms(), stale);
+    int idx = http_pool_match_locked(host, port);
+    if (idx >= 0) memcpy(peer, s_pool[idx].peer, sizeof(s_pool[idx].peer));
+    http_unlock();
+    http_close_handles(stale, HTTP_POOL_SLOTS);
+    return idx >= 0;
 }
 #endif
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
@@ -560,22 +575,18 @@ static bool http_pool_eligible(const char *url) {
 }
 static esp_http_client_handle_t http_pool_take(const char *url, http_poll_t *poll, http_event_handle_cb cb, void *cb_ctx) {
     if (!poll || !http_pool_eligible(url)) return NULL;
-    esp_http_client_handle_t client = NULL, stale = NULL;
-    uint64_t now = client_now_ms();
+    esp_http_client_handle_t client = NULL;
+    esp_http_client_handle_t stale[HTTP_POOL_SLOTS] = {0};
     http_lock();
-    if (s_pool.client) {
-        if (now - s_pool.last_used_ms >= HTTP_POOL_IDLE_MS ||
-            esp_http_client_get_state(s_pool.client) < HTTP_STATE_CONNECTED) {
-            stale = s_pool.client;
-            memset(&s_pool, 0, sizeof(s_pool));
-        } else if (s_pool.port == poll->port && !strcasecmp(s_pool.host, poll->host)) {
-            client = s_pool.client;
-            memcpy(poll->peer, s_pool.peer, sizeof(poll->peer));
-            memset(&s_pool, 0, sizeof(s_pool));
-        }
+    http_pool_prune_locked(client_now_ms(), stale);
+    int idx = http_pool_match_locked(poll->host, poll->port);
+    if (idx >= 0) {
+        client = s_pool[idx].client;
+        memcpy(poll->peer, s_pool[idx].peer, sizeof(poll->peer));
+        memset(&s_pool[idx], 0, sizeof(s_pool[idx]));
     }
     http_unlock();
-    if (stale) { esp_http_client_close(stale); esp_http_client_cleanup(stale); }
+    http_close_handles(stale, HTTP_POOL_SLOTS);
     if (!client) return NULL;
     size_t cap = strlen(poll->path) + (poll->query ? strlen(poll->query) : 0) + 96;
     char *pool_url = wr_alloc(cap);
@@ -607,7 +618,7 @@ static esp_http_client_handle_t http_pool_take(const char *url, http_poll_t *pol
 static void http_pool_put(const char *url, esp_http_client_handle_t client, http_poll_t *poll, bool ok) {
     if (!client) return;
     size_t hlen = poll ? strlen(poll->host) : 0;
-    if (!ok || !poll || !hlen || hlen >= sizeof(s_pool.host) || !http_pool_eligible(url) ||
+    if (!ok || !poll || !hlen || hlen >= sizeof(s_pool[0].host) || !http_pool_eligible(url) ||
         weread_client_cancelled() || esp_http_client_get_state(client) < HTTP_STATE_CONNECTED ||
         !esp_http_client_is_persistent_connection(client) ||
         !esp_http_client_is_complete_data_received(client)) {
@@ -618,13 +629,23 @@ static void http_pool_put(const char *url, esp_http_client_handle_t client, http
     esp_http_client_set_user_data(client, NULL);
     http_lock();
     if (s_active_http == client) s_active_http = NULL;
-    esp_http_client_handle_t evicted = s_pool.client;
-    memset(&s_pool, 0, sizeof(s_pool));
-    s_pool.client = client;
-    memcpy(s_pool.host, poll->host, hlen + 1);
-    memcpy(s_pool.peer, poll->peer, sizeof(s_pool.peer));
-    s_pool.port = poll->port;
-    s_pool.last_used_ms = client_now_ms();
+    int hit = http_pool_match_locked(poll->host, poll->port);
+    size_t pick = 0;
+    if (hit >= 0) {
+        pick = (size_t)hit;
+    } else {
+        for (size_t i = 0; i < HTTP_POOL_SLOTS; ++i) {
+            if (!s_pool[i].client) { pick = i; break; }
+            if (s_pool[i].last_used_ms < s_pool[pick].last_used_ms) pick = i;
+        }
+    }
+    esp_http_client_handle_t evicted = s_pool[pick].client;
+    memset(&s_pool[pick], 0, sizeof(s_pool[pick]));
+    s_pool[pick].client = client;
+    memcpy(s_pool[pick].host, poll->host, hlen + 1);
+    memcpy(s_pool[pick].peer, poll->peer, sizeof(s_pool[pick].peer));
+    s_pool[pick].port = poll->port;
+    s_pool[pick].last_used_ms = client_now_ms();
     http_unlock();
     if (evicted && evicted != client) { esp_http_client_close(evicted); esp_http_client_cleanup(evicted); }
 }
@@ -744,7 +765,7 @@ static esp_err_t weread_client_dispatch_raw(
                 .crt_bundle_attach = esp_crt_bundle_attach,
                 .disable_auto_redirect = true,
                 .keep_alive_enable = true,
-                .buffer_size = 2048,
+                .buffer_size = 4096,
                 .buffer_size_tx = 2048,
                 .event_handler = login_header, .user_data = &login,
             };
@@ -790,30 +811,33 @@ static esp_err_t weread_client_dispatch_raw(
     }
     if (out_status) *out_status = esp_http_client_get_status_code(client);
     const size_t limit = 2u * 1024u * 1024u;
-    size_t used = 0, capacity = 4096;
-    char *buffer = err == ESP_OK ? wr_alloc(capacity + 1) : NULL;
+    int64_t content_len = err == ESP_OK ? esp_http_client_get_content_length(client) : -1;
+    if (err == ESP_OK && content_len > (int64_t)limit) err = ESP_ERR_INVALID_SIZE;
+    size_t used = 0;
+    size_t capacity = (err == ESP_OK && content_len > 0) ? (size_t)content_len : 4096u;
+    char *buffer = err == ESP_OK ? wr_alloc_raw(capacity + 1u) : NULL;
     if (err == ESP_OK && !buffer) err = ESP_ERR_NO_MEM;
-    if (err == ESP_OK && esp_http_client_get_content_length(client) > (int64_t)limit) err = ESP_ERR_INVALID_SIZE;
     unsigned body_chunks = 0;
     while (err == ESP_OK) {
         if (weread_client_cancelled()) { err = ESP_ERR_INVALID_STATE; break; }
         weread_client_yield_for_display(NULL, NULL);
-        char chunk[2048];
-        int n = http_poll_read(client, chunk, sizeof(chunk),poll);
+        if (used == capacity) {
+            if (capacity >= limit) { err = ESP_ERR_INVALID_SIZE; break; }
+            size_t next = capacity * 2u;
+            if (next > limit) next = limit;
+            char *larger = wr_realloc(buffer, next + 1u);
+            if (!larger) { err = ESP_ERR_NO_MEM; break; }
+            buffer = larger; capacity = next;
+        }
+        size_t avail = capacity - used;
+        int want = avail > 8192u ? 8192 : (int)avail;
+        int n = http_poll_read(client, buffer + used, want, poll);
         if (n < 0) { err = http_poll_error(poll,ESP_FAIL); break; }
         if (!n) {
             if (!esp_http_client_is_complete_data_received(client)) err = ESP_ERR_INVALID_RESPONSE;
             break;
         }
-        if ((size_t)n > limit - used) { err = ESP_ERR_INVALID_SIZE; break; }
-        if (used + (size_t)n > capacity) {
-            size_t next = capacity * 2;
-            if (next > limit) next = limit;
-            char *larger = wr_realloc(buffer, next + 1);
-            if (!larger) { err = ESP_ERR_NO_MEM; break; }
-            buffer = larger; capacity = next;
-        }
-        memcpy(buffer + used, chunk, (size_t)n); used += (size_t)n;
+        used += (size_t)n;
         if (!(body_chunks++ & 7u)) client_notify_activity();
     }
     if (err == ESP_OK) {
@@ -1189,7 +1213,8 @@ static esp_err_t download_event(esp_http_client_event_t *event) {
     return ESP_OK;
 }
 static esp_err_t download_raw(const char *url, const char *headers, FILE *file, size_t limit,
-    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info, char **redirect) {
+    weread_cancel_fn cancel, void *ctx, weread_download_info_t *info, char **redirect, bool *may_be_json) {
+    *may_be_json = false;
     http_poll_t *poll __attribute__((cleanup(wr_release)))=NULL;
     esp_err_t prepared=http_poll_prepare(url,s_polling,cancel,ctx,&poll);
     if(prepared!=ESP_OK)return prepared;
@@ -1218,7 +1243,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
             esp_http_client_config_t cfg = {.url = url, .timeout_ms = request_timeout_ms(url),
                 .crt_bundle_attach = esp_crt_bundle_attach, .disable_auto_redirect = true,
                 .keep_alive_enable = true,
-                .buffer_size = 2048, .buffer_size_tx = 2048,
+                .buffer_size = 4096, .buffer_size_tx = 2048,
                 .event_handler = download_event, .user_data = &event};
             http_poll_config(poll,&cfg);
             client = esp_http_client_init(&cfg);
@@ -1262,6 +1287,11 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
             break;
         }
         if ((size_t)n > limit - info->bytes) { err = ESP_ERR_INVALID_SIZE; break; }
+        if (!info->bytes && n > 0) {
+            int j = 0;
+            while (j < n && isspace((unsigned char)buffer[j])) ++j;
+            *may_be_json = (j == n || buffer[j] == '{' || buffer[j] == '[');
+        }
         weread_client_yield_for_display(cancel, ctx);
         if (fwrite(buffer, 1, (size_t)n, file) != (size_t)n) { err = ESP_FAIL; break; }
         info->bytes += (size_t)n;
@@ -1304,12 +1334,13 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
         if (!headers || !hdr_ok) return ESP_ERR_NO_MEM;
         char *next __attribute__((cleanup(wr_release))) = NULL;
         esp_err_t err;
+        bool may_be_json = true;
         if (s_download_transport) {
             err = s_download_transport(current, headers, file, limit, cancel, ctx, info, s_download_ctx);
             if (err == ESP_OK || info->status > 0 || info->bytes > 0) client_notify_activity();
         }
 #if defined(ESP_PLATFORM) || defined(WEREAD_USE_ESP_HTTP_CLIENT)
-        else err = download_raw(current, headers, file, limit, cancel, ctx, info, &next);
+        else err = download_raw(current, headers, file, limit, cancel, ctx, info, &next, &may_be_json);
 #else
         else err = ESP_ERR_INVALID_STATE;
 #endif
@@ -1326,7 +1357,7 @@ esp_err_t weread_client_download(const char *url, FILE *file, size_t limit,
             continue;
         }
         int code = 0;
-        if (info->bytes <= 4096 && !fseek(file, 0, SEEK_SET)) {
+        if (may_be_json && info->bytes <= 4096 && !fseek(file, 0, SEEK_SET)) {
             char *text __attribute__((cleanup(wr_release)))=wr_alloc(4097);
             if(!text)return ESP_ERR_NO_MEM;
             size_t n = fread(text, 1, 4096, file); text[n] = 0;

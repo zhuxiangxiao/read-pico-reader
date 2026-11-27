@@ -15,7 +15,7 @@
 #include <string.h>
 #include <unistd.h>
 
-static int mode, requests, renewals, web_reads;
+static int mode, requests, renewals, web_reads, fail_web_once;
 static const char *progress_response, *native_response;
 static esp_err_t transport(const char *url, const char *method, const char *headers, const char *body,
                           char **out, size_t *len, int *status, void *ctx) {
@@ -25,12 +25,17 @@ static esp_err_t transport(const char *url, const char *method, const char *head
     else if (mode == 1) return ESP_ERR_TIMEOUT;
     else if (strstr(url, "/web/book/read")) {
         assert(!strcmp(method, "POST")); ++web_reads;
-        cJSON *request = cJSON_Parse(body);
-        assert(cJSON_IsString(cJSON_GetObjectItem(request, "s")));
-        assert(cJSON_IsString(cJSON_GetObjectItem(request, "appId")));
-        assert(cJSON_IsString(cJSON_GetObjectItem(request, "b")));
-        cJSON_Delete(request);
-        response = "{\"succ\":1}";
+        if (fail_web_once) {
+            fail_web_once = 0;
+            response = "{}";
+        } else {
+            cJSON *request = cJSON_Parse(body);
+            assert(cJSON_IsString(cJSON_GetObjectItem(request, "s")));
+            assert(cJSON_IsString(cJSON_GetObjectItem(request, "appId")));
+            assert(cJSON_IsString(cJSON_GetObjectItem(request, "b")));
+            cJSON_Delete(request);
+            response = "{\"succ\":1}";
+        }
     } else if (strstr(url, "/book/read")) {
         assert(!strcmp(method, "POST"));
         cJSON *request = cJSON_Parse(body);
@@ -172,6 +177,22 @@ int main(void) {
         weread_progress_t reported={0};
         assert(weread_progress_outbox_report("test_book_101",90100,960,&reported)==ESP_OK);
         assert(renewals==renew_before && web_reads==web_before+1 && !reported.dirty && !reported.position_pending);
+        int req_before = requests; web_before = web_reads;
+        assert(weread_progress_note("test_book_101",1,1,160,36,2,1,"learned-web",970)==ESP_OK);
+        native_response="{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":150,\"progress\":35}]}";
+        assert(weread_progress_outbox_report("test_book_101",90200,980,&reported)==ESP_OK);
+        assert(requests==req_before+2 && web_reads==web_before+1 && !reported.dirty);
+        fail_web_once = 1; mode = 0; req_before = requests; web_before = web_reads;
+        assert(weread_progress_note("test_book_101",1,1,170,37,2,1,"fallback-after-web-fail",990)==ESP_OK);
+        native_response="{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":160,\"progress\":36}]}";
+        assert(weread_progress_outbox_report("test_book_101",90300,1000,&reported)==ESP_OK);
+        assert(requests==req_before+3 && web_reads==web_before+1 && !reported.dirty);
+        mode=4; weread_progress_outbox_reset();
+        assert(weread_progress_note("test_book_101",1,1,180,38,2,1,"reset-learned-web",1010)==ESP_OK);
+        native_response="{\"books\":[{\"bookId\":\"test_book_101\",\"bookVersion\":0}],\"bookProgress\":[{\"bookId\":\"test_book_101\",\"chapterUid\":1,\"chapterIdx\":1,\"chapterOffset\":170,\"progress\":37}]}";
+        req_before = requests; web_before = web_reads;
+        assert(weread_progress_outbox_report("test_book_101",90400,1020,&reported)==ESP_OK);
+        assert(requests==req_before+3 && web_reads==web_before+1 && !reported.dirty);
         mode=0; native_response=NULL;
     }
     strcpy(session.vid, "999"); assert(weread_auth_save_session(&session) == ESP_OK && weread_auth_load_session(&session) == ESP_OK);

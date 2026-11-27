@@ -26,7 +26,7 @@ for uid in (11,27,50):
     (out/f'{uid}-v102.zip').write_bytes(fixture['_make_zipcrypto_zip'](data,b'test_password_123'))
 large=out/'long';large.mkdir(exist_ok=True)
 data={'info.txt':json.dumps({'bookId':'window_book','bookVersion':100,'chapters':[{'chapterUid':11,'files':['Text/main.xhtml']}]}).encode(),
-      'Text/main.xhtml':b'<html><body><p>'+b'x'*10000+b'</p></body></html>'}
+      'Text/main.xhtml':b'<html><body><p>'+b'a\xe7\x94\xb2'*6000+b'</p></body></html>'}
 (large/'11-v100.zip').write_bytes(fixture['_make_zipcrypto_zip'](data,b'test_password_123'))
 sources=['tools/test_weread_runtime_save.c','main/book/book_weread_crypto.c','main/book/book_source_weread.c','main/book/html_text.c',
          *[f'main/weread/weread_{n}.c' for n in ('runtime','chapter','position','progress','shelf','toc','store','auth','client')],'tools/weread_stubs/cJSON.c']

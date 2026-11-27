@@ -270,10 +270,17 @@ esp_err_t book_chapter_image(size_t chapter, const char *src, uint8_t **data, si
 
 esp_err_t book_chapter_image_dimensions(size_t chapter, const char *src, unsigned *width, unsigned *height) {
     if (book_weread_is_open()) {
-        uint8_t *data = NULL; size_t len = 0; bool png = false;
-        esp_err_t err = book_weread_image(chapter, src, &data, &len, &png);
-        if (err == ESP_OK && !book_image_dimensions(data, len, png, width, height)) err = ESP_ERR_NOT_SUPPORTED;
-        free(data); return err;
+        static const size_t kProbes[] = {64u, 4096u, 65536u, 0u};
+        for (size_t p = 0; p < sizeof(kProbes) / sizeof(kProbes[0]); ++p) {
+            uint8_t *data = NULL; size_t len = 0, total = 0; bool png = false;
+            esp_err_t err = book_weread_image_prefix(chapter, src, kProbes[p], &data, &len, &png, &total);
+            if (err != ESP_OK) return err;
+            bool ok = book_image_dimensions(data, len, png, width, height);
+            free(data);
+            if (ok) return ESP_OK;
+            if (!kProbes[p] || len >= total) return ESP_ERR_NOT_SUPPORTED;
+        }
+        return ESP_ERR_NOT_SUPPORTED;
     }
     return s_epub ? book_epub_image_dimensions(s_epub, chapter, src, width, height) : ESP_ERR_NOT_SUPPORTED;
 }

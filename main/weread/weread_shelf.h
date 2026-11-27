@@ -44,6 +44,9 @@ esp_err_t weread_shelf_set_version(const char *id,uint32_t version);
 /// 更新已加载书架中单本书的本地缓存章节数与总章节数并原子落盘。
 /// Update local cached/total chapter counts for one book in the loaded shelf and persist atomically.
 esp_err_t weread_shelf_set_chapter_counts(const char *book_id, uint16_t cached, uint16_t total);
+bool weread_shelf_get_chapter_counts(const char *book_id, uint16_t *cached, uint16_t *total);
+esp_err_t weread_shelf_set_chapter_counts_mem(const char *book_id, uint16_t cached, uint16_t total, bool *changed);
+esp_err_t weread_shelf_flush_counts(void);
 uint64_t weread_shelf_synckey(void);
 bool weread_shelf_cache_fresh(uint64_t now_seconds);
 uint64_t weread_cover_key(const char *book_id,const char *raw_url);

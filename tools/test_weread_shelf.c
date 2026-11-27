@@ -338,6 +338,29 @@ int main(void) {
     assert(!strcmp(url, "https://cdn.qq.com/s_x"));
     weread_cover_retry_result(&retry, 200, 65101); assert(!retry.failures && !retry.original);
     test_chapter_counts_and_expired_shelf();
+    {
+        char tpath[512];
+        assert(wr_cache_path("A", "chapters.json", tpath, sizeof(tpath)) == ESP_OK);
+        const char *unsorted = "{\"vid\":\"123\",\"bookId\":\"A\",\"synckey\":1,\"updateTime\":1,\"bookVersion\":1,\"chapters\":["
+            "{\"chapterUid\":30,\"chapterIdx\":3,\"title\":\"c3\"},"
+            "{\"chapterUid\":10,\"chapterIdx\":1,\"title\":\"c1\"},"
+            "{\"chapterUid\":20,\"chapterIdx\":2,\"title\":\"c2\"}]}";
+        cJSON *uj = cJSON_Parse(unsorted);
+        assert(uj && wr_write_json(tpath, uj) == ESP_OK);
+        cJSON_Delete(uj);
+        weread_toc_t utoc = {0};
+        assert(weread_toc_load("A", &utoc) == ESP_OK && utoc.count == 3);
+        assert(utoc.chapters[0].uid == 10 && utoc.chapters[1].uid == 20 && utoc.chapters[2].uid == 30);
+        weread_toc_free(&utoc);
+        const char *dup = "{\"vid\":\"123\",\"bookId\":\"A\",\"synckey\":1,\"updateTime\":1,\"bookVersion\":1,\"chapters\":["
+            "{\"chapterUid\":30,\"chapterIdx\":1,\"title\":\"c1\"},"
+            "{\"chapterUid\":10,\"chapterIdx\":2,\"title\":\"c2\"},"
+            "{\"chapterUid\":30,\"chapterIdx\":3,\"title\":\"c3\"}]}";
+        cJSON *dj = cJSON_Parse(dup);
+        assert(dj && wr_write_json(tpath, dj) == ESP_OK);
+        cJSON_Delete(dj);
+        assert(weread_toc_load("A", &utoc) == ESP_ERR_INVALID_RESPONSE);
+    }
     weread_shelf_clear(); weread_auth_clear_session(); weread_client_set_transport(NULL, NULL);
     puts("WeRead shelf/TOC: transaction, batching, rollback, offline, isolation and cover tests passed.");
     return 0;

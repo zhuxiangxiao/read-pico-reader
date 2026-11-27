@@ -21,8 +21,8 @@ def function(path,name):
         p+=1
     return s[start:p]+'\n'
 source=(root/'main/book/book_source_weread.c').read_text()
-state=re.search(r'^static struct .* s_css;',source,re.M).group(0)
-(out/'css.inc').write_text(state+'\n'+''.join(function(Path('main/book/book_source_weread.c'),n) for n in ['clear_css','collect_css','chapter_css']))
+state=re.search(r'^typedef struct .* css_slot_t;\nstatic struct .* s_css;',source,re.M).group(0)
+(out/'css.inc').write_text(state+'\n'+''.join(function(Path('main/book/book_source_weread.c'),n) for n in ['clear_css','collect_css','css_slot_load','chapter_css']))
 (out/'shelf.inc').write_text(''.join(function(Path('main/weread/weread_store.c'),n) for n in ['wr_string','wr_uint','wr_valid_id','wr_copy'])+''.join(function(Path('main/weread/weread_shelf.c'),n) for n in ['books','item_id','find','number','weread_shelf_set_version']))
 (out/'test.c').write_text(r'''
 #include "weread_store.h"
@@ -81,7 +81,7 @@ int main(void){
     char temp[]="/tmp/weread-css-regression-XXXXXX";assert(mkdtemp(temp));snprintf(root_dir,sizeof(root_dir),"%s",temp);
     char path[600];snprintf(path,sizeof(path),"%s/main.css",temp);FILE*f=fopen(path,"wb");assert(f);assert(fputs("p {text-align:right}",f)>=0);assert(!fclose(f));
     for(unsigned kind=1;kind<=9;kind++){
-        clear_css();fault=kind;dir_calls=0;size_t used=123;assert(chapter_css(0,NULL,&used)==NULL);assert(!s_css.roots&&!s_css.text);
+        clear_css();fault=kind;dir_calls=0;size_t used=123;assert(chapter_css(0,NULL,&used)==NULL);assert(!s_css.res.root&&!s_css.res.text&&!s_css.ch.root&&!s_css.ch.text&&!s_css.merged);
         dir_calls=0;const char*css=chapter_css(0,NULL,&used);assert(css&&used&&strstr(css,"text-align:right")&&dir_calls);
         dir_calls=0;assert(chapter_css(0,NULL,&used)==css&&!dir_calls);
     }

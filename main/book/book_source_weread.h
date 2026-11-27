@@ -38,6 +38,7 @@ bool book_weread_id_in_use(const char *id);
 /// 当前与候选的精确映射表常驻字节，不包含正文/目录。/ Resident exact-map bytes across the active and candidate slots, excluding body/TOC storage.
 size_t book_weread_map_cache_bytes(void);
 esp_err_t book_weread_image(size_t index, const char *src, uint8_t **data, size_t *len, bool *png);
+esp_err_t book_weread_image_prefix(size_t index, const char *src, size_t max_bytes, uint8_t **data, size_t *len, bool *png, size_t *total_size);
 uint32_t book_weread_total(void);
 uint32_t book_weread_offset(size_t index);
 uint32_t book_weread_uid(size_t index);

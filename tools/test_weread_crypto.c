@@ -184,6 +184,27 @@ static void test_gilbert_vernam(void) {
     book_weread_gilbert_vernam(buf, msg_len, (const uint8_t *)key, key_len, 1024);
     assert(memcmp(buf, plain_msg, msg_len) == 0);
 
+    // Bit-exact verification across key_len {1,2,3,7,16,32} and varied offsets
+    static const size_t key_lens[] = {1, 2, 3, 7, 16, 32};
+    static const size_t starts[] = {0, 1, 2, 3, 15, 16, 17, 63, 64, 1023};
+    uint8_t kbuf[32], orig[128], got[128], ref[128];
+    for (size_t i = 0; i < sizeof(kbuf); ++i) kbuf[i] = (uint8_t)(i * 37u + 11u);
+    for (size_t i = 0; i < sizeof(orig); ++i) orig[i] = (uint8_t)(i * 13u + 5u);
+    for (size_t ki = 0; ki < sizeof(key_lens)/sizeof(*key_lens); ++ki) {
+        size_t kl = key_lens[ki];
+        for (size_t si = 0; si < sizeof(starts)/sizeof(*starts); ++si) {
+            size_t st = starts[si];
+            memcpy(got, orig, sizeof(orig));
+            memcpy(ref, orig, sizeof(orig));
+            for (size_t i = 0; i < sizeof(ref); ++i) {
+                size_t pos = st + i;
+                ref[i] ^= kbuf[(pos + pos / kl) % kl];
+            }
+            book_weread_gilbert_vernam(got, sizeof(got), kbuf, kl, st);
+            assert(memcmp(got, ref, sizeof(got)) == 0);
+        }
+    }
+
     // Zero length and NULL safety
     book_weread_gilbert_vernam(buf, 0, (const uint8_t *)key, key_len, 0);
     book_weread_gilbert_vernam(NULL, 10, (const uint8_t *)key, key_len, 0);

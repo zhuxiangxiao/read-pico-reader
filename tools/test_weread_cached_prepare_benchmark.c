@@ -78,7 +78,14 @@ int main(int argc,char **argv){
         uint32_t expected=0;assert(book_weread_map(0,true,7,&expected)==ESP_OK);
         delay_report=true;unsigned before_reports=reports;
         weread_reader_tick("weread://bench_book",0,7,10,text.utf8+7,2000,true);
+#if defined(WEREAD_BENCH_CURRENT)
+        // Current builds verify the next-chapter cache bit asynchronously before issuing urgent reports.
         weread_reader_tick("weread://bench_book",0,7,10,text.utf8+7,2001,true);
+        settle();
+        weread_reader_tick("weread://bench_book",0,7,10,text.utf8+7,2001,true);
+#else
+        weread_reader_tick("weread://bench_book",0,7,10,text.utf8+7,2001,true);
+#endif
         uint64_t until=micros()+5000000;while(!atomic_load(&entered)){assert(micros()<until);usleep(1000);}
         uint64_t begin=micros();esp_err_t err=weread_reader_prepare("weread://bench_book",1);uint64_t elapsed=micros()-begin;
         settle();delay_report=false;weread_progress_t durable;
