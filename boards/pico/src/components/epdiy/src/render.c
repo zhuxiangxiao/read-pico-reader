@@ -12,6 +12,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <stdalign.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,6 +43,10 @@ const int clear_cycle_time = 15;
     } while (0)
 
 static RenderContext_t render_context;
+static atomic_int s_scan_busy_depth;
+void epd_display_scan_begin(void) { atomic_fetch_add_explicit(&s_scan_busy_depth, 1, memory_order_acq_rel); }
+void epd_display_scan_end(void) { atomic_fetch_sub_explicit(&s_scan_busy_depth, 1, memory_order_acq_rel); }
+bool epd_display_scan_active(void) { return atomic_load_explicit(&s_scan_busy_depth, memory_order_acquire) > 0; }
 static const uint8_t* const* s_phase_luts;
 static const int8_t* s_line_phase;
 static const int* s_col_band_x0;
@@ -338,7 +343,9 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
         render_context.line_mask, drawn_columns, render_context.display_width / 4
     );
 
+    epd_display_scan_begin();
     lcd_do_update(&render_context);
+    epd_display_scan_end();
     render_context.phase_luts = NULL;
     render_context.line_phase = NULL;
     render_context.col_band_x0 = NULL;

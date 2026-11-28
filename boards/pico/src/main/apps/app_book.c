@@ -4823,7 +4823,14 @@ static void render(app_ctx_t* ctx, uint8_t* fb) {
             unlock_draw();
             return;
         }
-        draw_reader(fb, s_page);
+        if (!s_toolbar && !s_clear_confirm && !s_zoom_active &&
+            book_layout_page_image_count(s_page) == 0 && !app_settings_book_background_path()[0] &&
+            reader_keep_holds(&s_keep_cur, (int)s_page)) {
+            memcpy(fb, s_keep_cur.fb, fb_bytes());
+            draw_reader_outer(fb, s_page);
+        } else {
+            draw_reader(fb, s_page);
+        }
         unlock_draw();
         return;
     }
@@ -10487,7 +10494,8 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
     // 低残影模式只在阅读正文期间保持高压轨；离开阅读立即恢复原来的空闲断电。
     // Low-ghost holds the rails only while the reader is visible; leaving restores idle power-off.
     display_set_rail_hold(s_view == READING && s_text && app_settings_low_ghost());
-    app_redraw_t chapter=wr_chapter_tick(ctx);
+    app_redraw_t chapter = (!s_wr_jump.pending && app_touch_input_pending(ctx))
+        ? APP_REDRAW_NONE : wr_chapter_tick(ctx);
     if(chapter!=APP_REDRAW_NONE){
         if(s_view==TOC&&chapter==APP_REDRAW_PAGE){
             set_reader_view(TOC);

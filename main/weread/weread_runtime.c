@@ -1553,9 +1553,10 @@ static void consume_reader_result(void) {
         if (s_result.error == ESP_ERR_INVALID_STATE && s_reader.active && s_reader.retry &&
             weread_auth_is_authenticated() && s_result.local.chapter_uid &&
             !s_result.local.sync_conflict && s_result.local.retry_after == 0) {
-            s_reader.pause_report_at = s_reader.last_tick;
-            s_reader.report_at = s_reader.last_tick;
-            s_reader.urgent = true;
+            if (s_reader.pause_report_at > s_reader.last_tick + 5000u)
+                s_reader.pause_report_at = s_reader.last_tick + 5000u;
+            if (s_reader.report_at > s_reader.last_tick + 5000u)
+                s_reader.report_at = s_reader.last_tick + 5000u;
         }
     }
     if (s_result.job == WR_JOB_CLOUD_SYNC) {
@@ -2340,12 +2341,15 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry&&weread_auth_is_authenticated()){
         (void)weread_runtime_start(WR_JOB_PREFETCH,s_reader.id,"1");return;
     }
+    uint64_t fg_ms = atomic_load(&s_fg_input_ms);
+    uint64_t sys_now = fg_ms ? now_ms() : 0;
+    bool fg_cooling = fg_ms && sys_now >= fg_ms && sys_now - fg_ms < 800;
     bool pause_report = now >= s_reader.last_move && now - s_reader.last_move >= 8000 &&
         now >= s_reader.pause_report_at && network_online_ready() && weread_auth_is_authenticated();
     bool urgent_report = now >= s_reader.last_move && now - s_reader.last_move >= 1000 &&
         now >= s_reader.report_at && weread_auth_is_authenticated() &&
         (s_reader.urgent || s_reader.durable.pending_pages >= 10 || now >= s_reader.report_due);
-    if(s_reader.retry&&(pause_report||urgent_report)){
+    if(s_reader.retry&&!fg_cooling&&(pause_report||urgent_report)){
         if(weread_runtime_start(WR_JOB_NOTE,s_reader.id,NULL)){
             s_reader.report_at=now+15000;
             s_reader.pause_report_at=now+15000;
@@ -2356,11 +2360,7 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
     // 手动缓存不等翻页静止1秒，但前台输入冷却仍生效；关闭只停止新的派发，已启动章节照常完成。
     // Manual caching skips the1s idle-after-move window while foreground input still pauses it; turning it off only stops new dispatches.
     if(!s_reader.cache_forward&&now-s_reader.last_move<1000)return;
-    uint64_t fg_ms = atomic_load(&s_fg_input_ms);
-    if (fg_ms) {
-        uint64_t sys_now = now_ms();
-        if (sys_now >= fg_ms && sys_now - fg_ms < 800) return;
-    }
+    if (fg_cooling) return;
     if(!s_reader.cover_warmed){s_reader.cover_warmed=weread_runtime_start(WR_JOB_COVER,s_reader.id,"warm");return;}
     if(!s_reader.prefetch_done&&!s_reader.storage_blocked&&s_reader.prefetch_failures<3&&now>=s_reader.prefetch_retry){
         // 显式关闭只抑制新的整本向后补齐；目录扫描、自动下一章预读与在飞章节都不受影响。

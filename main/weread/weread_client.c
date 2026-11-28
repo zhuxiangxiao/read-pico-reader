@@ -512,7 +512,7 @@ static uint64_t client_now_ms(void) {
 }
 #if defined(ESP_PLATFORM)
 #define HTTP_POOL_SLOTS 2u
-#define HTTP_POOL_IDLE_MS 25000u
+#define HTTP_POOL_IDLE_MS 40000u
 typedef struct {
     esp_http_client_handle_t client;
     char host[128];

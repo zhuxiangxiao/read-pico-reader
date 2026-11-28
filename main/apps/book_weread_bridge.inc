@@ -36,6 +36,10 @@ static void wr_reader_move(void){
         s_wr_undo_top_erase=true;
         if(mode==WR_UNDO_CLOUD_JUMP)weread_reader_commit_cloud_jump(s_path,false);
     }
+    if(s_wr_sync_pill_shown&&weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_IDLE&&
+        !strcmp(s_reader_notice,"正在同步云端进度…")){
+        s_reader_notice[0]=0;s_reader_notice_until=0;wr_sync_ui_reset();
+    }
     size_t offset=reader_page_offset(s_page);if(offset>s_text_len)offset=s_text_len;
     weread_reader_navigated_version(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,s_wr_content_version);
 }
