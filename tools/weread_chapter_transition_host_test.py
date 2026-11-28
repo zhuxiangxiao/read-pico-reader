@@ -28,6 +28,13 @@ static bool busy,done,save_fail,load_fail,alloc_fail,s_reader_text_frame=true,ca
 static bool stage_ready;static char stage_text[64];static EpdRect s_area;static int s_mode,renders;
 static int stage_kind;static uint64_t stage_bytes;
 typedef enum {WEREAD_STAGE_NONE=0,WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE,WEREAD_STAGE_RETRY} weread_stage_t;
+typedef enum {WEREAD_CLOUD_SYNC_IDLE=0,WEREAD_CLOUD_SYNC_ACTIVE,WEREAD_CLOUD_SYNC_EXPIRED,WEREAD_CLOUD_SYNC_TIMEOUT,WEREAD_CLOUD_SYNC_OFFLINE,WEREAD_CLOUD_SYNC_VERSION,WEREAD_CLOUD_SYNC_FAILED} weread_cloud_sync_ui_state_t;
+static weread_cloud_sync_ui_state_t mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_IDLE;
+static bool s_reader_fullscreen=false,mock_immersive=false,s_wr_sync_pill_shown=false;
+static weread_cloud_sync_ui_state_t s_wr_sync_pill_last=WEREAD_CLOUD_SYNC_IDLE;
+static void wr_sync_ui_reset(void){s_wr_sync_pill_last=WEREAD_CLOUD_SYNC_IDLE;s_wr_sync_pill_shown=false;}
+static weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void){return mock_cloud_sync_ui;}
+static bool app_settings_reader_immersive(void){return mock_immersive;}
 static bool weread_reader_stage(weread_stage_t *stage,uint64_t *bytes){if(!stage_ready)return false;*stage=(weread_stage_t)stage_kind;if(bytes)*bytes=stage_bytes;return true;}
 static bool weread_reader_stage_text(char *out,size_t cap){if(!stage_ready)return false;snprintf(out,cap,"%s",stage_text);return true;}
 static void render(app_ctx_t *ctx,uint8_t *fb){(void)ctx;(void)fb;++renders;}
@@ -44,6 +51,7 @@ static void *wr_alloc(size_t bytes){return alloc_fail?NULL:calloc(1,bytes);}
 static void copy_text(char *to,size_t cap,const char *from){snprintf(to,cap,"%s",from);}
 static bool weread_runtime_busy(void){return busy;}
 static bool weread_reader_cached(const char *uri,size_t ch){(void)uri;(void)ch;return cached_flag;}
+static bool book_path_is_weread(const char *p){return p&&strncmp(p,"weread://",9)==0;}
 static bool weread_runtime_prefetch_active(const char *id,uint32_t uid){(void)id;(void)uid;return prefetch_busy;}
 static void weread_runtime_prefetch_adopt(uint32_t uid){adopted_uid=uid;}
 static bool weread_reader_poll_cloud_jump(const char *uri,size_t *ch,uint32_t *off){(void)uri;if(!cloud_jump_ready)return false;*ch=cloud_jump_ch;*off=cloud_jump_off;return true;}
@@ -209,6 +217,22 @@ int main(void){
  assert(s_wr_jump.pending&&!s_chapter_jump_undo.valid);
  wr_chapter_cancel();
  complete(ESP_ERR_INVALID_STATE);
+ // Immersive cloud-sync pill & error/expired toasts
+ s_reader_notice[0]=0;s_reader_notice_until=0;wr_sync_ui_reset();
+ s_reader_fullscreen=false;mock_immersive=false;mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_ACTIVE;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE&&s_reader_notice[0]==0);
+ s_reader_fullscreen=true;mock_immersive=true;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&!strcmp(s_reader_notice,"正在同步云端进度…"));
+ mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_IDLE;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&s_reader_notice[0]==0);
+ mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_ACTIVE;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&!strcmp(s_reader_notice,"正在同步云端进度…"));
+ mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_TIMEOUT;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&!strcmp(s_reader_notice,"云端同步超时")&&s_reader_notice_until==ctx.now_ms+3000);
+ s_reader_notice[0]=0;s_reader_notice_until=0;s_reader_fullscreen=false;mock_immersive=false;
+ mock_cloud_sync_ui=WEREAD_CLOUD_SYNC_EXPIRED;
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_AREA&&!strcmp(s_reader_notice,"登录已过期，暂无法同步"));
+ assert(wr_chapter_tick(&ctx)==APP_REDRAW_NONE);
  puts("PASS: production chapter controller adopts prefetch, applies cloud jumps, coalesces targets, and cancels safely");
 }
 '''

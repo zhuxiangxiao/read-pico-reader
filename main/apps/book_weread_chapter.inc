@@ -94,7 +94,47 @@ static app_redraw_t wr_chapter_tick(app_ctx_t *ctx){
     if(!s_wr_jump.pending){
         if(ctx->request_app||ctx->consumed||(ctx->touch&&ctx->touch->touched)||s_view!=READING||!s_text||s_reader_panel!=READER_PANEL_NONE||s_clear_confirm)return APP_REDRAW_NONE;
         size_t chapter=0;uint32_t offset=0;
-        if(!weread_reader_poll_cloud_jump(s_path,&chapter,&offset))return APP_REDRAW_NONE;
+        if(!weread_reader_poll_cloud_jump(s_path,&chapter,&offset)){
+            if(!book_path_is_weread(s_path)||s_chapter_jump_undo.valid)return APP_REDRAW_NONE;
+            weread_cloud_sync_ui_state_t sync=weread_reader_cloud_sync_state();
+            bool immersive=s_reader_fullscreen&&app_settings_reader_immersive();
+            if(sync==WEREAD_CLOUD_SYNC_ACTIVE){
+                if(immersive&&(!s_wr_sync_pill_shown||s_wr_sync_pill_last!=WEREAD_CLOUD_SYNC_ACTIVE)){
+                    copy_text(s_reader_notice,sizeof(s_reader_notice),"正在同步云端进度…");
+                    s_reader_notice_until=INT64_MAX;
+                    s_wr_sync_pill_shown=true;s_wr_sync_pill_last=WEREAD_CLOUD_SYNC_ACTIVE;
+                    if(ctx->fb){render(ctx,ctx->fb);s_area=(EpdRect){208,150,268,68};s_mode=MODE_GL16;return APP_REDRAW_AREA;}
+                }
+            }else if(sync!=WEREAD_CLOUD_SYNC_IDLE){
+                const char *msg=NULL;
+                if(sync==WEREAD_CLOUD_SYNC_EXPIRED&&s_wr_sync_pill_last!=WEREAD_CLOUD_SYNC_EXPIRED){
+                    msg="登录已过期，暂无法同步";
+                }else if((immersive||s_wr_sync_pill_shown)&&sync!=s_wr_sync_pill_last){
+                    if(sync==WEREAD_CLOUD_SYNC_TIMEOUT)msg="云端同步超时";
+                    else if(sync==WEREAD_CLOUD_SYNC_OFFLINE)msg="网络不可用";
+                    else if(sync==WEREAD_CLOUD_SYNC_VERSION)msg="书目已更新，请重开";
+                    else if(sync==WEREAD_CLOUD_SYNC_FAILED)msg="云端进度同步失败";
+                }
+                s_wr_sync_pill_shown=false;s_wr_sync_pill_last=sync;
+                if(msg){
+                    copy_text(s_reader_notice,sizeof(s_reader_notice),msg);
+                    s_reader_notice_until=ctx->now_ms+3000;
+                    if(ctx->fb){render(ctx,ctx->fb);s_area=(EpdRect){208,150,268,68};s_mode=MODE_GL16;return APP_REDRAW_AREA;}
+                }else if(!strcmp(s_reader_notice,"正在同步云端进度…")){
+                    s_reader_notice[0]=0;s_reader_notice_until=0;
+                    if(ctx->fb){render(ctx,ctx->fb);s_area=(EpdRect){208,150,268,68};s_mode=MODE_GL16;return APP_REDRAW_AREA;}
+                }
+            }else if(s_wr_sync_pill_shown||s_wr_sync_pill_last!=WEREAD_CLOUD_SYNC_IDLE){
+                bool was_shown=s_wr_sync_pill_shown;
+                wr_sync_ui_reset();
+                if(was_shown&&!strcmp(s_reader_notice,"正在同步云端进度…")){
+                    s_reader_notice[0]=0;s_reader_notice_until=0;
+                    if(ctx->fb){render(ctx,ctx->fb);s_area=(EpdRect){208,150,268,68};s_mode=MODE_GL16;return APP_REDRAW_AREA;}
+                }
+            }
+            return APP_REDRAW_NONE;
+        }
+        wr_sync_ui_reset();
         if(weread_runtime_reader_has_turned(s_path)){
             if(weread_runtime_cloud_jump_rebase(s_path)!=ESP_OK)return APP_REDRAW_NONE;
             s_chapter_jump_undo.valid=true;

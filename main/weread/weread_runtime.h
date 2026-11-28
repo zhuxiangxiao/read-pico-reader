@@ -101,7 +101,17 @@ bool weread_runtime_reader_has_turned(const char *book_id);
 esp_err_t weread_runtime_cloud_jump_rebase(const char *book_id);
 /// 本地持久化先行；失败不消耗内存中的待保存导航。/ Persist locally without losing a failed navigation sample.
 esp_err_t weread_reader_save(uint64_t now_ms);
+typedef enum {
+    WEREAD_CLOUD_SYNC_IDLE = 0,
+    WEREAD_CLOUD_SYNC_ACTIVE,
+    WEREAD_CLOUD_SYNC_EXPIRED,
+    WEREAD_CLOUD_SYNC_TIMEOUT,
+    WEREAD_CLOUD_SYNC_OFFLINE,
+    WEREAD_CLOUD_SYNC_VERSION,
+    WEREAD_CLOUD_SYNC_FAILED,
+} weread_cloud_sync_ui_state_t;
 weread_progress_state_t weread_reader_state(void);
+weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void);
 bool weread_reader_save_failed(void);
 bool weread_reader_pending_save(void);
 /// 已保存在设备应急账本，尚未确认云端同步。/ Durable in the device rescue journal, without a cloud acknowledgement.
@@ -111,6 +121,7 @@ void weread_reader_cached_progress(unsigned *cached, unsigned *total);
 bool weread_reader_storage_blocked(void);
 bool weread_reader_caching(void);
 void weread_reader_pause_bg(void);
+void weread_reader_pause_bg_join(uint32_t timeout_ms);
 esp_err_t weread_reader_prepare_open(const char *uri);
 bool weread_reader_open_ready(const char *uri);
 void weread_reader_begin(const char *uri, uint64_t now_ms);
@@ -123,6 +134,9 @@ esp_err_t weread_reader_resume_chapter(const char *uri, size_t *chapter, uint32_
 void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsigned percent,
     const char *summary, uint64_t now_ms, bool active);
 void weread_reader_flush(uint64_t now_ms, bool stop_network);
+/// 锁屏/关机前有界冲刷：先取消无关后台任务，若当前书有待同步进度且已配网则拉起上传（限时 timeout_ms）。
+/// Bounded lock/poweroff flush: pause unrelated background work and attempt to upload dirty progress when Wi-Fi is configured.
+bool weread_reader_flush_for_lock(uint64_t now_ms, uint32_t timeout_ms);
 /// 浅睡唤醒后恢复阅读态位图/实时坐标并重新触发云端进度检查（零阻塞、零磁盘 IO）。
 /// Restore reader cache bitmap/live position after light-sleep wake and re-arm cloud progress check (non-blocking, zero disk IO).
 void weread_reader_wake(uint64_t now_ms);

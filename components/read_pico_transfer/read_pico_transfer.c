@@ -2243,13 +2243,15 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
     // internal RAM; under rc111 a network-only session (router connect/time sync/cloud) must also
     // release it when memory is tight, otherwise WiFi static RX buffers fail to init and the UI
     // reports "connection start failed". Keep the old coexistence behaviour when RAM is ample.
+    bool ble_forced = false;
+retry_acquire_ble: ;
     const bool low_internal =
         heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 100u * 1024u ||
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 24u * 1024u ||
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA) < 16u * 1024u;
-    if (!cfg->network_only || low_internal) {
-        if (cfg->network_only) ESP_LOGW("transfer", "wifi network-only: release BLE for memory (internal free=%u)",
-                                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (!cfg->network_only || low_internal || ble_forced) {
+        if (cfg->network_only) ESP_LOGW("transfer", "wifi network-only: release BLE for memory (internal free=%u forced=%d)",
+                                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), (int)ble_forced);
         const esp_err_t reserve=ble_pt_network_acquire();
         if(reserve!=ESP_OK){release_config();return reserve;}
         s_ble_network_reserved=true;
@@ -2339,6 +2341,13 @@ esp_err_t read_pico_transfer_start(const read_pico_transfer_cfg_t *cfg) {
         (void)esp_wifi_deinit();
         vTaskDelay(pdMS_TO_TICKS(250));
         err = esp_wifi_init(&init);
+    }
+    if (err == ESP_ERR_NO_MEM && cfg->network_only && !s_ble_network_reserved && !ble_forced) {
+        ESP_LOGW("transfer", "wifi init NO_MEM with BLE active; releasing BLE and retrying");
+        clear_secret(&wifi, sizeof(wifi)); clear_secret(&saved, sizeof(saved));
+        read_pico_transfer_stop();
+        ble_forced = true;
+        goto retry_acquire_ble;
     }
     if (err != ESP_OK) goto fail;
     s_wifi = true;

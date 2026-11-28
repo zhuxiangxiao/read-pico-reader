@@ -178,6 +178,9 @@ int main(void){
  // An active ERROR (wifi_enabled=true) is not cleared by connect_network and propagates its error.
  reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_ERROR;mock_last_error=ESP_ERR_NO_MEM;mock_wifi_enabled=true;
  assert(connect_network()==ESP_ERR_NO_MEM&&!mock_stop_calls&&!mock_start_calls&&!s_owns_network);
+ // 建连超时残留的 ERROR(ESP_ERR_TIMEOUT) 即使 wifi_enabled=true 也应清理并允许重新建连。
+ reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_ERROR;mock_last_error=ESP_ERR_TIMEOUT;mock_wifi_enabled=true;mock_start_error=ESP_OK;
+ assert(connect_network()==ESP_OK&&mock_stop_calls==1&&mock_start_calls==1&&started&&s_owns_network);
  // 本次启动后在轮询期进入 ERROR(ESP_ERR_TIMEOUT) 时清理会话并标记建连超时。
  // If a started session later enters ERROR(ESP_ERR_TIMEOUT), clean up ownership and mark s_connect_timed_out.
  reset();mock_use_custom=true;wall=1800000000;mock_state=READ_PICO_TRANSFER_STOPPED;poll_error_on_started=ESP_ERR_TIMEOUT;

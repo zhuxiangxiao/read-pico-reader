@@ -512,7 +512,7 @@ static uint64_t client_now_ms(void) {
 }
 #if defined(ESP_PLATFORM)
 #define HTTP_POOL_SLOTS 2u
-#define HTTP_POOL_IDLE_MS 45000u
+#define HTTP_POOL_IDLE_MS 25000u
 typedef struct {
     esp_http_client_handle_t client;
     char host[128];
@@ -803,7 +803,7 @@ static esp_err_t weread_client_dispatch_raw(
         }
         phase[4]=client_now_ms();
 #if defined(ESP_PLATFORM)
-        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !weread_client_cancelled()) {
+        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && !weread_client_cancelled()) {
             http_cleanup(client); client = NULL; reused = false; continue;
         }
 #endif
@@ -1112,8 +1112,10 @@ static esp_err_t request_captured(const char *url, const char *method,
         bool renew_timeout = allow_timeout_renew && session_code == WEREAD_AUTH_ERRCODE_TIMEOUT;
         bool renew_fg_auth = fg_bound && (session_code == WEREAD_AUTH_ERRCODE_EXPIRED ||
             (allow_timeout_renew && status == 401));
+        bool renew_bg_401 = expected != NULL && allow_timeout_renew && status == 401 &&
+            session_code != WEREAD_AUTH_ERRCODE_EXPIRED;
         if (err == ESP_OK && !weread_client_cancelled() && !is_weblogin &&
-            (renew_timeout || renew_fg_auth)) {
+            (renew_timeout || renew_fg_auth || renew_bg_401)) {
             {
                 WR_GUARD;
                 if (!identity_matches(&snapshot->identity)) { free(response); return ESP_ERR_INVALID_STATE; }
@@ -1260,7 +1262,7 @@ static esp_err_t download_raw(const char *url, const char *headers, FILE *file, 
             else client_notify_activity();
         }
 #if defined(ESP_PLATFORM)
-        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && err != ESP_ERR_TIMEOUT && !(cancel && cancel(ctx))) {
+        if (reused && err != ESP_OK && err != ESP_ERR_INVALID_STATE && !(cancel && cancel(ctx))) {
             http_cleanup(client); client = NULL; reused = false; continue;
         }
 #endif

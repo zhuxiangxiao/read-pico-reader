@@ -145,7 +145,8 @@ int main(int argc,char **argv){
         weread_progress_outbox_reset();char next[64];for(unsigned i=0;i<10;++i)assert(weread_progress_outbox_next(next,sizeof(next),1700000214)!=ESP_OK);
         unsigned old_reads=reads;assert(weread_progress_outbox_report(id,90001,1700000214,&p)==ESP_ERR_TIMEOUT&&reads==old_reads);
         network_fail=false;empty_ack=true;assert(weread_progress_outbox_report(id,90002,1700000215,&p)==ESP_ERR_INVALID_RESPONSE&&p.dirty&&p.retry_count==2&&p.retry_after==1700000245);
-        empty_ack=false;assert(weread_progress_outbox_report(id,90003,1700000245,&p)==ESP_OK&&!p.dirty&&!p.retry_count);
+        old_reads=reads;assert(weread_progress_outbox_report(id,90002,1700000220,&p)==ESP_ERR_TIMEOUT&&reads==old_reads);
+        empty_ack=false;assert(weread_progress_outbox_report_ex(id,90003,1700000220,true,&p)==ESP_OK&&!p.dirty&&!p.retry_count&&reads>old_reads);
     }else if(!strcmp(argv[2],"ack-write")){
         armed=true;fail_write=1;assert(weread_progress_outbox_report(id,90000,1700000200,&p)==ESP_FAIL&&p.dirty);
         assert(weread_progress_load(id,&p)==ESP_OK&&p.dirty&&p.reading_time==5);

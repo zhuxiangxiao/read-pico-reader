@@ -67,6 +67,8 @@ void weread_progress_rescue_backend(const weread_progress_rescue_backend_t *back
 esp_err_t weread_progress_outbox_next(char *id,size_t cap,uint64_t now_seconds);
 /// 核对新鲜云端基线再补报；ACK按事务代次合并，不能清除新导航。/ Recheck the cloud baseline, then merge acknowledgements without clearing newer navigation.
 esp_err_t weread_progress_outbox_report(const char *id,uint64_t now_ms,uint64_t now_seconds,weread_progress_t *out);
+/// 允许在手动锁屏/关机前忽略退避窗口立即尝试同步。/ Optionally bypass the backoff window for explicit lock/poweroff flushes.
+esp_err_t weread_progress_outbox_report_ex(const char *id,uint64_t now_ms,uint64_t now_seconds,bool ignore_backoff,weread_progress_t *out);
 /// 账号或媒体生命周期交接后重置扫描器。/ Reset the scanner after account or media handoff.
 void weread_progress_outbox_reset(void);
 /// 只读取已接管快照，不在绘制中访问磁盘。/ Inspect an adopted snapshot without disk access while rendering.

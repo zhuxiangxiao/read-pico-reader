@@ -12,6 +12,13 @@
 #endif
 static bool s_wr_undo_top_erase __attribute__((unused));
 static uint32_t s_wr_content_version;
+static weread_cloud_sync_ui_state_t s_wr_sync_ui_prev, s_wr_sync_pill_last;
+static bool s_wr_sync_pill_shown;
+static void wr_sync_ui_reset(void) {
+    s_wr_sync_ui_prev = WEREAD_CLOUD_SYNC_IDLE;
+    s_wr_sync_pill_last = WEREAD_CLOUD_SYNC_IDLE;
+    s_wr_sync_pill_shown = false;
+}
 static bool wr_reader_text_page(void){
     return s_view==READING&&s_text&&!s_clear_confirm&&s_reader_panel==READER_PANEL_NONE&&
         s_page<book_layout_page_count()&&!book_layout_page_image_count(s_page);
@@ -42,17 +49,30 @@ static void wr_reader_sample(uint64_t now, bool active) {
     weread_progress_state_t before=weread_reader_state();
     bool failed=weread_reader_save_failed(),pending=weread_reader_pending_save(),rescued=weread_reader_rescued();
     bool space=weread_reader_storage_blocked();
+    weread_cloud_sync_ui_state_t sync_before=s_wr_sync_ui_prev;
     weread_reader_tick(s_path,s_chapter,(uint32_t)offset,percent(s_page),s_text+offset,now,active);
+    weread_cloud_sync_ui_state_t sync_now=weread_reader_cloud_sync_state();
     if(s_view==READING&&!s_toolbar&&
         (before!=weread_reader_state()||failed!=weread_reader_save_failed()||pending!=weread_reader_pending_save()||
-        rescued!=weread_reader_rescued()||space!=weread_reader_storage_blocked())){
-        s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;
+        rescued!=weread_reader_rescued()||space!=weread_reader_storage_blocked()||sync_now!=sync_before)){
+        s_wr_sync_ui_prev=sync_now;
+        if(!s_reader_fullscreen||!app_settings_reader_immersive()){
+            s_reader_footer_pending=true;s_reader_footer_due_ms=now+800;
+        }
     }
 }
 static const char *wr_reader_status(void){
     if(!book_path_is_weread(s_path))return "";
     if(weread_reader_save_failed())return "未保存 · ";
     if(weread_reader_pending_save())return "待保存 · ";
+    weread_cloud_sync_ui_state_t sync=weread_reader_cloud_sync_state();
+    s_wr_sync_ui_prev=sync;
+    if(sync==WEREAD_CLOUD_SYNC_EXPIRED)return "登录过期 · ";
+    if(sync==WEREAD_CLOUD_SYNC_ACTIVE)return "同步进度中 · ";
+    if(sync==WEREAD_CLOUD_SYNC_TIMEOUT)return "同步超时 · ";
+    if(sync==WEREAD_CLOUD_SYNC_OFFLINE)return "网络不可用 · ";
+    if(sync==WEREAD_CLOUD_SYNC_VERSION)return "书目已更新 · ";
+    if(sync==WEREAD_CLOUD_SYNC_FAILED)return "同步失败 · ";
     if(weread_reader_state()==WR_PROGRESS_CONFLICT)return "进度冲突 · ";
     if(weread_reader_rescued())return "暂存机内 · ";
     switch(weread_reader_state()){

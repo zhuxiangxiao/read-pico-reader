@@ -5802,6 +5802,7 @@ static bool commit_next_chapter(app_ctx_t *ctx, size_t chapter) {
 static void free_book(void) {
     s_chapter_display_pending = false;
     s_reader_rule_pending = false;
+    wr_sync_ui_reset();
     wr_chapter_cancel();
     if (book_path_is_weread(s_path)) weread_reader_end((uint64_t)esp_timer_get_time()/1000);
     if (s_txt_opening) {
@@ -6201,7 +6202,7 @@ static bool load_chapter(app_ctx_t* ctx, size_t chapter, size_t offset, bool las
 bool app_book_prepare_leave(app_ctx_t *ctx){
     bool reading=s_text&&book_path_is_weread(s_path);
     if(!reading&&!weread_reader_pending_save())return true;
-    wr_chapter_cancel();weread_runtime_cancel_join();
+    wr_chapter_cancel();weread_reader_pause_bg_join(1500);
     if(reading)wr_reader_sample(ctx->now_ms,false);
     if(weread_reader_save(ctx->now_ms)==ESP_OK)return true;
     copy_text(s_reader_notice,sizeof(s_reader_notice),"位置未保存，请检查存储卡后重试");
@@ -6493,7 +6494,7 @@ static bool open_requested_book(app_ctx_t* ctx) {
     uint8_t origin = s_requested_open_origin;
     s_requested_open[0] = 0;
     s_requested_open_origin = 1;
-    if (book_path_is_weread(path)) weread_runtime_load_local();
+    if (book_path_is_weread(path) && !weread_reader_open_ready(path)) weread_runtime_load_local();
     bool opened = open_book(ctx, path);
     s_requested_fullscreen = false;
     s_requested_resume_mode = false;
@@ -10674,7 +10675,11 @@ static app_redraw_t on_tick(app_ctx_t* ctx) {
 }
 static void before_lock(app_ctx_t* ctx) {
     wr_chapter_cancel();
-    if (book_path_is_weread(s_path)) weread_runtime_cancel_join();
+    if (book_path_is_weread(s_path)) {
+        wr_reader_sample(ctx->now_ms, false);
+        (void)weread_reader_flush_for_lock(ctx->now_ms, 7500);
+        weread_runtime_cancel_join();
+    }
     if(s_import_candidates&&book_import_running()){book_import_cancel();copy_text(s_batch_message,sizeof(s_batch_message),"导入已取消，原书架已保留");}
     cancel_shelf_open();
     book_weread_cover_cancel();

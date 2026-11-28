@@ -937,6 +937,9 @@ static esp_err_t outbox_failure(const char *id,const progress_identity_t *sessio
     return stored==ESP_OK?err:stored;
 }
 esp_err_t weread_progress_outbox_report(const char *id,uint64_t now_ms,uint64_t now,weread_progress_t *out){
+    return weread_progress_outbox_report_ex(id,now_ms,now,false,out);
+}
+esp_err_t weread_progress_outbox_report_ex(const char *id,uint64_t now_ms,uint64_t now,bool ignore_backoff,weread_progress_t *out){
     if(!wr_valid_id(id)||!out||now>9007199254740991ULL)return ESP_ERR_INVALID_ARG;
     memset(out,0,sizeof(*out));weread_progress_t sent;progress_identity_t session;
     { WR_GUARD;
@@ -947,7 +950,7 @@ esp_err_t weread_progress_outbox_report(const char *id,uint64_t now_ms,uint64_t 
             return outbox_failure(id,&session,&sent,err,now,out);
         if(!sent.dirty||!sent.position_pending)return ESP_OK;
         if(sent.sync_conflict)return WEREAD_ERR_PROGRESS_CONFLICT;
-        if(sent.retry_after>now&&sent.retry_after-now<=300)return ESP_ERR_TIMEOUT;
+        if(!ignore_backoff&&sent.retry_after>now&&sent.retry_after-now<=300)return ESP_ERR_TIMEOUT;
     }
     weread_progress_t cloud;uint32_t version=0;
     esp_err_t err=fetch_progress(id,&cloud,&version,NULL,&session,false);

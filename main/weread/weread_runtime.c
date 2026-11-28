@@ -96,10 +96,11 @@ static WR_EXT_BSS struct {
     uint8_t media_id[WEREAD_MEDIA_ID_BYTES];
     uint64_t last_tick, active_ms, last_store, last_move, prefetch_retry;
     uint32_t prefetched;
-    uint64_t report_at, pause_report_at, report_due, cloud_sync_retry_at;
+    uint64_t report_at, pause_report_at, report_due, cloud_sync_retry_at, cloud_sync_ui_until;
     unsigned prefetch_mask, prefetch_failures;
-    uint8_t cloud_sync_failures;
+    uint8_t cloud_sync_failures, cloud_sync_connect_timeouts;
     weread_progress_state_t state;
+    weread_cloud_sync_ui_state_t cloud_sync_ui;
     bool seen, changed, retry, cover_warmed, anchor, navigation_pending, storage_blocked, pending_coordinate, save_failed;
     bool durable_valid, media_valid, rescued, active, urgent, plain_text, cloud_sync_pending;
     bool prefetch_done, user_turned_since_open;
@@ -237,14 +238,13 @@ static void on_http_activity(void *ctx) {
 __attribute__((noinline))
 #endif
 static bool network_online_ready(void) {
-    if (!atomic_load(&s_owns_network)) return false;
 #if defined(ESP_PLATFORM)
     read_pico_transfer_status_t status;
     read_pico_transfer_get_status(&status);
     return status.network_ready && status.mode == READ_PICO_TRANSFER_MODE_STA &&
         status.state != READ_PICO_TRANSFER_STOPPED && status.state != READ_PICO_TRANSFER_ERROR;
 #else
-    return true;
+    return atomic_load(&s_owns_network);
 #endif
 }
 static void stop_network(void) {
@@ -276,9 +276,11 @@ static esp_err_t connect_network(void) {
             if(cancelled(NULL)){if(started_here)stop_network();return ESP_ERR_INVALID_STATE;}
             return ESP_OK;
         }
-        // 前次 Wi-Fi 启动失败（如 OOM）且射频未开启时，先复位错误状态再重试建连。
-        // Clear a prior failed start (e.g., OOM) when radio is off before attempting a fresh start.
-        if(!started_here && !cleared_error && status.state==READ_PICO_TRANSFER_ERROR && !status.wifi_enabled){
+        // 前次 Wi-Fi 启动失败（如 OOM/超时）时，先复位错误状态再重试建连。
+        // Clear a prior failed start (e.g., OOM or connect timeout) before attempting a fresh start.
+        if(!started_here && !cleared_error && status.state==READ_PICO_TRANSFER_ERROR &&
+           (!status.wifi_enabled || status.last_error==ESP_ERR_TIMEOUT)){
+            ESP_LOGW("weread","clearing prior transfer error state err=%d wifi=%d",(int)status.last_error,(int)status.wifi_enabled);
             cleared_error=true;
             read_pico_transfer_stop();
             read_pico_transfer_get_status(&status);
@@ -292,12 +294,17 @@ static esp_err_t connect_network(void) {
             read_pico_transfer_cfg_t cfg={.mode=READ_PICO_TRANSFER_MODE_STA,.network_only=true,.cover_lookup=true};
             esp_err_t err=read_pico_transfer_start(&cfg);
             if(err==ESP_OK){started_here=true;s_owns_network=true;s_network_active=now_ms();}
-            else if(err!=ESP_ERR_INVALID_STATE && err!=ESP_ERR_NOT_FINISHED)return err;
+            else if(err!=ESP_ERR_INVALID_STATE && err!=ESP_ERR_NOT_FINISHED){
+                ESP_LOGW("weread","connect start failed err=%d",(int)err);
+                return err;
+            }
         } else if(status.mode!=READ_PICO_TRANSFER_MODE_STA){
+            ESP_LOGW("weread","connect aborted mode=%d",(int)status.mode);
             if(started_here)s_owns_network = false;
             return ESP_ERR_INVALID_STATE;
         } else if(status.state==READ_PICO_TRANSFER_ERROR){
             esp_err_t err=status.last_error!=ESP_OK?status.last_error:ESP_ERR_INVALID_STATE;
+            ESP_LOGW("weread","connect failed err=%d owned=%d",(int)err,(int)started_here);
             if(started_here){
                 stop_network();
                 if(err==ESP_ERR_TIMEOUT)s_connect_timed_out=true;
@@ -307,6 +314,7 @@ static esp_err_t connect_network(void) {
         // 已有STA正在连接时等待IP，不中断外部会话。/ Wait for an existing STA's IP without interrupting its owner.
         read_pico_transfer_service_poll();pause_ms(100);
     }
+    ESP_LOGW("weread","connect timed out cancel=%d owned=%d",(int)cancelled(NULL),(int)started_here);
     if (started_here) stop_network();
     if (cancelled(NULL)) return ESP_ERR_INVALID_STATE;
     s_connect_timed_out = true;
@@ -1405,8 +1413,14 @@ static esp_err_t job_run(void) {
             weread_progress_outbox_reset();err = weread_auth_clear_session(); weread_shelf_clear(); memset(&s_choice,0,sizeof(s_choice)); ++s_cache_epoch; cache_stats_invalidate(); stop_network(); snapshot(); break;
         case WR_JOB_NOTE: case WR_JOB_REPORT: {
             if (!weread_auth_is_authenticated()) { err = ESP_ERR_INVALID_STATE; break; }
-            if(s_work.id[0] || weread_progress_outbox_next(s_result.id,sizeof(s_result.id),(uint64_t)time(NULL))==ESP_OK)
-                err=weread_progress_outbox_report(s_result.id,s_work.now,(uint64_t)time(NULL),&s_result.local);
+            bool force = !strcmp(s_work.value, "force");
+            if (s_work.id[0] || weread_progress_outbox_next(s_result.id, sizeof(s_result.id), (uint64_t)time(NULL)) == ESP_OK) {
+                err = weread_progress_outbox_report_ex(s_result.id, s_work.now, (uint64_t)time(NULL), force, &s_result.local);
+                if (force && err == ESP_ERR_INVALID_STATE && !cancelled(NULL) &&
+                    weread_auth_is_authenticated() && s_result.local.chapter_uid && !s_result.local.sync_conflict) {
+                    err = weread_progress_outbox_report_ex(s_result.id, s_work.now, (uint64_t)time(NULL), true, &s_result.local);
+                }
+            }
             break;
         }
         case WR_JOB_CHAPTER:
@@ -1450,7 +1464,7 @@ static void perform_job(void) {
     }
 #endif
     weread_client_set_polling(true);
-    weread_client_set_background(s_work.job==WR_JOB_NOTE||s_work.job==WR_JOB_REPORT||s_work.job==WR_JOB_PREFETCH||s_work.job==WR_JOB_COVER||s_work.job==WR_JOB_CLOUD_SYNC);
+    weread_client_set_background(s_work.job==WR_JOB_REPORT||s_work.job==WR_JOB_PREFETCH||s_work.job==WR_JOB_COVER);
     bool retryable = retryable_job(s_work.job);
     // 超时只来自网络阶段：目录/版本缓存重写幂等，位置检查点之后的写入禁止重放（s_retry_blocked）。
     // Timeouts come from network phases: TOC/version cache writes are idempotent, while persistence after the progress checkpoint forbids replay (s_retry_blocked).
@@ -1474,6 +1488,9 @@ static void perform_job(void) {
     s_result.authenticated = weread_auth_is_authenticated();
     s_result.auth_expired = weread_auth_is_expired();
 #if defined(ESP_PLATFORM)
+    if((s_work.job==WR_JOB_NOTE||s_work.job==WR_JOB_REPORT)&&s_result.error!=ESP_OK)
+        ESP_LOGW("weread","sync upload fail job=%u id=%s err=%d auth=%d exp=%d",
+            (unsigned)s_work.job,s_result.id,(int)s_result.error,(int)s_result.authenticated,(int)s_result.auth_expired);
     if(s_work.job!=WR_JOB_COVER&&s_work.job!=WR_JOB_NOTE&&s_work.job!=WR_JOB_REPORT&&s_work.job!=WR_JOB_DISCONNECT)
         ESP_LOGI("weread","memory job=%u result=%d internal=%u largest=%u psram=%u stack=%u",
             (unsigned)s_work.job,(int)s_result.error,(unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT),
@@ -1521,17 +1538,33 @@ bool weread_runtime_busy(void) { return atomic_load(&s_busy); }
 static void consume_reader_result(void) {
     if (!s_reader.id[0] || strcmp(s_reader.id, s_result.id)) return;
     if (s_result.job == WR_JOB_NOTE || s_result.job == WR_JOB_REPORT) {
-        if(s_reader.durable_valid&&s_result.local.revision==s_reader.durable.revision){
-            s_reader.durable=s_result.local;
-            s_reader.state=weread_progress_state(&s_result.local);
-            s_reader.retry=s_result.local.dirty&&s_result.local.position_pending&&!s_result.local.sync_conflict;
-            if(s_result.error==ESP_OK){s_reader.rescued=false;s_reader.report_at=0;s_reader.report_due=s_reader.last_tick+60000;}
+        bool matching_rev = s_reader.durable_valid && s_result.local.revision == s_reader.durable.revision;
+        bool newer_ack = s_reader.durable_valid && s_result.error == ESP_OK &&
+            s_result.local.chapter_uid &&
+            (int32_t)(s_result.local.revision - s_reader.durable.revision) > 0;
+        if (matching_rev || newer_ack) {
+            s_reader.durable = s_result.local;
+            s_reader.state = weread_progress_state(&s_result.local);
+            s_reader.retry = s_result.local.dirty && s_result.local.position_pending && !s_result.local.sync_conflict;
+            if (s_result.error == ESP_OK) {
+                s_reader.rescued = false; s_reader.report_at = 0; s_reader.report_due = s_reader.last_tick + 60000;
+            }
+        }
+        if (s_result.error == ESP_ERR_INVALID_STATE && s_reader.active && s_reader.retry &&
+            weread_auth_is_authenticated() && s_result.local.chapter_uid &&
+            !s_result.local.sync_conflict && s_result.local.retry_after == 0) {
+            s_reader.pause_report_at = s_reader.last_tick;
+            s_reader.report_at = s_reader.last_tick;
+            s_reader.urgent = true;
         }
     }
     if (s_result.job == WR_JOB_CLOUD_SYNC) {
         if (s_result.error == ESP_OK) {
             s_reader.cloud_sync_failures = 0;
+            s_reader.cloud_sync_connect_timeouts = 0;
             s_reader.cloud_sync_retry_at = 0;
+            s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_IDLE;
+            s_reader.cloud_sync_ui_until = 0;
             if (!atomic_load(&s_cloud_jump_ready) &&
                 s_reader.durable_valid && s_result.local.chapter_uid &&
                 s_result.local.revision == s_reader.durable.revision) {
@@ -1539,13 +1572,36 @@ static void consume_reader_result(void) {
                 s_reader.state = weread_progress_state(&s_result.local);
                 s_reader.retry = s_result.local.dirty && s_result.local.position_pending && !s_result.local.sync_conflict;
             }
-        } else if (s_reader.active && weread_auth_is_authenticated() && !s_connect_timed_out &&
+        } else if (s_reader.active && weread_auth_is_authenticated() && !weread_auth_is_expired() &&
+                   s_connect_timed_out && s_reader.cloud_sync_connect_timeouts < 1) {
+            ++s_reader.cloud_sync_connect_timeouts;
+            s_reader.cloud_sync_pending = true;
+            s_reader.cloud_sync_retry_at = s_reader.last_tick + 3000u;
+        } else if (s_reader.active && weread_auth_is_authenticated() && !weread_auth_is_expired() &&
+                   !s_connect_timed_out &&
                    s_result.error != WEREAD_ERR_PURCHASE && s_result.error != WEREAD_ERR_SOLD_OUT &&
                    s_result.error != WEREAD_ERR_POSITION && s_result.error != WEREAD_ERR_VERSION &&
                    s_result.error != ESP_ERR_NOT_FOUND && s_reader.cloud_sync_failures < 3) {
             ++s_reader.cloud_sync_failures;
             s_reader.cloud_sync_pending = true;
             s_reader.cloud_sync_retry_at = s_reader.last_tick + (uint64_t)s_reader.cloud_sync_failures * 5000u;
+        } else if (s_reader.active) {
+            if (weread_auth_is_expired()) {
+                s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_EXPIRED;
+                s_reader.cloud_sync_ui_until = UINT64_MAX;
+            } else if (s_result.error == WEREAD_ERR_VERSION) {
+                s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_VERSION;
+                s_reader.cloud_sync_ui_until = s_reader.last_tick + 3000u;
+            } else if (s_result.error == ESP_ERR_TIMEOUT && !s_connect_timed_out) {
+                s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_TIMEOUT;
+                s_reader.cloud_sync_ui_until = s_reader.last_tick + 3000u;
+            } else if (s_connect_timed_out || s_result.error == ESP_ERR_INVALID_STATE || s_result.error == ESP_ERR_NOT_FOUND) {
+                s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_OFFLINE;
+                s_reader.cloud_sync_ui_until = s_reader.last_tick + 3000u;
+            } else {
+                s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_FAILED;
+                s_reader.cloud_sync_ui_until = s_reader.last_tick + 3000u;
+            }
         }
     }
     if (s_result.job == WR_JOB_CHAPTER && s_result.error == ESP_OK && s_result.chapter_idx != SIZE_MAX) {
@@ -1599,6 +1655,13 @@ void weread_runtime_cancel(void){
 void weread_reader_pause_bg(void) {
     if (weread_runtime_busy() && s_work.job != WR_JOB_NOTE && s_work.job != WR_JOB_REPORT)
         weread_runtime_cancel();
+}
+void weread_reader_pause_bg_join(uint32_t timeout_ms) {
+    weread_reader_pause_bg();
+    if (!weread_runtime_busy()) return;
+    uint64_t deadline = now_ms() + timeout_ms;
+    while (weread_runtime_busy() && now_ms() < deadline) pause_ms(10);
+    if (weread_runtime_busy()) weread_runtime_cancel_join();
 }
 void weread_reader_input(bool cached_text_only){
     atomic_store(&s_fg_input_ms, now_ms());
@@ -2093,6 +2156,19 @@ esp_err_t weread_reader_save(uint64_t now){
     return err;
 }
 weread_progress_state_t weread_reader_state(void){return s_reader.state;}
+weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void) {
+    if (!s_reader.active || !s_reader.id[0]) return WEREAD_CLOUD_SYNC_IDLE;
+    if (weread_auth_is_expired()) return WEREAD_CLOUD_SYNC_EXPIRED;
+    if (s_reader.cloud_sync_pending) return WEREAD_CLOUD_SYNC_ACTIVE;
+    if (weread_runtime_busy() && s_work.job == WR_JOB_CLOUD_SYNC && !strcmp(s_work.id, s_reader.id))
+        return WEREAD_CLOUD_SYNC_ACTIVE;
+    if (s_reader.cloud_sync_ui != WEREAD_CLOUD_SYNC_IDLE) {
+        if (s_reader.cloud_sync_ui == WEREAD_CLOUD_SYNC_EXPIRED ||
+            s_reader.last_tick < s_reader.cloud_sync_ui_until)
+            return s_reader.cloud_sync_ui;
+    }
+    return WEREAD_CLOUD_SYNC_IDLE;
+}
 bool weread_reader_save_failed(void){return s_reader.save_failed;}
 bool weread_reader_pending_save(void){return s_reader.changed||s_reader.navigation_pending||s_reader.save_failed;}
 bool weread_reader_rescued(void){return s_reader.rescued;}
@@ -2250,8 +2326,13 @@ void weread_reader_tick(const char *uri, size_t chapter, uint32_t offset, unsign
         (void)weread_reader_save(now);return;
     }
     if(now-s_reader.last_move<300)return;
-    if(s_reader.cloud_sync_pending&&now>=s_reader.cloud_sync_retry_at&&weread_auth_is_authenticated()){
-        if(weread_runtime_start(WR_JOB_CLOUD_SYNC,s_reader.id,NULL)){s_reader.cloud_sync_pending=false;return;}
+    if(s_reader.cloud_sync_pending){
+        if(!weread_auth_is_authenticated()){
+            s_reader.cloud_sync_pending=false;
+            if(weread_auth_is_expired()){s_reader.cloud_sync_ui=WEREAD_CLOUD_SYNC_EXPIRED;s_reader.cloud_sync_ui_until=UINT64_MAX;}
+        }else if(now>=s_reader.cloud_sync_retry_at&&weread_runtime_start(WR_JOB_CLOUD_SYNC,s_reader.id,NULL)){
+            s_reader.cloud_sync_pending=false;return;
+        }
     }
     bool bits_ready = book_cache_ready(s_reader.id);
     bool next_ready = bits_ready ? book_cache_bit(s_reader.id, chapter + 1) : ((s_reader.prefetch_mask & 1u) != 0);
@@ -2306,6 +2387,83 @@ void weread_reader_flush(uint64_t now, bool stop) {
     (void)weread_reader_save(now);
     if(stop){book_cache_clear();weread_runtime_stop();}
 }
+bool weread_reader_flush_for_lock(uint64_t now, uint32_t timeout_ms) {
+    if (!s_reader.id[0]) {
+        weread_runtime_cancel_join();
+        return true;
+    }
+    if (weread_runtime_busy() && s_work.job != WR_JOB_NOTE && s_work.job != WR_JOB_REPORT) {
+        weread_runtime_cancel_join();
+    }
+    (void)weread_reader_save(now);
+    if (!weread_auth_is_authenticated() || s_reader.save_failed) {
+        weread_runtime_cancel_join();
+        return !s_reader.retry && !s_reader.save_failed;
+    }
+    bool has_pending = s_reader.retry ||
+        (s_reader.durable_valid && s_reader.durable.dirty &&
+         s_reader.durable.position_pending && !s_reader.durable.sync_conflict);
+    if (!has_pending) {
+        weread_runtime_cancel_join();
+        return true;
+    }
+#if defined(ESP_PLATFORM)
+    bool wifi_ready = network_online_ready();
+    if (!wifi_ready) {
+        bool configured = false;
+        char ssid[33] = {0};
+        if (read_pico_transfer_get_saved_wifi(ssid, &configured) == ESP_OK)
+            wifi_ready = configured;
+        else {
+            read_pico_transfer_status_t st = {0};
+            read_pico_transfer_get_status(&st);
+            wifi_ready = st.wifi_configured;
+        }
+    }
+    if (!wifi_ready) {
+        weread_runtime_cancel_join();
+        return false;
+    }
+#endif
+    uint64_t start = now_ms();
+    if (weread_runtime_busy()) {
+        if (s_work.job == WR_JOB_NOTE || s_work.job == WR_JOB_REPORT) {
+            weread_reader_pause_bg_join(timeout_ms);
+        } else {
+            weread_runtime_cancel_join();
+        }
+    }
+    if (!weread_runtime_busy() && atomic_exchange(&s_done, false)) {
+        consume_reader_result();
+        weread_runtime_result_free(&s_result);
+    }
+    has_pending = s_reader.retry ||
+        (s_reader.durable_valid && s_reader.durable.dirty &&
+         s_reader.durable.position_pending && !s_reader.durable.sync_conflict);
+    if (!has_pending) return true;
+    uint64_t elapsed = now_ms() - start;
+    if (elapsed >= timeout_ms) {
+        weread_runtime_cancel_join();
+        return false;
+    }
+    uint32_t remain = (uint32_t)(timeout_ms - elapsed);
+    if (!weread_runtime_start(WR_JOB_NOTE, s_reader.id, "force")) {
+        return false;
+    }
+    uint64_t wait_until = now_ms() + remain;
+    atomic_store(&s_deadline, wait_until);
+    while (weread_runtime_busy() && now_ms() < wait_until) pause_ms(10);
+    atomic_store(&s_deadline, 0);
+    if (weread_runtime_busy()) {
+        weread_runtime_cancel_join();
+        return false;
+    }
+    if (atomic_exchange(&s_done, false)) {
+        consume_reader_result();
+        weread_runtime_result_free(&s_result);
+    }
+    return !s_reader.retry;
+}
 void weread_reader_wake(uint64_t now) {
     if (!s_reader.active || !s_reader.id[0]) return;
     if (!book_cache_ready(s_reader.id)) {
@@ -2325,7 +2483,10 @@ void weread_reader_wake(uint64_t now) {
     s_reader.session_pages = 0;
     s_reader.cloud_sync_pending = weread_auth_is_authenticated();
     s_reader.cloud_sync_failures = 0;
+    s_reader.cloud_sync_connect_timeouts = 0;
     s_reader.cloud_sync_retry_at = 0;
+    s_reader.cloud_sync_ui = WEREAD_CLOUD_SYNC_IDLE;
+    s_reader.cloud_sync_ui_until = 0;
     s_reader.last_tick = now;
     s_reader.last_move = now;
 }

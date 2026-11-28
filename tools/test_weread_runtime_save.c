@@ -341,6 +341,54 @@ int main(int argc,char **argv){
         puts("PASS actual runtime cloud-sync-priority-wake");
         return 0;
     }
+    if(!strcmp(mode,"lock-flush-sync-ui")){
+        weread_reader_end(1500);book_weread_close();
+        assert(weread_runtime_start(WR_JOB_OPEN,"window_book",NULL));
+        assert(observe_result()==WR_JOB_OPEN);
+        assert(book_weread_open("weread://window_book")==ESP_OK);
+        size_t rch=99;uint32_t rso=99;
+        assert(weread_reader_resume_chapter("weread://window_book",&rch,&rso)==ESP_OK);
+        html_text_t c0={0};uint32_t v0=0;adopt(0,&c0,&v0);
+        assert(weread_chapter_download("window_book",27)==ESP_OK);
+        weread_reader_begin("weread://window_book",2000);
+        weread_reader_cache_forward_set(false);
+        assert(weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_ACTIVE);
+        weread_reader_tick("weread://window_book",0,0,1,"start",2000,true);
+        sync_fail_times=10;sync_fail_err=ESP_ERR_TIMEOUT;
+        uint64_t t=2300;
+        for(unsigned step=0;step<4;++step){
+            weread_reader_tick("weread://window_book",0,0,1,"start",t,true);
+            assert(observe_result()==WR_JOB_CLOUD_SYNC);
+            assert(weread_reader_cloud_sync_state()==(step<3?WEREAD_CLOUD_SYNC_ACTIVE:WEREAD_CLOUD_SYNC_TIMEOUT));
+            t+=20000;
+        }
+        assert(weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_TIMEOUT);
+        sync_fail_times=0;
+        weread_reader_wake(t);
+        assert(weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_ACTIVE);
+        weread_reader_tick("weread://window_book",0,0,1,"start",t+300,true);
+        assert(observe_result()==WR_JOB_CLOUD_SYNC);
+        weread_reader_tick("weread://window_book",0,0,1,"start",t+350,true);
+        assert(weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_IDLE);
+        unsigned posts_before=progress_posts;
+        assert(weread_reader_flush_for_lock(t+400,7500)&&progress_posts==posts_before);
+        weread_reader_navigated_version("weread://window_book",0,6,25,c0.utf8+6,v0);
+        weread_reader_tick("weread://window_book",0,6,25,c0.utf8+6,t+1000,true);
+        sync_fail_times=1;sync_fail_err=ESP_ERR_TIMEOUT;
+        weread_reader_tick("weread://window_book",0,6,25,c0.utf8+6,t+10000,true);
+        assert(observe_result()==WR_JOB_NOTE);
+        weread_reader_tick("weread://window_book",0,6,25,c0.utf8+6,t+10050,true);
+        assert(weread_reader_state()==WR_PROGRESS_PENDING);
+        sync_fail_times=0;
+        assert(weread_reader_flush_for_lock(t+11000,7500));
+        assert(weread_reader_state()==WR_PROGRESS_SYNCED&&progress_posts==posts_before+1);
+        assert(weread_auth_mark_expired()==ESP_OK);
+        assert(weread_reader_cloud_sync_state()==WEREAD_CLOUD_SYNC_EXPIRED);
+        html_text_free(&c0);
+        weread_reader_end(t+12000);book_weread_close();weread_runtime_stop();html_text_free(&text);
+        puts("PASS actual runtime lock-flush-sync-ui");
+        return 0;
+    }
     if(!strcmp(mode,"m2-regressions")){
         // 1. weread_runtime_cloud_jump_rebase() save failure: no tick spin and s_cloud_jump.rebased == false
         local_navigation(0,4,2000,100);

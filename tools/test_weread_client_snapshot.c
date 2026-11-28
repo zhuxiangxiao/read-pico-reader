@@ -57,7 +57,7 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         }
         assert(*out); *bytes = strlen(*out); return ESP_OK;
     }
-    if (response_status == 2012) {
+    if (response_status == 2012 || response_status == 4010) {
         if (strstr(url, "/weblogin")) {
             *http_status = 200;
             *out = strdup("{\"accessToken\":\"fixture-renewed-token\",\"refreshToken\":\"fixture-renewed-refresh\"}");
@@ -66,7 +66,7 @@ static esp_err_t transport(const char *url, const char *method, const char *head
         assert(strstr(url, "/book/read") && !strcmp(method, "POST"));
         if (strstr(headers, "fixture-old-token")) {
             *http_status = 401;
-            *out = strdup("{\"errCode\":-2012,\"errMsg\":\"timeout\"}");
+            *out = strdup(response_status == 4010 ? "{\"errcode\":401}" : "{\"errCode\":-2012,\"errMsg\":\"timeout\"}");
             assert(*out); *bytes = strlen(*out); return ESP_OK;
         }
         assert(strstr(headers, "fixture-renewed-token"));
@@ -189,6 +189,15 @@ int main(int argc, char **argv) {
         assert(result == ESP_OK && dinfo.status == 200 && requests == 3);
         assert(atomic_load(&activity_calls) >= 6);
         fclose(tmp);
+        assert(weread_auth_save_session(&reset_tok) == ESP_OK && weread_auth_load_session(&reset_tok) == ESP_OK);
+        requests = 0; response_status = 4010;
+        assert(weread_client_identity_get(&bound));
+        weread_client_set_background(true);
+        result = weread_client_request_bound_renew("https://i.weread.qq.com/book/read", "POST",
+            "Content-Type: application/json\r\n", "{}", &response, &response_bytes, &status, &bound);
+        weread_client_set_background(false);
+        assert(result == ESP_OK && status == 200 && requests == 3 && !strcmp(bound.token, "fixture-renewed-token"));
+        free(response); response = NULL;
         assert(weread_auth_mark_expired() == ESP_OK);
         assert(!weread_client_identity_get(&bound));
         atomic_store(&activity_calls, 0);

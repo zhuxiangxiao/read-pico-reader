@@ -49,6 +49,7 @@ enum {
 };
 typedef enum { APP_REDRAW_NONE, APP_REDRAW_PAGE, APP_REDRAW_AREA, APP_REDRAW_FULL } app_redraw_t;
 typedef enum { WR_PROGRESS_LOCAL, WR_PROGRESS_PENDING, WR_PROGRESS_SYNCED, WR_PROGRESS_CONFLICT } weread_progress_state_t;
+typedef enum { WEREAD_CLOUD_SYNC_IDLE = 0, WEREAD_CLOUD_SYNC_ACTIVE, WEREAD_CLOUD_SYNC_EXPIRED, WEREAD_CLOUD_SYNC_TIMEOUT, WEREAD_CLOUD_SYNC_OFFLINE, WEREAD_CLOUD_SYNC_VERSION, WEREAD_CLOUD_SYNC_FAILED } weread_cloud_sync_ui_state_t;
 typedef enum { WEREAD_STAGE_NONE = 0, WEREAD_STAGE_PROGRESS, WEREAD_STAGE_TOC, WEREAD_STAGE_CHAPTER, WEREAD_STAGE_PARSE, WEREAD_STAGE_RETRY } weread_stage_t;
 typedef enum { UI_GESTURE_PRESS, UI_GESTURE_MOVE, UI_GESTURE_CANCEL, UI_GESTURE_TAP, UI_GESTURE_SWIPE_L, UI_GESTURE_SWIPE_R, UI_GESTURE_SWIPE_U, UI_GESTURE_SWIPE_D, UI_GESTURE_LONG_PRESS } ui_gesture_type_t;
 typedef enum { UI_KEY_1 = 0, UI_KEY_2 = 1, UI_KEY_3 = 2 } ui_key_t;
@@ -206,6 +207,8 @@ static void weread_reader_tick(const char *p, size_t c, uint32_t o, unsigned pct
     if (mock_flip_blocked) { mock_blocked = true; mock_flip_blocked = false; }
 }
 static weread_progress_state_t weread_reader_state(void) { return mock_state; }
+static weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void) { return WEREAD_CLOUD_SYNC_IDLE; }
+static bool app_settings_reader_immersive(void) { return false; }
 static bool weread_reader_save_failed(void) { return mock_save_failed; }
 static bool weread_reader_pending_save(void) { return mock_pending_save; }
 static bool weread_reader_rescued(void) { return mock_rescued; }
@@ -566,6 +569,7 @@ enum EpdDrawMode { MODE_GL16 = 1, MODE_DU = 2 };
 enum EpdDrawError { EPD_DRAW_SUCCESS = 0, EPD_DRAW_ERROR = -1 };
 typedef enum { APP_REDRAW_NONE, APP_REDRAW_PAGE, APP_REDRAW_AREA, APP_REDRAW_FULL } app_redraw_t;
 typedef enum { WR_PROGRESS_LOCAL, WR_PROGRESS_PENDING, WR_PROGRESS_SYNCED, WR_PROGRESS_CONFLICT } weread_progress_state_t;
+typedef enum { WEREAD_CLOUD_SYNC_IDLE = 0, WEREAD_CLOUD_SYNC_ACTIVE, WEREAD_CLOUD_SYNC_EXPIRED, WEREAD_CLOUD_SYNC_TIMEOUT, WEREAD_CLOUD_SYNC_OFFLINE, WEREAD_CLOUD_SYNC_VERSION, WEREAD_CLOUD_SYNC_FAILED } weread_cloud_sync_ui_state_t;
 typedef enum {
     DISPLAY_READER_GRAY_PAGE = 0,
     DISPLAY_READER_GRAY_BACKGROUND,
@@ -682,6 +686,8 @@ static enum EpdDrawError update_display_reader_gray(epd_hl_t *hl, EpdRect area, 
 static void weread_reader_navigated_version(const char *p, size_t c, uint32_t o, unsigned pct, const char *s, uint32_t v) { (void)p; (void)c; (void)o; (void)pct; (void)s; (void)v; }
 static void weread_reader_tick(const char *p, size_t c, uint32_t o, unsigned pct, const char *s, uint64_t n, bool a) { (void)p; (void)c; (void)o; (void)pct; (void)s; (void)n; (void)a; }
 static weread_progress_state_t weread_reader_state(void) { return mock_state; }
+static weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void) { return WEREAD_CLOUD_SYNC_IDLE; }
+static bool app_settings_reader_immersive(void) { return false; }
 static bool weread_reader_save_failed(void) { return mock_save_failed; }
 static bool weread_reader_pending_save(void) { return mock_pending_save; }
 static bool weread_reader_rescued(void) { return mock_rescued; }
@@ -907,6 +913,8 @@ static uint32_t book_weread_uid(size_t ch) { return (uint32_t)(ch + 10); }
 static void weread_reader_navigated_version(const char *p, size_t c, uint32_t o, unsigned pct, const char *s, uint32_t v) { (void)p; (void)c; (void)o; (void)pct; (void)s; (void)v; }
 static void weread_reader_tick(const char *p, size_t c, uint32_t o, unsigned pct, const char *s, uint64_t n, bool a) { (void)p; (void)c; (void)o; (void)pct; (void)s; (void)n; (void)a; }
 static weread_progress_state_t weread_reader_state(void) { return WR_PROGRESS_SYNCED; }
+static weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void) { return WEREAD_CLOUD_SYNC_IDLE; }
+static bool app_settings_reader_immersive(void) { return false; }
 static bool weread_reader_save_failed(void) { return false; }
 static bool weread_reader_pending_save(void) { return false; }
 static bool weread_reader_rescued(void) { return false; }

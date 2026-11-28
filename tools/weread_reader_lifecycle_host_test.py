@@ -35,7 +35,8 @@ static void mark(char event){assert(trace_at+1<sizeof(trace));trace[trace_at++]=
 static bool book_path_is_weread(const char *path){return path&&!strncmp(path,"weread://",9);}
 static bool weread_reader_pending_save(void){return ram_pending;}
 static void wr_chapter_cancel(void){++cancels;mark('C');}
-static void weread_runtime_cancel_join(void){++joins;mark('J');}
+static void __attribute__((unused)) weread_runtime_cancel_join(void){++joins;mark('J');}
+static void weread_reader_pause_bg_join(uint32_t timeout_ms){(void)timeout_ms;++joins;mark('J');}
 static void wr_reader_sample(uint64_t now,bool active){assert(now==1234&&!active);++samples;mark('N');}
 static esp_err_t weread_reader_save(uint64_t now){assert(now==1234);++saves;mark('S');if(save_fails)return ESP_FAIL;ram_pending=false;return ESP_OK;}
 static void copy_text(char *to,size_t cap,const char *from){snprintf(to,cap,"%s",from);}

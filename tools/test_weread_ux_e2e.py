@@ -1585,13 +1585,14 @@ enum {
 enum {READING,TOC,READER_PANEL_NONE,WR_JOB_NOTE,WR_JOB_CHAPTER,WR_JOB_PREFETCH,MODE_GL16};
 typedef enum {APP_REDRAW_NONE,APP_REDRAW_PAGE,APP_REDRAW_AREA} app_redraw_t;
 typedef enum {WR_PROGRESS_LOCAL,WR_PROGRESS_PENDING,WR_PROGRESS_SYNCED,WR_PROGRESS_CONFLICT} weread_progress_state_t;
+typedef enum {WEREAD_CLOUD_SYNC_IDLE=0,WEREAD_CLOUD_SYNC_ACTIVE,WEREAD_CLOUD_SYNC_EXPIRED,WEREAD_CLOUD_SYNC_TIMEOUT,WEREAD_CLOUD_SYNC_OFFLINE,WEREAD_CLOUD_SYNC_VERSION,WEREAD_CLOUD_SYNC_FAILED} weread_cloud_sync_ui_state_t;
 typedef enum {WEREAD_STAGE_NONE=0,WEREAD_STAGE_PROGRESS,WEREAD_STAGE_TOC,WEREAD_STAGE_CHAPTER,WEREAD_STAGE_PARSE,WEREAD_STAGE_RETRY} weread_stage_t;
 typedef struct {int x,y,width,height;} EpdRect;
 typedef struct {bool touched;} touch_t;
 typedef struct {int64_t now_ms;bool consumed,request_app;touch_t *touch;uint8_t *fb;int leaf;} app_ctx_t;
 typedef struct {int job,error;char id[64];uint32_t chapter_uid;} weread_result_t;
 static int s_view=READING,s_reader_panel=READER_PANEL_NONE,s_mode;
-static bool s_clear_confirm,s_toolbar,s_reader_footer_pending,s_reader_text_frame=true;
+static bool s_clear_confirm,s_toolbar,s_reader_footer_pending,s_reader_text_frame=true,s_reader_fullscreen=false;
 static uint64_t s_reader_footer_due_ms;
 static int64_t s_reader_notice_until;
 static EpdRect s_area;
@@ -1600,9 +1601,11 @@ static const char *s_text="body text";
 static size_t s_text_len=9,s_chapter=1,s_page=0,s_selected_toc,s_selected_toc_offset,s_toc_page=0;
 ''' + undo_decl + r'''
 static weread_progress_state_t mock_state = WR_PROGRESS_SYNCED;
+static weread_cloud_sync_ui_state_t mock_cloud_sync = WEREAD_CLOUD_SYNC_IDLE;
 static unsigned mock_cached = 1, mock_total = 4;
-static bool mock_paused = false, mock_blocked = false;
+static bool mock_paused = false, mock_blocked = false, mock_immersive = false;
 static bool mock_save_failed = false, mock_pending_save = false, mock_rescued = false, mock_has_turned = false, mock_network_active = false;
+static bool app_settings_reader_immersive(void){return mock_immersive;}
 static bool book_path_is_weread(const char *p){return p&&strncmp(p,"weread://",9)==0;}
 static size_t book_layout_page_count(void){return 2;}
 static size_t book_layout_page_image_count(size_t p){(void)p;return 0;}
@@ -1623,6 +1626,7 @@ static uint32_t book_weread_uid(size_t ch){return (uint32_t)(ch+1);}
 static void weread_reader_navigated_version(const char *p,size_t c,uint32_t o,unsigned pct,const char *s,uint32_t v){(void)p;(void)c;(void)o;(void)pct;(void)s;(void)v;}
 static void weread_reader_tick(const char *p,size_t c,uint32_t o,unsigned pct,const char *s,uint64_t n,bool a){(void)p;(void)c;(void)o;(void)pct;(void)s;(void)n;(void)a;}
 static weread_progress_state_t weread_reader_state(void){return mock_state;}
+static weread_cloud_sync_ui_state_t weread_reader_cloud_sync_state(void){return mock_cloud_sync;}
 static bool weread_reader_save_failed(void){return mock_save_failed;}
 static bool weread_reader_pending_save(void){return mock_pending_save;}
 static bool weread_reader_rescued(void){return mock_rescued;}
@@ -1731,6 +1735,23 @@ int main(void) {
     s_wr_jump.pending = true;
     wr_chapter_cancel();
     assert(s_wr_jump.pending == false);
+
+    // 5. wr_reader_status() reflects cloud sync progress and failure hints
+    mock_state = WR_PROGRESS_SYNCED;
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_ACTIVE;
+    assert(strcmp(wr_reader_status(), "同步进度中 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_EXPIRED;
+    assert(strcmp(wr_reader_status(), "登录过期 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_TIMEOUT;
+    assert(strcmp(wr_reader_status(), "同步超时 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_OFFLINE;
+    assert(strcmp(wr_reader_status(), "网络不可用 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_VERSION;
+    assert(strcmp(wr_reader_status(), "书目已更新 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_FAILED;
+    assert(strcmp(wr_reader_status(), "同步失败 · ") == 0);
+    mock_cloud_sync = WEREAD_CLOUD_SYNC_IDLE;
+    assert(strcmp(wr_reader_status(), "") == 0);
     return 0;
 }
 ''')

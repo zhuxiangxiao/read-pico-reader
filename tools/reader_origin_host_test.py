@@ -26,6 +26,7 @@ static int64_t s_resume_media_deadline_ms;
 static int s_view=READING,s_reader_panel,freed,saved,returned;
 static bool resume_media_wait(app_ctx_t*c){(void)c;return false;}
 static void weread_runtime_load_local(void){}
+static bool weread_reader_open_ready(const char*p){(void)p;return false;}
 static bool app_settings_reader_default_fullscreen(void){return false;}
 static void copy_text(char*out,size_t cap,const char*in){snprintf(out,cap,"%s",in);}
 static bool open_book(app_ctx_t*c,const char*p){(void)c;assert(p[0]);s_reader_return_origin=1;return !fail_open;}
